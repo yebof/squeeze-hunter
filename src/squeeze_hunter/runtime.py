@@ -197,6 +197,20 @@ class RuntimeContext:
             if self.metrics_registry:
                 self.metrics_registry.set_kill_switch_active(ks.reason or "unknown")
 
+    async def tick_safe(self: RuntimeContext, now: datetime) -> bool:
+        """Run tick() and swallow any exception so the scheduler keeps firing.
+
+        Returns True on success, False if an exception was caught and logged.
+        Use this for fire-and-forget scheduler callbacks where an unhandled
+        exception in a Task would otherwise be silently dropped by asyncio.
+        """
+        try:
+            await self.tick(now=now)
+        except Exception:
+            log.exception("tick_failed", as_of=now.isoformat())
+            return False
+        return True
+
     async def shutdown(self: RuntimeContext) -> None:
         if self.broker is not None and hasattr(self.broker, "disconnect"):
             await self.broker.disconnect()

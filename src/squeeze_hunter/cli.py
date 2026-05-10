@@ -210,7 +210,7 @@ def paper(
         await rc.setup()
         sched = build_scheduler(
             callbacks={
-                "intraday_loop": lambda: asyncio.ensure_future(rc.tick(now=datetime.now(UTC))),
+                "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
             }
         )
         sched.start()
@@ -249,7 +249,7 @@ def live(
         await rc.setup()
         sched = build_scheduler(
             callbacks={
-                "intraday_loop": lambda: asyncio.ensure_future(rc.tick(now=datetime.now(UTC))),
+                "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
             }
         )
         sched.start()
