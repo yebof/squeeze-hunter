@@ -28,6 +28,36 @@ async def test_si_pct_float_factor_picks_latest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_si_pct_float_excludes_tickers_with_zero_float() -> None:
+    """A ticker with si_pct_float=0 (no float data) must not be emitted as a 0 row,
+    or it pollutes cross-sectional z-score for other tickers.
+    """
+    provider = AsyncMock()
+
+    def make_si(t: str, pct: float) -> list[ShortInterest]:
+        return [
+            ShortInterest(
+                ticker=t,
+                settlement_date=date(2024, 4, 30),
+                si_shares=1_000_000,
+                si_pct_float=pct,
+                avg_daily_volume_20d=200_000,
+            )
+        ]
+
+    provider.fetch_short_interest.side_effect = lambda t, since=None: make_si(
+        t, {"GME": 0.20, "AAPL": 0.0, "TSLA": 0.05}[t]
+    )
+    factor = await compute_si_pct_float(
+        ["GME", "AAPL", "TSLA"], provider, datetime(2024, 5, 13, tzinfo=UTC)
+    )
+    tickers = set(factor.values["ticker"])
+    assert "GME" in tickers
+    assert "TSLA" in tickers
+    assert "AAPL" not in tickers  # excluded — si_pct_float=0 means no float data
+
+
+@pytest.mark.asyncio
 async def test_days_to_cover_uses_si_div_adv() -> None:
     provider = AsyncMock()
     provider.fetch_short_interest.return_value = [

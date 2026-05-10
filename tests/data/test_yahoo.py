@@ -35,3 +35,39 @@ def test_yahoo_capabilities() -> None:
     p = YahooProvider()
     assert "bars" in p.capabilities
     assert "options" in p.capabilities
+
+
+@pytest.mark.asyncio
+async def test_yahoo_get_float_shares() -> None:
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.info = {"floatShares": 12345678, "sharesOutstanding": 99999999}
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        n = await p.get_float_shares("GME")
+    assert n == 12345678
+
+
+@pytest.mark.asyncio
+async def test_yahoo_get_float_shares_falls_back_to_shares_outstanding() -> None:
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.info = {"sharesOutstanding": 50000000}  # no floatShares
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        n = await p.get_float_shares("GME")
+    assert n == 50000000
+
+
+@pytest.mark.asyncio
+async def test_yahoo_get_float_shares_returns_none_when_missing() -> None:
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.info = {}
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        n = await p.get_float_shares("UNKNOWN")
+    assert n is None

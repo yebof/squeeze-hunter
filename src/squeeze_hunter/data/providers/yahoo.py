@@ -123,6 +123,22 @@ class YahooProvider:
 
         return await asyncio.to_thread(_go)
 
+    async def get_float_shares(self: YahooProvider, ticker: str) -> int | None:
+        """Return current float shares (sharesOutstanding as fallback). None if unavailable.
+
+        Note: Yahoo only exposes current float, not historical. When this value is stored
+        alongside historical SI records the float is time-leaked (today's float applied to
+        past SI dates). This is an accepted pragmatic simplification — reconstructing
+        historical floats from 10-Q filings is out of scope.
+        """
+
+        def _go() -> int | None:
+            info = yf.Ticker(ticker).info or {}
+            f = info.get("floatShares") or info.get("sharesOutstanding")
+            return int(f) if f else None
+
+        return await asyncio.to_thread(_go)
+
     async def fetch_sentiment(
         self: YahooProvider, ticker: str, as_of: datetime
     ) -> RedditMention | None:

@@ -82,8 +82,8 @@ def _seed(cache: ParquetCache) -> None:
             {
                 "ticker": t,
                 "settlement_date": date(2024, 4, 30),
-                "si_shares": 0,
-                "si_pct_float": 0.0,
+                "si_shares": 5_000,
+                "si_pct_float": 0.01,  # small but non-zero so f1 z-score has meaningful spread
                 "avg_daily_volume_20d": 1_000,
             }
         )

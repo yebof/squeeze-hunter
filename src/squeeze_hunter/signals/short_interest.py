@@ -19,6 +19,11 @@ async def compute_si_pct_float(
         if not si_list:
             continue
         latest = max(si_list, key=lambda x: x.settlement_date)
+        if latest.si_pct_float <= 0.0:
+            # No float data for this ticker — exclude from f1 rather than emit 0,
+            # which would pollute the cross-sectional z-score for other tickers.
+            # The ticker still participates in f2-f7.
+            continue
         rows.append({"ticker": t, "raw_value": latest.si_pct_float})
     return Factor(name="f1_si_pct", as_of=clock, values=pd.DataFrame(rows))
 
