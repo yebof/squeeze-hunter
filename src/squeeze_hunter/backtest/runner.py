@@ -80,14 +80,14 @@ async def run_backtest(
             if sig.action == "exit":
                 qty = broker.position_qty(ticker)
                 if qty > 0:
-                    fill = await broker.submit_sell(ticker, qty, last.close, cur)
+                    order = await broker.submit_sell(ticker, qty, last.close, cur)
                     trade_log.append(
                         {
                             "ts": cur,
                             "ticker": ticker,
                             "side": "sell",
                             "qty": qty,
-                            "price": fill.fill_price,
+                            "price": order.avg_fill_price,
                             "reason": sig.reason or "exit",
                         }
                     )
@@ -95,14 +95,14 @@ async def run_backtest(
             elif sig.action == "halve":
                 qty = broker.position_qty(ticker) // 2
                 if qty > 0:
-                    fill = await broker.submit_sell(ticker, qty, last.close, cur)
+                    order = await broker.submit_sell(ticker, qty, last.close, cur)
                     trade_log.append(
                         {
                             "ts": cur,
                             "ticker": ticker,
                             "side": "sell",
                             "qty": qty,
-                            "price": fill.fill_price,
+                            "price": order.avg_fill_price,
                             "reason": "signal_decay_half",
                         }
                     )
@@ -165,22 +165,22 @@ async def run_backtest(
                     continue
                 px = bars[-1].close
                 qty = max(1, int(size_usd // px))
-                fill = await broker.submit_buy(row["ticker"], qty, px, cur)
+                order = await broker.submit_buy(row["ticker"], qty, px, cur)
                 trade_log.append(
                     {
                         "ts": cur,
                         "ticker": row["ticker"],
                         "side": "buy",
                         "qty": qty,
-                        "price": fill.fill_price,
+                        "price": order.avg_fill_price,
                         "reason": "entry",
                         "score": float(row["score"]),
                         "setup_type": row["setup_type"],
                     }
                 )
                 open_states[row["ticker"]] = {
-                    "entry_price": fill.fill_price,
-                    "peak": fill.fill_price,
+                    "entry_price": order.avg_fill_price,
+                    "peak": order.avg_fill_price,
                     "current_score": float(row["score"]),
                     "entry_score": float(row["score"]),
                     "bars_held": 0,

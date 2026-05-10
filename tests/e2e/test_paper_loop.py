@@ -4,6 +4,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from squeeze_hunter.backtest.cost_model import StockCostModel
+from squeeze_hunter.broker.simulator import SimulatorBroker
 from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.execution.lifecycle import LifecycleState
@@ -46,11 +48,20 @@ async def test_runtime_three_ticks_no_crash(tmp_path: Path) -> None:
         pd.DataFrame(columns=["ticker", "report_at", "actual_eps", "estimate_eps"]),
     )
 
+    sim_broker = SimulatorBroker(initial_cash=100_000.0, cost_model=StockCostModel())
+    # Establish a real broker-side position so lifecycle's submit_sell can succeed
+    await sim_broker.submit_buy(
+        ticker="GME",
+        qty=100,
+        limit_price=100.0,
+        ts=base,
+    )
     rc = RuntimeContext(
         cache=cache,
         settings=Settings(),
         tickers=["GME"],
         mode="sim",
+        broker=sim_broker,  # type: ignore[arg-type]
     )
     rc.lifecycle_state = LifecycleState(
         positions={
@@ -66,8 +77,8 @@ async def test_runtime_three_ticks_no_crash(tmp_path: Path) -> None:
         }
     )
     await rc.setup()
-    # Three ticks at increasing time. SimulatorBroker has no fetch_quote, so
-    # lifecycle logs a warning per ticker and continues — no crash.
+    # Three ticks at increasing time. fetch_quote now works correctly —
+    # lifecycle evaluates stops and manages positions without crashing (C4 fix).
     for offset in (0, 60, 120):
         await rc.tick(now=base + timedelta(days=29, seconds=offset))
     await rc.shutdown()

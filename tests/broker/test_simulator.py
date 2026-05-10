@@ -12,14 +12,14 @@ async def test_buy_then_sell_realizes_pnl() -> None:
     await broker.submit_buy(
         ticker="GME",
         qty=100,
-        reference_price=100.0,
+        limit_price=100.0,
         ts=datetime(2024, 5, 13, 14, 0, tzinfo=UTC),
     )
     assert broker.position_qty("GME") == 100
     await broker.submit_sell(
         ticker="GME",
         qty=100,
-        reference_price=120.0,
+        limit_price=120.0,
         ts=datetime(2024, 5, 17, 14, 0, tzinfo=UTC),
     )
     assert broker.position_qty("GME") == 0
@@ -34,7 +34,7 @@ async def test_mark_to_market_updates_equity() -> None:
     await broker.submit_buy(
         ticker="GME",
         qty=100,
-        reference_price=100.0,
+        limit_price=100.0,
         ts=datetime(2024, 5, 13, tzinfo=UTC),
     )
     broker.mark_to_market({"GME": 130.0}, ts=datetime(2024, 5, 14, tzinfo=UTC))

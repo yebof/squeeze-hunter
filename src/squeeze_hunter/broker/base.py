@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(slots=True, frozen=True)
@@ -35,6 +35,7 @@ class BrokerOrder:
     avg_fill_price: float | None = None
 
 
+@runtime_checkable
 class IBroker(Protocol):
     name: str
 
