@@ -62,3 +62,31 @@ async def test_runtime_one_tick_no_signals(tmp_path: Path) -> None:
     await rc.tick(now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     assert rc.metrics_registry is not None
     assert rc.kill_switch_active is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_killswitch_uses_real_telemetry(tmp_path: Path) -> None:
+    """C1 regression: tick() must feed real telemetry to evaluate_killswitch,
+    not all-zero placeholders.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)  # existing helper in this file
+    settings = Settings()
+    rc = RuntimeContext(
+        cache=cache,
+        settings=settings,
+        tickers=["GME"],
+        mode="sim",
+    )
+    await rc.setup()
+    # Simulate a -15% drawdown in the telemetry
+    base_ts = datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+    rc.telemetry.record_equity(base_ts, 100_000.0)
+    rc.telemetry.record_equity(base_ts + timedelta(days=1), 110_000.0)
+    rc.telemetry.record_equity(base_ts + timedelta(days=2), 93_500.0)  # -15% from peak
+    rc.telemetry.record_broker_heartbeat(base_ts + timedelta(days=2))
+    rc.telemetry.record_data_freshness("ibkr_quotes", base_ts + timedelta(days=2))
+
+    await rc.tick(now=base_ts + timedelta(days=2))
+    assert rc.kill_switch_active is True
+    assert rc._kill_reason == "monthly_drawdown"
