@@ -314,7 +314,7 @@ Tuning rules:
 1. **Discrete weights** {0, 0.5, 1.0, 1.5, 2.0}.
 2. **50% rule** — walk-forward test Sharpe drop > 50% from train → reject parameter set.
 3. **Deflated Sharpe** (López de Prado) penalty applied for the number of combos tried.
-4. **Random shuffle test** — permute entry dates 100× and recompute Sharpe; the real strategy must beat the 95th percentile.
+4. **Random shuffle test** — for the realized equity curve, permute its daily returns 200×; for each permutation, fit an OLS trend on the log equity series and compute the slope's t-statistic. The real strategy's t-statistic must exceed the 95th percentile of the permutation distribution. (Sharpe alone is order-invariant under permutation and would not detect timing skill; the OLS-trend t-statistic is order-sensitive and so distinguishes a real edge from noise.)
 5. **Captured-the-event check** — the validation set must hit ≥ 5 of 8 historical squeeze events (entered within 5 trading days of event start).
 6. **Holdout veto** — any holdout metric below `train − 1×SD` → entire strategy goes back for redesign.
 
@@ -353,7 +353,7 @@ Distribution: 3 CAR-type + 3 GME-type + 2 Mixed. The 5/8 hit threshold means the
 
 | Gate | From → To | Conditions |
 | --- | --- | --- |
-| **1** | Backtest → Paper | Holdout Sharpe ≥ 1.0; Sortino ≥ 1.5; MaxDD ≤ 25%; win-rate ≥ 30%; avg payoff ≥ 1.5; captured-the-event hits ≥ 5/8; random-shuffle p < 0.05; deflated Sharpe > 0.5 |
+| **1** | Backtest → Paper | Holdout Sharpe ≥ 1.0; Sortino ≥ 1.5; MaxDD ≤ 25%; win-rate ≥ 30%; avg payoff ≥ 1.5; captured-the-event hits ≥ 5/8; random-shuffle p < 0.05; deflated Sharpe ≥ threshold (default `0.0`; tighten to `0.3+` only when `n_trials ≤ 30`) |
 | **2** | Paper → Small Live ($2–5K) | 30 calendar days of paper; Sharpe ≥ 0.5; 0 kill-switch triggers; 0 broker/data outages > 1h; deviation from backtest expectation < 50% |
 | **3** | Small Live → Normal Size | 60 calendar days of small live; Sharpe ≥ 0.5; 0 operational incidents; total P&L ≥ 0 (net positive or flat) |
 
@@ -578,6 +578,7 @@ These are deliberately deferred from v1; capturing them so they're not forgotten
 - **Multi-account / multi-strategy.** Out of scope for v1. Architecture allows it but config and risk gates would need extension.
 - **Streaming compute.** If signal-decay reaction time matters, replace 60s polling with WebSocket-driven event loop. Not warranted unless paper trading shows we are missing fast unwinds.
 - **Gate failure response.** If Gate 1 fails repeatedly, do we (a) tighten universe / score threshold, (b) drop a setup type, or (c) abandon the strategy? Decision criterion to be set when we see actual failure-mode data.
+- **Phase 0–2 implementation deviations.** The first implementation pass surfaced minor corrections that are now in code but not in the original spec wording: (a) `BacktestProvider.fetch_bars` now clamps cached OHLC to the `low ≤ open,close ≤ high` invariant before constructing `Bar` records (handles upstream Yahoo data quirks); (b) `score.classifier.classify_setups` tolerates missing factor columns by treating them as zero, so partial-coverage scans don't crash; (c) the Bollinger-breakout signal evaluates the squeeze condition on the pre-breakout window, not the breakout day's own (post-expansion) band-width. Each is logged in the corresponding commit on `main`.
 
 ## 9. Validation Sources
 
