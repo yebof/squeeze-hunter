@@ -91,7 +91,13 @@ def captured_events(
     events: list[tuple[str, datetime]],
     window_days: int = 5,
 ) -> int:
-    """Count distinct events whose ticker had any buy within ±`window_days` of event ts."""
+    """Count distinct events whose ticker had any buy within the capture window.
+
+    The window is asymmetric: lookback is ``window_days`` before the event
+    (to credit predictive entries), but the forward allowance is only **1
+    calendar day** after the event start.  Entries more than 1 day after the
+    event are considered late chasing and do NOT count as captured.
+    """
     if trade_log.empty:
         return 0
     hits = 0
@@ -100,7 +106,7 @@ def captured_events(
         match = buys[
             (buys["ticker"] == ticker)
             & (buys["ts"] >= event_ts - timedelta(days=window_days))
-            & (buys["ts"] <= event_ts + timedelta(days=window_days))
+            & (buys["ts"] <= event_ts + timedelta(days=1))
         ]
         if not match.empty:
             hits += 1

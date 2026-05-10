@@ -57,3 +57,52 @@ def test_captured_events_counts_hits() -> None:
     ]
     hit = captured_events(trades, events, window_days=5)
     assert hit == 3
+
+
+def test_captured_events_rejects_late_entries() -> None:
+    """I6 regression: entries after event_ts + 1 day must NOT count as hits.
+
+    A strategy that chases a squeeze 4 days after the peak should not pass
+    the captured-event gate.
+    """
+    trades = pd.DataFrame(
+        [
+            # Entered 4 days AFTER GME's event date — this is chasing, not capturing
+            {"ts": datetime(2024, 5, 17), "ticker": "GME", "side": "buy"},
+        ]
+    )
+    events = [("GME", datetime(2024, 5, 13))]
+    hit = captured_events(trades, events, window_days=5)
+    assert hit == 0
+
+
+def test_captured_events_accepts_same_day_entry() -> None:
+    """Entry on the event date itself counts as captured."""
+    trades = pd.DataFrame([{"ts": datetime(2024, 5, 13), "ticker": "GME", "side": "buy"}])
+    events = [("GME", datetime(2024, 5, 13))]
+    hit = captured_events(trades, events, window_days=5)
+    assert hit == 1
+
+
+def test_captured_events_accepts_one_day_after_entry() -> None:
+    """Entry one calendar day after the event still counts (captures fast moves)."""
+    trades = pd.DataFrame([{"ts": datetime(2024, 5, 14), "ticker": "GME", "side": "buy"}])
+    events = [("GME", datetime(2024, 5, 13))]
+    hit = captured_events(trades, events, window_days=5)
+    assert hit == 1
+
+
+def test_captured_events_rejects_two_days_after_entry() -> None:
+    """Entry two days after the event peak is too late."""
+    trades = pd.DataFrame([{"ts": datetime(2024, 5, 15), "ticker": "GME", "side": "buy"}])
+    events = [("GME", datetime(2024, 5, 13))]
+    hit = captured_events(trades, events, window_days=5)
+    assert hit == 0
+
+
+def test_captured_events_accepts_pre_event_entries_within_window() -> None:
+    """Entry 4 days before event still counts (predictive entry)."""
+    trades = pd.DataFrame([{"ts": datetime(2024, 5, 9), "ticker": "GME", "side": "buy"}])
+    events = [("GME", datetime(2024, 5, 13))]
+    hit = captured_events(trades, events, window_days=5)
+    assert hit == 1

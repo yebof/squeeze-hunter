@@ -9,6 +9,63 @@ from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 
 
+def _cfg_kwargs(**overrides):
+    """Helper: minimal valid WalkForwardConfig kwargs that the validator accepts."""
+    base = {
+        "tickers": ["GME"],
+        "train_start": datetime(2024, 1, 1, tzinfo=UTC),
+        "train_end": datetime(2024, 4, 1, tzinfo=UTC),
+        "test_windows": [
+            (datetime(2024, 4, 2, tzinfo=UTC), datetime(2024, 5, 1, tzinfo=UTC)),
+        ],
+        "holdout": (datetime(2024, 5, 2, tzinfo=UTC), datetime(2024, 6, 1, tzinfo=UTC)),
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_walk_forward_rejects_train_end_after_test_start(tmp_path: Path) -> None:
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            train_end=datetime(2024, 5, 15, tzinfo=UTC),  # after test_windows[0][0]
+        )
+    )
+    cache = ParquetCache(root=tmp_path)
+
+    with pytest.raises(ValueError, match="train_end"):
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+
+
+@pytest.mark.asyncio
+async def test_walk_forward_rejects_overlapping_test_windows(tmp_path: Path) -> None:
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            test_windows=[
+                (datetime(2024, 4, 2, tzinfo=UTC), datetime(2024, 5, 1, tzinfo=UTC)),
+                (datetime(2024, 4, 20, tzinfo=UTC), datetime(2024, 5, 30, tzinfo=UTC)),  # overlaps
+            ],
+        )
+    )
+    cache = ParquetCache(root=tmp_path)
+
+    with pytest.raises(ValueError, match="test_windows"):
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+
+
+@pytest.mark.asyncio
+async def test_walk_forward_rejects_holdout_before_test_end(tmp_path: Path) -> None:
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            holdout=(datetime(2024, 4, 15, tzinfo=UTC), datetime(2024, 5, 1, tzinfo=UTC)),
+        )
+    )
+    cache = ParquetCache(root=tmp_path)
+
+    with pytest.raises(ValueError, match="holdout"):
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+
+
 @pytest.mark.asyncio
 async def test_walk_forward_produces_per_window_metrics(tmp_path: Path) -> None:
     cache = ParquetCache(root=tmp_path)

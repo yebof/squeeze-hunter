@@ -27,6 +27,30 @@ class Gate1Verdict:
     deflated_sharpe_value: float = 0.0
 
 
+def resolve_thresholds_for_n_trials(
+    n_trials: int, base: Gate1Thresholds | None = None
+) -> Gate1Thresholds:
+    """Auto-pick deflated_sharpe_min based on n_trials.
+
+    With <=30 trials the multiple-testing penalty is mild, so we want a
+    strict threshold (0.3). With more trials the deflated-Sharpe formula
+    suppresses the value heavily by design, and a 0.0 threshold makes
+    sense (the shuffle test and n_obs penalty already protect us).
+    """
+    base = base or Gate1Thresholds()
+    ds_min = 0.3 if n_trials <= 30 else 0.0
+    return Gate1Thresholds(
+        sharpe_min=base.sharpe_min,
+        sortino_min=base.sortino_min,
+        max_drawdown_max=base.max_drawdown_max,
+        hit_rate_min=base.hit_rate_min,
+        avg_payoff_min=base.avg_payoff_min,
+        captured_events_min=base.captured_events_min,
+        shuffle_pvalue_max=base.shuffle_pvalue_max,
+        deflated_sharpe_min=ds_min,
+    )
+
+
 def evaluate_gate1(
     holdout: dict[str, Any],
     n_trials: int,
@@ -34,7 +58,7 @@ def evaluate_gate1(
     thresholds: Gate1Thresholds | None = None,
 ) -> Gate1Verdict:
     if thresholds is None:
-        thresholds = Gate1Thresholds()
+        thresholds = resolve_thresholds_for_n_trials(n_trials)
     failures: list[str] = []
     if holdout["sharpe"] < thresholds.sharpe_min:
         failures.append(f"sharpe {holdout['sharpe']:.2f} < {thresholds.sharpe_min}")

@@ -31,6 +31,45 @@ class WalkForwardConfig:
     validation_events: list[tuple[str, datetime]] = field(default_factory=list)
 
 
+def _validate_windows(cfg: WalkForwardConfig) -> None:
+    """Raise ValueError if the walk-forward windows overlap or are out of order."""
+    if cfg.train_end <= cfg.train_start:
+        raise ValueError(
+            f"train_end ({cfg.train_end}) must be after train_start ({cfg.train_start})"
+        )
+
+    if cfg.test_windows:
+        first_test_start = cfg.test_windows[0][0]
+        if cfg.train_end > first_test_start:
+            raise ValueError(
+                f"train_end ({cfg.train_end}) must be <= test_windows[0] start "
+                f"({first_test_start}); windows overlap and would leak training data"
+            )
+
+        for i, (ws, we) in enumerate(cfg.test_windows):
+            if ws >= we:
+                raise ValueError(
+                    f"test_windows[{i}] is internally disordered: start {ws} >= end {we}"
+                )
+
+        for i in range(len(cfg.test_windows) - 1):
+            _, prev_end = cfg.test_windows[i]
+            next_start, _ = cfg.test_windows[i + 1]
+            if prev_end > next_start:
+                raise ValueError(
+                    f"test_windows[{i}] and test_windows[{i + 1}] overlap: "
+                    f"window {i} ends {prev_end}, window {i + 1} starts {next_start}"
+                )
+
+        last_test_end = cfg.test_windows[-1][1]
+        holdout_start = cfg.holdout[0]
+        if holdout_start < last_test_end:
+            raise ValueError(
+                f"holdout start ({holdout_start}) must be >= last test_windows end "
+                f"({last_test_end}); holdout overlaps with test data"
+            )
+
+
 def _summarize(result: BacktestResult, events: list[tuple[str, datetime]]) -> dict[str, Any]:
     eq = result.equity_curve
     hit, payoff = hit_rate_and_payoff(result.trade_log)
@@ -53,6 +92,8 @@ async def run_walk_forward(
     cache: ParquetCache,
     settings: Settings,
 ) -> dict[str, Any]:
+    _validate_windows(cfg)
+
     async def _bt(start: datetime, end: datetime) -> BacktestResult:
         return await run_backtest(
             BacktestConfig(
