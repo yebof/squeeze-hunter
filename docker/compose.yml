@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: squeeze
+      POSTGRES_PASSWORD: squeeze
+      POSTGRES_DB: squeeze
+    ports: ["5432:5432"]
+    volumes:
+      - ./.data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U squeeze"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: squeeze
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./.data/grafana:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  ib-gateway:
+    build:
+      context: .
+      dockerfile: ib-gateway.dockerfile
+    environment:
+      TWS_USERID:    ${IBKR_USERID}
+      TWS_PASSWORD:  ${IBKR_PASSWORD}
+      TRADING_MODE:  paper
+    ports:
+      - "7497:7497"   # paper TWS / API
+      - "5901:5900"   # VNC for debugging
+    restart: unless-stopped
