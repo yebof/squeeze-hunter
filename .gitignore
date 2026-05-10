@@ -1,0 +1,38 @@
+# Brainstorming session artifacts (visual mockups, ephemeral state)
+.superpowers/
+
+# Secrets — IBKR creds, Telegram token, Slack webhook, etc.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+*.egg-info/
+dist/
+build/
+
+# Data volumes (parquet history, postgres data dir, logs, backups)
+data/parquet/
+data/postgres/
+logs/
+backups/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# uv
+.python-version
