@@ -50,18 +50,27 @@ class BacktestProvider:
             return []
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
         mask = (df["ts"] >= start) & (df["ts"] <= end) & (df["ts"] <= self.clock.now)
-        return [
-            Bar(
-                ticker=row["ticker"],
-                ts=row["ts"].to_pydatetime(),
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=int(row["volume"]),
+        bars = []
+        for _, row in df[mask].iterrows():
+            o = float(row["open"])
+            h = float(row["high"])
+            lo = float(row["low"])
+            c = float(row["close"])
+            # Clamp high/low so OHLC constraints hold even for noisy cached data.
+            h = max(h, o, c)
+            lo = min(lo, o, c)
+            bars.append(
+                Bar(
+                    ticker=row["ticker"],
+                    ts=row["ts"].to_pydatetime(),
+                    open=o,
+                    high=h,
+                    low=lo,
+                    close=c,
+                    volume=int(row["volume"]),
+                )
             )
-            for _, row in df[mask].iterrows()
-        ]
+        return bars
 
     async def fetch_quote(self: BacktestProvider, ticker: str) -> Quote:
         bars = await self.fetch_bars(
