@@ -6,13 +6,31 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
-from ib_async import IB, Stock
+from ib_async import IB, LimitOrder, MarketOrder, Stock
 
-from squeeze_hunter.broker.base import BrokerHealth, Quote
+from squeeze_hunter.broker.base import BrokerHealth, BrokerOrder, Quote
 from squeeze_hunter.logging_setup import get_logger
 
 log = get_logger("broker.ibkr")
+
+_STATUS_MAP = {
+    "PendingSubmit": "pending",
+    "PendingCancel": "pending",
+    "PreSubmitted": "pending",
+    "Submitted": "pending",
+    "ApiPending": "pending",
+    "Filled": "filled",
+    "Cancelled": "cancelled",
+    "ApiCancelled": "cancelled",
+    "Inactive": "rejected",
+}
+
+
+def _translate_status(ibkr_status: str) -> str:
+    return _STATUS_MAP.get(ibkr_status, "pending")
+
 
 _IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
 _IBKR_PORT = int(os.environ.get("IBKR_PORT", "7497"))
@@ -62,3 +80,86 @@ class IBKRBroker:
             last_ping_ms=0,
             account=self.account,
         )
+
+    async def submit_buy(
+        self: IBKRBroker,
+        ticker: str,
+        qty: int,
+        limit_price: float | None,
+        ts: datetime,
+    ) -> BrokerOrder:
+        contract = Stock(ticker, "SMART", "USD")
+        await self._ib.qualifyContractsAsync(contract)
+        order = LimitOrder("BUY", qty, limit_price) if limit_price else MarketOrder("BUY", qty)
+        trade = self._ib.placeOrder(contract, order)
+        log.info(
+            "order_submitted",
+            ticker=ticker,
+            side="buy",
+            qty=qty,
+            limit=limit_price,
+            broker_order_id=trade.order.orderId,
+        )
+        return BrokerOrder(
+            broker_order_id=str(trade.order.orderId),
+            ticker=ticker,
+            side="buy",
+            qty=qty,
+            limit_price=limit_price,
+            status=_translate_status(trade.orderStatus.status),
+        )
+
+    async def submit_sell(
+        self: IBKRBroker,
+        ticker: str,
+        qty: int,
+        limit_price: float | None,
+        ts: datetime,
+    ) -> BrokerOrder:
+        contract = Stock(ticker, "SMART", "USD")
+        await self._ib.qualifyContractsAsync(contract)
+        order = LimitOrder("SELL", qty, limit_price) if limit_price else MarketOrder("SELL", qty)
+        trade = self._ib.placeOrder(contract, order)
+        log.info(
+            "order_submitted",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit=limit_price,
+            broker_order_id=trade.order.orderId,
+        )
+        return BrokerOrder(
+            broker_order_id=str(trade.order.orderId),
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status=_translate_status(trade.orderStatus.status),
+        )
+
+    async def cancel_order(self: IBKRBroker, broker_order_id: str) -> bool:
+        for trade in self._ib.openTrades():
+            if str(trade.order.orderId) == broker_order_id:
+                self._ib.cancelOrder(trade.order)
+                return True
+        return False
+
+    async def get_open_orders(self: IBKRBroker) -> list[BrokerOrder]:
+        out = []
+        for trade in self._ib.openTrades():
+            contract = trade.contract
+            order = trade.order
+            st = trade.orderStatus
+            out.append(
+                BrokerOrder(
+                    broker_order_id=str(order.orderId),
+                    ticker=getattr(contract, "symbol", ""),
+                    side="buy" if order.action == "BUY" else "sell",
+                    qty=int(order.totalQuantity),
+                    limit_price=getattr(order, "lmtPrice", None) or None,
+                    status=_translate_status(st.status),
+                    filled_qty=int(st.filled or 0),
+                    avg_fill_price=float(st.avgFillPrice) if st.avgFillPrice else None,
+                )
+            )
+        return out
