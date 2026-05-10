@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -115,6 +115,78 @@ def ingest_earnings(
     cache = ParquetCache(root=parquet_root)
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
     asyncio.run(backfill_earnings(tickers, cache))
+
+
+@app.command()
+def backtest(
+    train_start: Annotated[str, typer.Option("--train-start")],
+    train_end: Annotated[str, typer.Option("--train-end")],
+    test_windows: Annotated[
+        list[str], typer.Option("--test-window", help="ISO range, e.g. 2022-01-01:2022-12-31")
+    ],
+    holdout_range: Annotated[str, typer.Option("--holdout")],
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+    config_path: Annotated[Path, typer.Option("--config")] = Path("config/settings.example.yml"),
+    out: Annotated[Path, typer.Option("--out")] = Path("data/backtests"),
+    n_trials: Annotated[int, typer.Option("--n-trials")] = 1,
+) -> None:
+    """Run walk-forward backtest and produce a Gate 1 verdict."""
+    from squeeze_hunter.backtest.gate1 import evaluate_gate1
+    from squeeze_hunter.backtest.walk_forward import WalkForwardConfig, run_walk_forward
+
+    configure_logging()
+    settings = load_settings(config_path)
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+
+    def _parse_range(s: str) -> tuple[datetime, datetime]:
+        a, b = s.split(":")
+        return (
+            datetime.fromisoformat(a).replace(tzinfo=UTC),
+            datetime.fromisoformat(b).replace(tzinfo=UTC),
+        )
+
+    cfg = WalkForwardConfig(
+        tickers=tickers,
+        train_start=datetime.fromisoformat(train_start).replace(tzinfo=UTC),
+        train_end=datetime.fromisoformat(train_end).replace(tzinfo=UTC),
+        test_windows=[_parse_range(w) for w in test_windows],
+        holdout=_parse_range(holdout_range),
+    )
+    report = asyncio.run(run_walk_forward(cfg, cache=cache, settings=settings))
+    out.mkdir(parents=True, exist_ok=True)
+    holdout_eq = report["raw"]["holdout_equity"]
+    n_obs = max(20, len(holdout_eq.dropna()))
+    verdict = evaluate_gate1(report["holdout"], n_trials=n_trials, n_obs=n_obs)
+    holdout_eq.to_csv(out / "holdout_equity.csv")
+    report["raw"]["trades"].to_csv(out / "holdout_trades.csv", index=False)
+    summary_path = out / "gate1_report.txt"
+    summary_path.write_text(_format_report(report, verdict))
+    typer.echo(summary_path.read_text())
+
+
+def _format_report(report: dict, verdict: Any) -> str:
+    lines = ["=== Walk-forward report ==="]
+    for label, m in [
+        ("Train", report["train"]),
+        *[(f"Test[{i}]", m) for i, m in enumerate(report["test_windows"])],
+        ("Holdout", report["holdout"]),
+    ]:
+        lines.append(
+            f"{label:8s}  Sharpe={m['sharpe']:.2f}  Sortino={m['sortino']:.2f}  "
+            f"MaxDD={m['max_drawdown']:.2%}  Hit={m['hit_rate']:.2f}  "
+            f"Payoff={m['avg_payoff']:.2f}  Captured={m['captured_events']}  "
+            f"ShuffleP={m['shuffle_pvalue']:.3f}  Trades={m['n_trades']}"
+        )
+    lines.append("")
+    lines.append("=== Gate 1 verdict ===")
+    lines.append(f"PASSED: {verdict.passed}")
+    if verdict.failures:
+        for f in verdict.failures:
+            lines.append(f"  - {f}")
+    lines.append(f"deflated_sharpe = {verdict.deflated_sharpe_value:.3f}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
