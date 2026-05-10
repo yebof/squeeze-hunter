@@ -145,6 +145,7 @@ async def test_runner_takes_position_and_records_pnl(tmp_path: Path) -> None:
         start=datetime(2024, 5, 14, tzinfo=UTC),
         end=datetime(2024, 5, 28, tzinfo=UTC),
         initial_cash=100_000.0,
+        score_threshold=3.0,  # synthetic universe produces lower scores than live; production keeps 8.0
     )
     result = await run_backtest(cfg, cache=cache, settings=settings)
     assert result.equity_curve.iloc[-1] != pytest.approx(100_000.0)  # something happened
