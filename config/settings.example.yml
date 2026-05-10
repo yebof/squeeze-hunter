@@ -1,0 +1,26 @@
+score:
+  threshold: 8.0
+  weights:
+    f1_si_pct: 2.0
+    f2_days_to_cover: 1.0
+    f3_earnings_reaction: 2.0
+    f4_wsb_mention: 1.5
+    f5_call_oi_velocity: 1.5
+    f6_bollinger_breakout: 1.0
+    f7_volume_spike: 1.0
+risk:
+  kelly_fraction: 0.20
+  position_cap: 0.08
+  max_positions: 6
+  max_new_per_day: 3
+  max_gross_exposure: 0.90
+stops:
+  hard_stop: -0.12
+  trailing_car: -0.20
+  trailing_gme: -0.25
+  time_stop_days: 21
+universe:
+  min_market_cap: 200000000
+  max_market_cap: 10000000000
+  min_price: 5.0
+  min_days_listed: 30
