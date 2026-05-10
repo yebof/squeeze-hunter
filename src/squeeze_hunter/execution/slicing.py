@@ -1,0 +1,71 @@
+"""TWAP slicer for entry orders.
+
+Spec Section 6:
+    09:30-09:35  no orders (avoid open-auction noise)
+    09:35-09:55  TWAP 6-8 slices, ~150-180s apart
+                 limit price = mid + 0.5 * spread
+                 after 5 unfilled → switch to mid + 1 * spread on remaining
+                 after 80% unfilled → marketable limits
+                 hard cap at 09:55 → marketable limits
+
+This module produces the *plan* — the OMS (Task 3.4) executes it and re-prices
+slices on the fly using current quotes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+
+@dataclass(slots=True, frozen=True)
+class Slice:
+    submit_at: datetime
+    qty: int
+    limit_price: float
+    aggression_bps: float  # 0 = mid, +50 = marketable buy
+
+
+@dataclass(slots=True, frozen=True)
+class TwapPlan:
+    ticker: str
+    side: str  # "buy" | "sell"
+    slices: list[Slice]
+
+
+def build_twap_plan(
+    total_qty: int,
+    reference_price: float,
+    market_open: datetime,
+    *,
+    ticker: str = "",
+    side: str = "buy",
+    n_slices: int = 6,
+    window_minutes: int = 20,
+    slice_offset_minutes: int = 5,
+    starting_aggression_bps: float = 5.0,
+    ending_aggression_bps: float = 30.0,
+) -> TwapPlan:
+    if total_qty <= 0 or n_slices <= 0:
+        return TwapPlan(ticker=ticker, side=side, slices=[])
+    base_qty = total_qty // n_slices
+    remainder = total_qty - base_qty * n_slices
+    spacing = timedelta(seconds=(window_minutes * 60) // max(n_slices - 1, 1))
+    start = market_open + timedelta(minutes=slice_offset_minutes)
+    slices: list[Slice] = []
+    for i in range(n_slices):
+        qty = base_qty + (remainder if i == n_slices - 1 else 0)
+        agg = starting_aggression_bps + (
+            (ending_aggression_bps - starting_aggression_bps) * i / max(n_slices - 1, 1)
+        )
+        bps = agg if side == "buy" else -agg
+        limit_price = reference_price * (1 + bps / 10_000)
+        slices.append(
+            Slice(
+                submit_at=start + spacing * i,
+                qty=qty,
+                limit_price=limit_price,
+                aggression_bps=agg,
+            )
+        )
+    return TwapPlan(ticker=ticker, side=side, slices=slices)
