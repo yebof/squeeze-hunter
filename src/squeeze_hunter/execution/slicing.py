@@ -18,6 +18,44 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 
+def default_aggression_schedule(
+    n_slices: int,
+    starting_bps: float = 5.0,
+    ending_bps: float = 30.0,
+) -> list[float]:
+    """Per-slice aggression bps under normal (well-filling) conditions.
+
+    Returns a list of length n_slices that linearly interpolates from
+    starting_bps to ending_bps.
+    """
+    if n_slices <= 0:
+        return []
+    if n_slices == 1:
+        return [starting_bps]
+    return [
+        starting_bps + (ending_bps - starting_bps) * i / (n_slices - 1) for i in range(n_slices)
+    ]
+
+
+def escalate_aggression(
+    base_bps: float,
+    slices_submitted: int,
+    slices_filled: int,
+    marketable_bps: float = 50.0,
+    marketable_unfilled_threshold: float = 0.80,
+) -> float:
+    """If fills are lagging, escalate to marketable territory.
+
+    Returns the aggression bps to use for the next slice.
+    """
+    if slices_submitted == 0:
+        return base_bps
+    unfilled_pct = (slices_submitted - slices_filled) / slices_submitted
+    if unfilled_pct >= marketable_unfilled_threshold:
+        return marketable_bps
+    return base_bps
+
+
 @dataclass(slots=True, frozen=True)
 class Slice:
     submit_at: datetime
