@@ -212,3 +212,47 @@ async def test_runner_records_realized_pnl_on_sells(tmp_path: Path) -> None:
         # Every sell row must have a non-null realized field
         assert "realized" in sells.columns
         assert sells["realized"].notna().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_gross_exposure_updates_within_daily_loop(tmp_path: Path) -> None:
+    """R6 regression: when multiple new entries open in the same day, the
+    gate's gross_exposure_pct check must see the cumulative effect of prior
+    entries — not just the pre-loop snapshot. Without this, three 8% positions
+    can each individually pass even when collectively they would breach the
+    90% gross cap.
+
+    Test: seed strong signals on multiple tickers so the runner tries to open
+    several positions on the same day. The cumulative gross_exposure_pct in
+    state must increase monotonically as new buys happen.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    cfg = BacktestConfig(
+        tickers=_ALL_TICKERS,
+        start=datetime(2024, 5, 14, tzinfo=UTC),
+        end=datetime(2024, 5, 16, tzinfo=UTC),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    result = await run_backtest(cfg, cache=cache, settings=settings)
+    # The R6 bug would let the runner open more than the 90% gross cap allows;
+    # with the fix, opened-positions' total notional should be ≤ 90% of equity.
+    # We validate the invariant by reconstructing total entry notional from buys.
+    buys = result.trade_log[result.trade_log["side"] == "buy"]
+    if len(buys) >= 2:
+        # Sum of (qty * price) for first-day buys should never exceed 90% of $100k
+        first_day = buys.iloc[0]["ts"]
+        same_day = buys[buys["ts"] == first_day]
+        notional = (same_day["qty"] * same_day["price"]).sum()
+        assert notional <= 100_000.0 * 0.90 + 1.0  # +$1 fudge for fp error

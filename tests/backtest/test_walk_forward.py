@@ -67,6 +67,66 @@ async def test_walk_forward_rejects_holdout_before_test_end(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_walk_forward_rejects_holdout_overlap_with_empty_test_windows(
+    tmp_path: Path,
+) -> None:
+    """R3 regression: when test_windows=[], the holdout/train overlap check
+    must still fire. Previously the entire holdout/train check was guarded
+    by `if cfg.test_windows:`, which meant an empty test_windows list let
+    a holdout window inside the training range pass silently — leaking
+    training data into Gate 1 evaluation.
+    """
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            test_windows=[],
+            holdout=(datetime(2024, 2, 15, tzinfo=UTC), datetime(2024, 3, 15, tzinfo=UTC)),
+            # holdout starts inside the training range (train_start=2024-1-1, train_end=2024-4-1)
+        )
+    )
+    cache = ParquetCache(root=tmp_path)
+    with pytest.raises(ValueError, match="holdout.*train"):
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+
+
+@pytest.mark.asyncio
+async def test_walk_forward_rejects_internally_disordered_holdout(
+    tmp_path: Path,
+) -> None:
+    """holdout start >= holdout end is invalid regardless of test_windows."""
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            test_windows=[],
+            holdout=(datetime(2024, 6, 1, tzinfo=UTC), datetime(2024, 5, 1, tzinfo=UTC)),
+        )
+    )
+    cache = ParquetCache(root=tmp_path)
+    with pytest.raises(ValueError, match="holdout"):
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+
+
+@pytest.mark.asyncio
+async def test_walk_forward_accepts_empty_test_windows_when_holdout_after_train(
+    tmp_path: Path,
+) -> None:
+    """Empty test_windows is valid as long as holdout starts after train_end."""
+    cfg = WalkForwardConfig(
+        **_cfg_kwargs(
+            test_windows=[],
+            holdout=(datetime(2024, 5, 2, tzinfo=UTC), datetime(2024, 6, 1, tzinfo=UTC)),
+        )
+    )
+    # We are NOT exercising the full backtest here — just the validation.
+    # The function will attempt to actually run; for that, seed minimal data.
+    cache = ParquetCache(root=tmp_path)
+    # Empty cache → backtest will produce empty results but validation passes.
+    # No ValueError expected.
+    try:
+        await run_walk_forward(cfg, cache=cache, settings=Settings())
+    except ValueError:
+        pytest.fail("validation rejected a valid config")
+
+
+@pytest.mark.asyncio
 async def test_walk_forward_produces_per_window_metrics(tmp_path: Path) -> None:
     cache = ParquetCache(root=tmp_path)
     base = datetime(2024, 1, 1, tzinfo=UTC)

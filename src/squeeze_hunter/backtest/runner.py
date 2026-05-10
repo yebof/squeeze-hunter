@@ -193,6 +193,13 @@ async def run_backtest(
                 trades = len(setup_sells)
                 wins_pl = [r["realized"] for r in setup_sells if r.get("realized", 0) > 0]
                 losses_pl = [-r["realized"] for r in setup_sells if r.get("realized", 0) < 0]
+                # Use observed win/loss ratio when both sides have happened.
+                # When only wins or only losses are observed, fall back to the
+                # per-setup prior payoff. The Bayesian shrinkage inside
+                # kelly_position_pct still blends observed win-rate with prior
+                # win-rate, so an all-wins streak still raises Kelly above the
+                # prior baseline — just not unboundedly. This is intentionally
+                # conservative (R9 reviewed and accepted).
                 avg_payoff = (
                     (sum(wins_pl) / max(len(wins_pl), 1))
                     / max(sum(losses_pl) / max(len(losses_pl), 1), 1.0)
@@ -249,6 +256,11 @@ async def run_backtest(
                 }
                 state.positions[row["ticker"]] = qty
                 state.opened_today += 1
+                # R6: update gross_exposure_pct so the next gate evaluation in
+                # this same daily loop sees the cumulative exposure. Without
+                # this, three new entries can each pass the gate when they
+                # would collectively breach the 90% cap.
+                state.gross_exposure_pct += size_usd / state.equity_usd
 
         # 4) Mark-to-market end of day
         broker.mark_to_market(marks, ts=cur)

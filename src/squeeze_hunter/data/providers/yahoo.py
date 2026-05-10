@@ -111,9 +111,14 @@ class YahooProvider:
             if isinstance(cal, dict) and cal.get("Earnings Date"):
                 raw_ts = cal["Earnings Date"][0]
                 if pd.notna(raw_ts):
-                    ts: datetime = cast(
-                        datetime, pd.Timestamp(raw_ts).tz_localize("UTC").to_pydatetime()
-                    )
+                    raw_pd_ts = pd.Timestamp(raw_ts)
+                    # Modern yfinance returns tz-aware timestamps for many tickers;
+                    # tz_localize on an already-aware Timestamp raises TypeError.
+                    if raw_pd_ts.tzinfo is None:
+                        utc_ts = raw_pd_ts.tz_localize("UTC")
+                    else:
+                        utc_ts = raw_pd_ts.tz_convert("UTC")
+                    ts: datetime = cast(datetime, utc_ts.to_pydatetime())
                     events.append(
                         EarningsEvent(
                             ticker=ticker,

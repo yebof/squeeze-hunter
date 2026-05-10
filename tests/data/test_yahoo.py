@@ -21,6 +21,47 @@ async def test_yahoo_fetch_earnings_handles_pd_nat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_yahoo_fetch_earnings_handles_tz_aware_timestamp() -> None:
+    """R4 regression: modern yfinance returns tz-aware Timestamps for many tickers.
+    Calling tz_localize on an aware Timestamp raises TypeError; the previous
+    code crashed for any non-naive earnings date.
+    """
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.calendar = {
+        "Earnings Date": [pd.Timestamp("2024-05-13 16:30", tz="US/Eastern")],
+        "Earnings Average": 0.05,
+    }
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        events = await p.fetch_earnings("GME")
+    assert len(events) == 1
+    # tz_convert preserves the absolute instant; assert UTC equivalent of 16:30 ET
+    # 16:30 ET in May (EDT, UTC-4) → 20:30 UTC
+    assert events[0].report_at.hour == 20
+    assert events[0].report_at.minute == 30
+    assert events[0].report_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_yahoo_fetch_earnings_handles_naive_timestamp() -> None:
+    """Naive timestamp should still work — tz_localize path."""
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.calendar = {
+        "Earnings Date": [pd.Timestamp("2024-05-13 12:00")],  # naive
+        "Earnings Average": 0.05,
+    }
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        events = await p.fetch_earnings("GME")
+    assert len(events) == 1
+    assert events[0].report_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
 async def test_yahoo_fetch_bars_normalizes() -> None:
     fake = pd.DataFrame(
         {

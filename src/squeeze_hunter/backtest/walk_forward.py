@@ -38,6 +38,20 @@ def _validate_windows(cfg: WalkForwardConfig) -> None:
             f"train_end ({cfg.train_end}) must be after train_start ({cfg.train_start})"
         )
 
+    # Holdout must always start after train_end, regardless of whether test_windows
+    # is populated. Empty test_windows is a valid configuration (e.g., n_trials=1
+    # backtest path) but does NOT exempt the holdout/train relationship.
+    holdout_start, holdout_end = cfg.holdout
+    if holdout_start >= holdout_end:
+        raise ValueError(
+            f"holdout is internally disordered: start {holdout_start} >= end {holdout_end}"
+        )
+    if holdout_start < cfg.train_end:
+        raise ValueError(
+            f"holdout start ({holdout_start}) must be >= train_end ({cfg.train_end}); "
+            "holdout overlaps training data"
+        )
+
     if cfg.test_windows:
         first_test_start = cfg.test_windows[0][0]
         if cfg.train_end > first_test_start:
@@ -62,7 +76,6 @@ def _validate_windows(cfg: WalkForwardConfig) -> None:
                 )
 
         last_test_end = cfg.test_windows[-1][1]
-        holdout_start = cfg.holdout[0]
         if holdout_start < last_test_end:
             raise ValueError(
                 f"holdout start ({holdout_start}) must be >= last test_windows end "
