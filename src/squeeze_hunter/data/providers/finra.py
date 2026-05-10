@@ -102,3 +102,9 @@ class FinraProvider:
         self: FinraProvider, *_a: object, **_kw: object
     ) -> RedditMention | None:
         return None
+
+    async def fetch_option_chain_at(
+        self: FinraProvider, ticker: str, as_of: datetime
+    ) -> OptionChain:
+        """Live providers don't yet cache historical option chains. Returns empty."""
+        return OptionChain(underlying=ticker, as_of=as_of, spot=0.0, quotes=[])

@@ -47,3 +47,7 @@ class DataProvider(Protocol):
     async def fetch_sentiment(
         self: DataProvider, ticker: str, as_of: datetime
     ) -> RedditMention | None: ...
+
+    async def fetch_option_chain_at(
+        self: DataProvider, ticker: str, as_of: datetime
+    ) -> OptionChain: ...

@@ -31,8 +31,11 @@ async def compute_call_oi_velocity(
     *,
     _archive: dict[tuple[str, date], OptionChain] | None = None,
 ) -> Factor:
-    archive = _archive or {}
+    """When `_archive` is None, query provider.fetch_option_chain_at for the
+    7-day-prior chain. The `_archive` parameter is retained as a test seam.
+    """
     rows = []
+    prior_date = (clock - timedelta(days=7)).date()
     for t in tickers:
         try:
             today = await provider.fetch_option_chain(t)
@@ -43,8 +46,16 @@ async def compute_call_oi_velocity(
             rows.append({"ticker": t, "raw_value": 0.0})
             continue
         oi_today = _atm_call_oi(today)
-        prior_date = (clock - timedelta(days=7)).date()
-        prior = archive.get((t, prior_date))
+
+        # Prefer test archive if provided; fall back to provider lookup
+        prior: OptionChain | None = None
+        if _archive is not None:
+            prior = _archive.get((t, prior_date))
+        if prior is None or not prior.quotes:
+            try:
+                prior = await provider.fetch_option_chain_at(t, clock - timedelta(days=7))
+            except (NotImplementedError, LookupError, AttributeError):
+                prior = None
         if prior is None or not prior.quotes:
             rows.append({"ticker": t, "raw_value": 0.0})
             continue

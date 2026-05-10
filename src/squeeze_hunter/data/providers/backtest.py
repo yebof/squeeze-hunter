@@ -107,6 +107,38 @@ class BacktestProvider:
         spot = float(df["spot"].iloc[0]) if "spot" in df.columns else 0.0
         return OptionChain(underlying=ticker, as_of=self.clock.now, spot=spot, quotes=quotes)
 
+    async def fetch_option_chain_at(
+        self: BacktestProvider, ticker: str, as_of: datetime
+    ) -> OptionChain:
+        """Read a historical option chain from cache.
+
+        Reads the parquet partition for the requested date. If absent, returns an
+        empty OptionChain (so the caller distinguishes "no data" from "real zeros").
+        Respects the clock — cannot read future dates.
+        """
+        if as_of > self.clock.now:
+            return OptionChain(underlying=ticker, as_of=as_of, spot=0.0, quotes=[])
+        df = self.cache.read_partition("options", f"{ticker}__{as_of.date().isoformat()}")
+        if df.empty:
+            return OptionChain(underlying=ticker, as_of=as_of, spot=0.0, quotes=[])
+        from squeeze_hunter.data.schema import OptionQuote
+
+        quotes = [
+            OptionQuote(
+                strike=float(r["strike"]),
+                expiry=date.fromisoformat(str(r["expiry"])),
+                right=r["right"],
+                open_interest=int(r["open_interest"]),
+                volume=int(r["volume"]),
+                implied_vol=float(r["implied_vol"]),
+                bid=float(r.get("bid", 0.0)),
+                ask=float(r.get("ask", 0.0)),
+            )
+            for _, r in df.iterrows()
+        ]
+        spot = float(df["spot"].iloc[0]) if "spot" in df.columns else 0.0
+        return OptionChain(underlying=ticker, as_of=as_of, spot=spot, quotes=quotes)
+
     async def fetch_short_interest(
         self: BacktestProvider, ticker: str, since: date | None = None
     ) -> list[ShortInterest]:
