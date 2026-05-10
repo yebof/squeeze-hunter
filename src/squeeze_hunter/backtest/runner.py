@@ -24,7 +24,7 @@ class BacktestConfig:
     start: datetime
     end: datetime
     initial_cash: float = 100_000.0
-    score_threshold: float = 3.0
+    score_threshold: float = 8.0  # production default per design doc; tests may override
     kelly: KellyParams = field(default_factory=KellyParams)
 
 
