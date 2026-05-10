@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty type check
+        entry: uv run ty check src
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: pytest-fast
+        name: pytest (fast unit tests)
+        entry: uv run pytest -m "not slow and not integration" -x -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

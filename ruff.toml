@@ -1,0 +1,28 @@
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = [
+    "E", "F", "W",      # pycodestyle / pyflakes
+    "I",                # isort
+    "N",                # naming
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "SIM",              # simplify
+    "RUF",              # ruff-specific
+    "T20",              # no print
+    "PT",               # pytest style
+    "ANN",              # require annotations
+]
+ignore = [
+    "ANN401",           # allow Any for adapter boundaries
+    "E501",             # ruff-format handles line length
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "T20"]      # tests can skip annotations and use print
+"alembic/versions/*" = ["ANN", "N"]   # generated migrations
+
+[format]
+quote-style = "double"
+indent-style = "space"
