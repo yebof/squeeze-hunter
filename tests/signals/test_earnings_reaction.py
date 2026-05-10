@@ -12,6 +12,35 @@ def _bar(ticker: str, ts: datetime, close: float, volume: int) -> Bar:
 
 
 @pytest.mark.asyncio
+async def test_earnings_reaction_uses_trading_days_for_window() -> None:
+    """B4: the 5-day decay window must be in trading days, not calendar days.
+
+    Scenario: report is pre-market Friday (08:00 UTC), clock is Thursday evening
+    (20:30 UTC) the following week.  That is 6 calendar days (.days == 6) but only
+    4 trading days (Mon, Tue, Wed, Thu).  The old calendar-day filter saw 6 > 5 and
+    dropped the event; the corrected trading-day filter keeps it and decay=0.2>0.
+    """
+    earnings_friday = datetime(2024, 5, 10, 8, 0, tzinfo=UTC)  # Friday pre-market
+    later_thursday = datetime(
+        2024, 5, 16, 20, 30, tzinfo=UTC
+    )  # Thursday evening (6 cal / 4 trading days later)
+    pre_bars = [
+        _bar("GME", earnings_friday - timedelta(days=d), 18.0, 1_000_000) for d in range(20, 0, -1)
+    ]
+    post_bar = _bar("GME", earnings_friday + timedelta(days=1), 22.0, 8_000_000)
+    provider = AsyncMock()
+    provider.fetch_earnings.return_value = [
+        EarningsEvent(ticker="GME", report_at=earnings_friday, actual_eps=0.10, estimate_eps=0.05)
+    ]
+    provider.fetch_bars.return_value = [*pre_bars, post_bar]
+    factor = await compute_earnings_reaction(["GME"], provider, later_thursday)
+    out = factor.values.set_index("ticker")
+    # 4 trading days later, decay=0.2 → nonzero raw_value
+    # (with the old calendar-day filter: 6 cal-days > 5 → would be dropped, raw=0)
+    assert out.loc["GME", "raw_value"] != 0.0
+
+
+@pytest.mark.asyncio
 async def test_earnings_reaction_uses_post_event_gap_and_volume() -> None:
     earnings_at = datetime(2024, 5, 12, 20, 30, tzinfo=UTC)  # AMC, 2024-05-12
     pre_bars = [

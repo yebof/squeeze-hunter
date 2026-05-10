@@ -15,10 +15,25 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from math import log
 
+import numpy as np
 import pandas as pd
 
 from squeeze_hunter.data.protocol import DataProvider
 from squeeze_hunter.signals.base import Factor
+
+
+def _trading_days_between(d1: datetime, d2: datetime) -> int:
+    """Count trading days from d1 to d2 (exclusive of d2 start, inclusive of d2 end).
+
+    Uses numpy.busday_count which counts Mon-Fri business days.
+    Returns a positive integer when d2 > d1.
+    """
+    return int(
+        np.busday_count(
+            d1.date() if hasattr(d1, "date") else d1,
+            d2.date() if hasattr(d2, "date") else d2,
+        )
+    )
 
 
 async def compute_earnings_reaction(
@@ -28,7 +43,10 @@ async def compute_earnings_reaction(
     horizon_days = 5
     for t in tickers:
         events = await provider.fetch_earnings(t)
-        recent = [e for e in events if 0 <= (clock - e.report_at).days <= horizon_days]
+        # B4 fix: filter by trading days, not calendar days
+        recent = [
+            e for e in events if 0 <= _trading_days_between(e.report_at, clock) <= horizon_days
+        ]
         if not recent:
             rows.append({"ticker": t, "raw_value": 0.0})
             continue
@@ -51,8 +69,8 @@ async def compute_earnings_reaction(
         avg_vol = sum(b.volume for b in last_20) / max(len(last_20), 1)
         ratio = first_post.volume / avg_vol if avg_vol > 0 else 1.0
         raw = (1 if gap >= 0 else -1) * abs(gap) * log(1 + max(0.0, ratio - 1.0))
-        # decay: linear over horizon
-        days_old = (clock - ev.report_at).days
+        # decay: linear over horizon (in trading days)
+        days_old = _trading_days_between(ev.report_at, clock)
         decay = max(0.0, 1.0 - days_old / horizon_days)
         rows.append({"ticker": t, "raw_value": raw * decay})
     return Factor(name="f3_earnings_reaction", as_of=clock, values=pd.DataFrame(rows))

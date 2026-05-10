@@ -106,3 +106,15 @@ def test_captured_events_accepts_pre_event_entries_within_window() -> None:
     events = [("GME", datetime(2024, 5, 13))]
     hit = captured_events(trades, events, window_days=5)
     assert hit == 1
+
+
+def test_sharpe_uses_sample_std_ddof_1() -> None:
+    """B1: Sharpe must use sample std (ddof=1), the financial convention."""
+    rng = np.random.default_rng(42)
+    rets = rng.normal(0.001, 0.01, 252)
+    eq = (1 + pd.Series(rets)).cumprod() * 100_000
+    eq.index = pd.date_range("2024-01-01", periods=len(eq), freq="B")
+    sr = sharpe(eq)
+    daily_returns_calc = eq.pct_change().dropna()
+    expected = float(daily_returns_calc.mean() / daily_returns_calc.std(ddof=1) * np.sqrt(252))
+    assert sr == pytest.approx(expected, rel=1e-6)

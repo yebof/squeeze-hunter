@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 
 from squeeze_hunter.data.schema import RedditMention
@@ -24,3 +25,15 @@ async def test_wsb_sentiment_returns_z_from_provider() -> None:
     out = factor.values.set_index("ticker")
     assert out.loc["GME", "raw_value"] == pytest.approx((400 - 10) / 20)
     assert out.loc["AAPL", "raw_value"] == pytest.approx((8 - 10) / 20)
+
+
+@pytest.mark.asyncio
+async def test_wsb_sentiment_uses_nan_for_missing_data() -> None:
+    """B2: when provider returns None, the signal must emit NaN, not 0.
+    NaN keeps missing-data tickers out of the cross-sectional mean/std.
+    """
+    provider = AsyncMock()
+    provider.fetch_sentiment.return_value = None
+    factor = await compute_wsb_sentiment(["UNKNOWN"], provider, datetime(2024, 5, 13, tzinfo=UTC))
+    if not factor.values.empty:
+        assert np.isnan(factor.values["raw_value"].iloc[0])

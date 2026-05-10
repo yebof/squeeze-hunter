@@ -24,17 +24,17 @@ def annualized_return(equity: pd.Series) -> float:
 
 def sharpe(equity: pd.Series, periods_per_year: int = 252) -> float:
     r = daily_returns(equity)
-    if r.std(ddof=0) == 0 or len(r) == 0:
+    if len(r) == 0 or r.std(ddof=1) == 0:
         return 0.0
-    return float(r.mean() / r.std(ddof=0) * np.sqrt(periods_per_year))
+    return float(r.mean() / r.std(ddof=1) * np.sqrt(periods_per_year))
 
 
 def sortino(equity: pd.Series, periods_per_year: int = 252) -> float:
     r = daily_returns(equity)
     downside = r[r < 0]
-    if downside.std(ddof=0) == 0 or len(downside) == 0:
+    if len(downside) == 0 or downside.std(ddof=1) == 0:
         return 0.0
-    return float(r.mean() / downside.std(ddof=0) * np.sqrt(periods_per_year))
+    return float(r.mean() / downside.std(ddof=1) * np.sqrt(periods_per_year))
 
 
 def max_drawdown(equity: pd.Series) -> float:

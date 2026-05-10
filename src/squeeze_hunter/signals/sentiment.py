@@ -17,7 +17,7 @@ async def compute_wsb_sentiment(
     for t in tickers:
         m = await provider.fetch_sentiment(t, clock)
         if m is None:
-            rows.append({"ticker": t, "raw_value": 0.0})
+            rows.append({"ticker": t, "raw_value": float("nan")})
             continue
         rows.append({"ticker": t, "raw_value": float(m.z_score)})
     return Factor(name="f4_wsb_mention", as_of=clock, values=pd.DataFrame(rows))

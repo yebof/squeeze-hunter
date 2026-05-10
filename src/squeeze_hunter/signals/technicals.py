@@ -25,12 +25,14 @@ async def compute_bollinger_breakout(
             rows.append({"ticker": t, "raw_value": 0.0})
             continue
         df = pd.DataFrame({"close": [b.close for b in bars]}).iloc[-60:]
-        ma20 = df["close"].rolling(20).mean()
-        sd20 = df["close"].rolling(20).std(ddof=0)
+        # Compute bands using PRE-TODAY data only, so today's gap-up doesn't
+        # inflate sd20 and suppress the breakout signal (B3 fix).
+        prev = df["close"].iloc[:-1]
+        ma20 = prev.rolling(20).mean()
+        sd20 = prev.rolling(20).std(ddof=0)
         upper = ma20 + 2 * sd20
         band_width = (upper - (ma20 - 2 * sd20)) / ma20
-        # Evaluate squeeze from the pre-today window to avoid today's pop inflating bw
-        bw_hist = band_width.iloc[:-1].dropna()
+        bw_hist = band_width.dropna()
         bw_quartile = bw_hist.quantile(0.25) if len(bw_hist) > 0 else np.nan
         bw_min_recent = bw_hist.tail(10).min() if len(bw_hist) >= 10 else np.nan
         last_close = df["close"].iloc[-1]
