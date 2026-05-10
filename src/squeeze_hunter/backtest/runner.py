@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -13,7 +13,7 @@ from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
 from squeeze_hunter.risk.gates import GateContext, PortfolioState, TradeProposal, evaluate_gates
-from squeeze_hunter.risk.kelly import KellyParams, kelly_position_pct
+from squeeze_hunter.risk.kelly import kelly_position_pct, kelly_priors_for_setup
 from squeeze_hunter.risk.stops import StopState, evaluate_stops
 from squeeze_hunter.scan import run_scan
 
@@ -25,7 +25,6 @@ class BacktestConfig:
     end: datetime
     initial_cash: float = 100_000.0
     score_threshold: float = 8.0  # production default per design doc; tests may override
-    kelly: KellyParams = field(default_factory=KellyParams)
 
 
 @dataclass
@@ -45,17 +44,36 @@ async def run_backtest(
     broker = SimulatorBroker(initial_cash=cfg.initial_cash, cost_model=StockCostModel())
     open_states: dict[
         str, dict
-    ] = {}  # ticker → {entry_price, peak, entry_score, bars_held, setup_type}
+    ] = {}  # ticker → {entry_price, peak, entry_score, current_score, bars_held, setup_type}
     trade_log: list[dict] = []
     equity_series: list[tuple[datetime, float]] = []
     daily_rows: list[dict] = []
 
-    cur = cfg.start
-    while cur <= cfg.end:
+    # C7: iterate over trading (business) days only — skips weekends.
+    # US holidays are not filtered here (minor inaccuracy, acceptable for now).
+    # Iterate as pd.Timestamp objects (list() avoids the .to_pydatetime() method
+    # that the type checker cannot resolve on DatetimeIndex).
+    trading_days: list[pd.Timestamp] = list(pd.bdate_range(cfg.start, cfg.end, tz="UTC"))
+
+    for cur_ts in trading_days:
+        # Convert pd.Timestamp to datetime; hour/min/sec are already 0 from bdate_range.
+        cur: datetime = cur_ts.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
         clock.advance_to(cur)
 
-        # 1) Manage open positions
+        # 1) Scan for today's ranked candidates (must happen BEFORE stop evaluation
+        #    so we can refresh current_score — I9 fix)
+        ranked = await run_scan(cfg.tickers, provider, cur, settings)
+
+        # I9: refresh current_score for open positions from today's scan results.
+        # If a ticker dropped out of the universe today, keep the previous score.
+        ranked_by_ticker = ranked.set_index("ticker")["score"].to_dict() if not ranked.empty else {}
+        for ticker, st in open_states.items():
+            if ticker in ranked_by_ticker:
+                st["current_score"] = float(ranked_by_ticker[ticker])
+
+        # 2) Manage open positions (evaluate stops with fresh current_score)
         marks: dict[str, float] = {}
+        tickers_to_remove: list[str] = []
         for ticker in list(open_states):
             try:
                 bars = await provider.fetch_bars(ticker, cur - timedelta(days=2), cur)
@@ -81,6 +99,8 @@ async def run_backtest(
                 qty = broker.position_qty(ticker)
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
+                    # C2: compute realized P&L so Kelly observed-trades counter works
+                    realized = (order.avg_fill_price - st["entry_price"]) * qty
                     trade_log.append(
                         {
                             "ts": cur,
@@ -89,13 +109,17 @@ async def run_backtest(
                             "qty": qty,
                             "price": order.avg_fill_price,
                             "reason": sig.reason or "exit",
+                            "realized": realized,
+                            "setup_type": st["setup_type"],
                         }
                     )
-                open_states.pop(ticker, None)
+                tickers_to_remove.append(ticker)
             elif sig.action == "halve":
                 qty = broker.position_qty(ticker) // 2
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
+                    # C2: compute realized P&L for the halved quantity
+                    realized = (order.avg_fill_price - st["entry_price"]) * qty
                     trade_log.append(
                         {
                             "ts": cur,
@@ -104,12 +128,35 @@ async def run_backtest(
                             "qty": qty,
                             "price": order.avg_fill_price,
                             "reason": "signal_decay_half",
+                            "realized": realized,
+                            "setup_type": st["setup_type"],
                         }
                     )
 
-        # 2) Scan & propose
-        ranked = await run_scan(cfg.tickers, provider, cur, settings)
+        for ticker in tickers_to_remove:
+            open_states.pop(ticker, None)
+
+        # 3) Propose new entries from today's scan results
         if not ranked.empty:
+            # I10: compute earnings proximity gate for each candidate (calendar days for now).
+            # We read the earnings cache directly (not through the provider's lookahead guard)
+            # because knowing an earnings date 3 days in advance is public information —
+            # it is NOT lookahead bias to act on a known future report date.
+            earnings_within_3_days_map: dict[str, bool] = {}
+            earnings_df = cache.read_partition("earnings", "all")
+            if not earnings_df.empty:
+                earnings_df["report_at"] = pd.to_datetime(earnings_df["report_at"], utc=True)
+            for t in cfg.tickers:
+                flag = False
+                if not earnings_df.empty:
+                    t_events = earnings_df[earnings_df["ticker"] == t]
+                    for _, erow in t_events.iterrows():
+                        days_away = (erow["report_at"] - cur).days
+                        if 0 <= days_away <= 3:
+                            flag = True
+                            break
+                earnings_within_3_days_map[t] = flag
+
             ctx = GateContext(
                 as_of=cur,
                 kill_switch_active=False,
@@ -119,7 +166,7 @@ async def run_backtest(
                 days_listed_by_ticker={t: 365 for t in cfg.tickers},
                 halted_tickers=frozenset(),
                 universe_tickers=frozenset(cfg.tickers),
-                earnings_within_3_days={t: False for t in cfg.tickers},
+                earnings_within_3_days=earnings_within_3_days_map,
                 portfolio_correlations={t: 0.0 for t in cfg.tickers},
             )
             broker.mark_to_market(marks, ts=cur)
@@ -131,28 +178,42 @@ async def run_backtest(
                 opened_today=0,
             )
 
-            wins_so_far = sum(
-                1 for r in trade_log if r["side"] == "sell" and r.get("realized", 0) > 0
-            )
-            trades_so_far = sum(1 for r in trade_log if r["side"] == "sell")
-            avg_payoff = 2.5  # bootstrap placeholder until we track per-trade payoff explicitly
-            kelly_pct = kelly_position_pct(
-                observed_wins=wins_so_far,
-                observed_trades=trades_so_far,
-                observed_avg_payoff=avg_payoff,
-                params=cfg.kelly,
-            )
-
             for _, row in ranked.iterrows():
                 if state.opened_today >= 3:
                     break
+                # C3: use per-setup priors so raw Kelly is positive from trade 0
+                setup = str(row["setup_type"])
+                setup_params = kelly_priors_for_setup(setup)
+
+                # Per-setup observed wins/trades from trade_log
+                setup_sells = [
+                    r for r in trade_log if r["side"] == "sell" and r.get("setup_type") == setup
+                ]
+                wins = sum(1 for r in setup_sells if r.get("realized", 0) > 0)
+                trades = len(setup_sells)
+                wins_pl = [r["realized"] for r in setup_sells if r.get("realized", 0) > 0]
+                losses_pl = [-r["realized"] for r in setup_sells if r.get("realized", 0) < 0]
+                avg_payoff = (
+                    (sum(wins_pl) / max(len(wins_pl), 1))
+                    / max(sum(losses_pl) / max(len(losses_pl), 1), 1.0)
+                    if wins_pl and losses_pl
+                    else setup_params.prior_payoff
+                )
+                kelly_pct = kelly_position_pct(
+                    observed_wins=wins,
+                    observed_trades=trades,
+                    observed_avg_payoff=avg_payoff,
+                    params=setup_params,
+                )
                 target_size = state.equity_usd * kelly_pct
                 if target_size <= 0:
-                    target_size = state.equity_usd * 0.04  # fallback floor while priors warm
+                    # Safety floor — should rarely fire now that per-setup priors are positive
+                    target_size = state.equity_usd * 0.04
+
                 p = TradeProposal(
                     ticker=row["ticker"],
                     score=float(row["score"]),
-                    setup_type=str(row["setup_type"]),
+                    setup_type=setup,
                     target_position_usd=target_size,
                     instrument="stock",
                 )
@@ -175,7 +236,7 @@ async def run_backtest(
                         "price": order.avg_fill_price,
                         "reason": "entry",
                         "score": float(row["score"]),
-                        "setup_type": row["setup_type"],
+                        "setup_type": setup,
                     }
                 )
                 open_states[row["ticker"]] = {
@@ -184,16 +245,15 @@ async def run_backtest(
                     "current_score": float(row["score"]),
                     "entry_score": float(row["score"]),
                     "bars_held": 0,
-                    "setup_type": str(row["setup_type"]),
+                    "setup_type": setup,
                 }
                 state.positions[row["ticker"]] = qty
                 state.opened_today += 1
 
-        # 3) Mark-to-market end of day
+        # 4) Mark-to-market end of day
         broker.mark_to_market(marks, ts=cur)
         equity_series.append((cur, broker.equity))
         daily_rows.append({"date": cur.date(), "equity": broker.equity, "cash": broker.cash})
-        cur = cur + timedelta(days=1)
 
     eq = pd.Series(
         data=[e for _, e in equity_series],

@@ -150,3 +150,65 @@ async def test_runner_takes_position_and_records_pnl(tmp_path: Path) -> None:
     result = await run_backtest(cfg, cache=cache, settings=settings)
     assert result.equity_curve.iloc[-1] != pytest.approx(100_000.0)  # something happened
     assert (result.trade_log["ticker"] == "GME").any()
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_weekend_days(tmp_path: Path) -> None:
+    """C7: bars_held should only count trading days, not calendar days.
+
+    Run a backtest spanning Tue 2024-05-14 to Wed 2024-05-22 (includes a weekend).
+    The equity curve should have 7 entries (7 weekdays), NOT 9 (calendar days).
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    # Span: 2024-05-14 (Tue) → 2024-05-22 (Wed). Weekdays: Tue Wed Thu Fri Mon Tue Wed = 7.
+    cfg = BacktestConfig(
+        tickers=_ALL_TICKERS,
+        start=datetime(2024, 5, 14, tzinfo=UTC),
+        end=datetime(2024, 5, 22, tzinfo=UTC),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    result = await run_backtest(cfg, cache=cache, settings=settings)
+    # Should have 7 weekdays, not 9 calendar days
+    assert len(result.equity_curve) == 7
+
+
+@pytest.mark.asyncio
+async def test_runner_records_realized_pnl_on_sells(tmp_path: Path) -> None:
+    """C2: trade_log sell entries must include `realized` so Kelly counter works."""
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    cfg = BacktestConfig(
+        tickers=_ALL_TICKERS,
+        start=datetime(2024, 5, 14, tzinfo=UTC),
+        end=datetime(2024, 6, 30, tzinfo=UTC),  # long enough to force sells via time stop
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    result = await run_backtest(cfg, cache=cache, settings=settings)
+    sells = result.trade_log[result.trade_log["side"] == "sell"]
+    if len(sells) > 0:
+        # Every sell row must have a non-null realized field
+        assert "realized" in sells.columns
+        assert sells["realized"].notna().all()
