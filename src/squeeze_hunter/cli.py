@@ -189,5 +189,119 @@ def _format_report(report: dict, verdict: Any) -> str:
     return "\n".join(lines)
 
 
+@app.command()
+def paper(
+    config_path: Annotated[Path, typer.Option("--config")] = Path("config/settings.example.yml"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+) -> None:
+    """Run the paper-trading loop indefinitely."""
+    from squeeze_hunter.runtime import RuntimeContext
+    from squeeze_hunter.scheduler import build_scheduler
+
+    configure_logging()
+    settings = load_settings(config_path)
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+
+    rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="paper")
+
+    async def main_loop() -> None:
+        await rc.setup()
+        sched = build_scheduler(
+            callbacks={
+                "intraday_loop": lambda: asyncio.ensure_future(rc.tick(now=datetime.now(UTC))),
+            }
+        )
+        sched.start()
+        try:
+            await asyncio.Event().wait()  # block forever
+        finally:
+            sched.shutdown()
+            await rc.shutdown()
+
+    asyncio.run(main_loop())
+
+
+@app.command()
+def live(
+    config_path: Annotated[Path, typer.Option("--config")] = Path("config/settings.example.yml"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    confirm: Annotated[bool, typer.Option("--confirm-real-money")] = False,
+) -> None:
+    """Run the live-trading loop. Requires --confirm-real-money."""
+    if not confirm:
+        typer.echo("Refusing to start live without --confirm-real-money", err=True)
+        raise typer.Exit(code=2)
+
+    from squeeze_hunter.runtime import RuntimeContext
+    from squeeze_hunter.scheduler import build_scheduler
+
+    configure_logging()
+    settings = load_settings(config_path)
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+
+    rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="live")
+
+    async def main_loop() -> None:
+        await rc.setup()
+        sched = build_scheduler(
+            callbacks={
+                "intraday_loop": lambda: asyncio.ensure_future(rc.tick(now=datetime.now(UTC))),
+            }
+        )
+        sched.start()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sched.shutdown()
+            await rc.shutdown()
+
+    asyncio.run(main_loop())
+
+
+@app.command("emergency-flatten")
+def emergency_flatten(
+    confirm: Annotated[bool, typer.Option("--confirm")] = False,
+    mode: Annotated[str, typer.Option("--mode", help="paper|live")] = "paper",
+) -> None:
+    """Market-flatten every open position. Requires --confirm."""
+    if not confirm:
+        typer.echo("Refusing without --confirm", err=True)
+        raise typer.Exit(code=2)
+    from squeeze_hunter.broker.paper import PaperBroker
+
+    configure_logging()
+    broker: IBKRBroker | PaperBroker = (
+        PaperBroker(client_id=99) if mode == "paper" else IBKRBroker(client_id=99)
+    )
+
+    async def go() -> None:
+        await broker.connect()
+        opens = await broker.get_open_orders()
+        for o in opens:
+            await broker.cancel_order(o.broker_order_id)
+        # Enumerate positions via ib-async
+        positions = broker._ib.positions()
+        for pos in positions:
+            sym = pos.contract.symbol
+            qty = abs(int(pos.position))
+            if qty <= 0:
+                continue
+            side = "sell" if pos.position > 0 else "buy"
+            log.info("emergency_flatten", ticker=sym, qty=qty, side=side)
+            if side == "sell":
+                await broker.submit_sell(
+                    ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC)
+                )
+            else:
+                await broker.submit_buy(ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC))
+        await broker.disconnect()
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     app()
