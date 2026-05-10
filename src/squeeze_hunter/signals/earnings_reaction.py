@@ -12,26 +12,61 @@ Only earnings within the past 5 trading days contribute; older ones decay to 0.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from math import log
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from squeeze_hunter.data.protocol import DataProvider
 from squeeze_hunter.signals.base import Factor
+
+# R8: cache US federal holidays once. np.busday_count without a holidays
+# argument counts Mon-Fri only and treats Christmas / Thanksgiving / etc.
+# as trading days. The federal-holiday calendar is a close approximation of
+# the NYSE trading calendar — it overlaps on ~9 of 10 closures per year.
+# Known small inaccuracies (acceptable for the 5-day decay window):
+#   - misses Good Friday (NYSE closure but not federal holiday)
+#   - includes Columbus Day and Veterans Day (federal but NYSE-open)
+# A future refinement could use pandas_market_calendars for exact NYSE
+# closures.
+_US_HOLIDAYS_CACHE: list[date] | None = None
+
+
+def _us_business_holidays() -> list[date]:
+    global _US_HOLIDAYS_CACHE
+    if _US_HOLIDAYS_CACHE is None:
+        cal = USFederalHolidayCalendar()
+        # Cover the realistic backtest + live range.
+        holidays = cal.holidays(start="2018-01-01", end="2030-12-31")
+        # Drop NaT entries that USFederalHolidayCalendar can theoretically emit.
+        out: list[date] = []
+        for h in holidays:
+            ts = pd.Timestamp(h)
+            if pd.notna(ts):
+                d = ts.date()
+                if isinstance(d, date):  # narrows date | NaTType -> date
+                    out.append(d)
+        _US_HOLIDAYS_CACHE = out
+    return _US_HOLIDAYS_CACHE
 
 
 def _trading_days_between(d1: datetime, d2: datetime) -> int:
     """Count trading days from d1 to d2 (exclusive of d2 start, inclusive of d2 end).
 
-    Uses numpy.busday_count which counts Mon-Fri business days.
+    Uses numpy.busday_count with US federal holidays excluded — Christmas,
+    Thanksgiving, July 4th, etc. no longer count as trading days. Mon-Fri
+    only otherwise.
+
     Returns a positive integer when d2 > d1.
     """
+    holidays_dt64 = np.array(_us_business_holidays(), dtype="datetime64[D]")
     return int(
         np.busday_count(
             d1.date() if hasattr(d1, "date") else d1,
             d2.date() if hasattr(d2, "date") else d2,
+            holidays=holidays_dt64,
         )
     )
 

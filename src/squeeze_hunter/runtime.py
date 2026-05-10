@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 import pandas as pd
@@ -155,6 +155,19 @@ class RuntimeContext:
             else:
                 raise ValueError(f"unknown mode: {self.mode}")
         self.metrics_registry = MetricsRegistry()
+        # R7: seed the broker heartbeat at setup so broker_disconnected_for_seconds
+        # measures elapsed time correctly. Without this seed, a startup where the
+        # broker is unreachable shows 0 disconnect-seconds forever (the killswitch
+        # never trips because last_broker_heartbeat stays None).
+        try:
+            health = await self.broker.health()
+            if health.connected:
+                self.telemetry.record_broker_heartbeat(datetime.now(UTC))
+        except Exception:
+            log.warning("broker_health_unreachable_at_setup")
+            # Seed heartbeat anyway so disconnect timer measures from now.
+            # If still down at next tick, broker_disconnected_for_seconds grows.
+            self.telemetry.record_broker_heartbeat(datetime.now(UTC))
 
     async def tick(self: RuntimeContext, now: datetime) -> None:
         """One intraday tick: manage positions + check killswitch."""

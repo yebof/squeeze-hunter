@@ -300,11 +300,23 @@ def emergency_flatten(
 
     async def go() -> None:
         await broker.connect()
+        # R5: ib-async's IB.positions() is populated from TWS push events;
+        # right after connectAsync the snapshot may be empty. Force a sync
+        # before reading. reqPositionsAsync blocks until TWS responds.
+        try:
+            await broker._ib.reqPositionsAsync()
+        except (AttributeError, NotImplementedError):
+            # Older ib-async versions or simulator brokers: best-effort fallback
+            await asyncio.sleep(2)
         opens = await broker.get_open_orders()
         for o in opens:
             await broker.cancel_order(o.broker_order_id)
-        # Enumerate positions via ib-async
+        # Enumerate positions via ib-async — now safely populated.
         positions = broker._ib.positions()
+        if not positions:
+            log.info("emergency_flatten_no_positions")
+            await broker.disconnect()
+            return
         for pos in positions:
             sym = pos.contract.symbol
             qty = abs(int(pos.position))

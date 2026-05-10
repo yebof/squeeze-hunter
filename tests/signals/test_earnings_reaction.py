@@ -4,7 +4,36 @@ from unittest.mock import AsyncMock
 import pytest
 
 from squeeze_hunter.data.schema import Bar, EarningsEvent
-from squeeze_hunter.signals.earnings_reaction import compute_earnings_reaction
+from squeeze_hunter.signals.earnings_reaction import (
+    _trading_days_between,
+    compute_earnings_reaction,
+)
+
+
+def test_trading_days_between_excludes_us_federal_holidays() -> None:
+    """R8 regression: Christmas Day (federal holiday) is no longer counted
+    as a trading day. Mon→Fri across Christmas (Wed) should be 3 trading
+    days, not 4. Without R8 the result was 4 (Mon, Tue, Christmas, Fri).
+    """
+    mon = datetime(2024, 12, 23, tzinfo=UTC)  # Mon before Christmas
+    fri = datetime(2024, 12, 27, tzinfo=UTC)  # Fri after
+    assert _trading_days_between(mon, fri) == 3
+
+
+def test_trading_days_between_handles_thanksgiving_week() -> None:
+    """Thanksgiving 2024 was Thu Nov 28. Mon->Fri (end-exclusive) spans
+    Mon, Tue, Wed, Thu — but Thanksgiving Thu is now a holiday, so 3 trading
+    days. Without R8 the result was 4."""
+    mon = datetime(2024, 11, 25, tzinfo=UTC)
+    fri = datetime(2024, 11, 29, tzinfo=UTC)
+    assert _trading_days_between(mon, fri) == 3
+
+
+def test_trading_days_between_normal_week_unchanged() -> None:
+    """A normal Mon->Fri (no holidays) should still be 4 trading days."""
+    mon = datetime(2024, 5, 13, tzinfo=UTC)  # no holiday this week
+    fri = datetime(2024, 5, 17, tzinfo=UTC)
+    assert _trading_days_between(mon, fri) == 4
 
 
 def _bar(ticker: str, ts: datetime, close: float, volume: int) -> Bar:
