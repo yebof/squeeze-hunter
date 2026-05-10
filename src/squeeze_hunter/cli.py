@@ -62,5 +62,60 @@ def scan(
     typer.echo(f"wrote {out_path} ({len(ranked)} tickers)")
 
 
+ingest_app = typer.Typer(help="Historical backfill commands")
+app.add_typer(ingest_app, name="ingest")
+
+
+@ingest_app.command("bars")
+def ingest_bars(
+    start: Annotated[str, typer.Option("--start", help="YYYY-MM-DD")],
+    end: Annotated[str, typer.Option("--end", help="YYYY-MM-DD")],
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+) -> None:
+    """Backfill EOD bars from yfinance into parquet cache."""
+    from squeeze_hunter.ingest.backfill_bars import backfill_bars_for_universe
+
+    configure_logging()
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+    asyncio.run(
+        backfill_bars_for_universe(
+            tickers,
+            datetime.fromisoformat(start).replace(tzinfo=UTC),
+            datetime.fromisoformat(end).replace(tzinfo=UTC),
+            cache,
+        )
+    )
+
+
+@ingest_app.command("finra")
+def ingest_finra(
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+) -> None:
+    """Backfill FINRA short-interest into parquet cache."""
+    from squeeze_hunter.ingest.backfill_finra import backfill_finra
+
+    configure_logging()
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+    asyncio.run(backfill_finra(tickers, cache))
+
+
+@ingest_app.command("earnings")
+def ingest_earnings(
+    tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
+) -> None:
+    """Backfill earnings calendar into parquet cache."""
+    from squeeze_hunter.ingest.backfill_earnings import backfill_earnings
+
+    configure_logging()
+    cache = ParquetCache(root=parquet_root)
+    tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+    asyncio.run(backfill_earnings(tickers, cache))
+
+
 if __name__ == "__main__":
     app()
