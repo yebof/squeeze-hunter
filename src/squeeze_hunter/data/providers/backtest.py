@@ -17,6 +17,9 @@ from squeeze_hunter.data.schema import (
     RedditMention,
     ShortInterest,
 )
+from squeeze_hunter.logging_setup import get_logger
+
+log = get_logger("data.backtest")
 
 
 @dataclass
@@ -45,8 +48,16 @@ class BacktestProvider:
         end: datetime,
         resolution: str = "1d",
     ) -> list[Bar]:
+        if end > self.clock.now:
+            log.warning(
+                "backtest_end_exceeds_clock",
+                ticker=ticker,
+                end=end.isoformat(),
+                clock=self.clock.now.isoformat(),
+            )
         df = self.cache.read_partition("bars", ticker)
         if df.empty:
+            log.info("backtest_no_bars_partition", ticker=ticker)
             return []
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
         mask = (df["ts"] >= start) & (df["ts"] <= end) & (df["ts"] <= self.clock.now)

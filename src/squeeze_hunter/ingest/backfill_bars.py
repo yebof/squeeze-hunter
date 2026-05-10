@@ -31,8 +31,7 @@ async def backfill_bars_for_ticker(
             for b in bars
         ]
     )
-    cache.dedup_keys = ["ticker", "ts"]
-    cache.append_partition("bars", ticker, df)
+    cache.append_partition("bars", ticker, df, dedup_keys=["ticker", "ts"])
 
 
 async def backfill_bars_for_universe(

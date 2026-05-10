@@ -79,3 +79,51 @@ async def test_backtest_provider_fetch_option_chain_at_missing_returns_empty(
     # Returns an empty chain (no quotes), not None — so caller can distinguish from
     # "no archive entry" → 0 raw_value (which is the correct fallback).
     assert chain.quotes == []
+
+
+@pytest.mark.asyncio
+async def test_backtest_provider_logs_when_end_exceeds_clock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C3_minor: silent clamp should now log a warning."""
+    cache = ParquetCache(root=tmp_path)
+    df = pd.DataFrame(
+        {
+            "ticker": ["GME"],
+            "ts": [datetime(2024, 5, 10, tzinfo=UTC)],
+            "open": [10.0],
+            "high": [10.0],
+            "low": [10.0],
+            "close": [10.0],
+            "volume": [1000],
+        }
+    )
+    cache.write_partition("bars", "GME", df)
+    clock = Clock(now=datetime(2024, 5, 13, tzinfo=UTC))
+    p = BacktestProvider(cache=cache, clock=clock)
+    await p.fetch_bars(
+        "GME",
+        start=datetime(2024, 5, 1, tzinfo=UTC),
+        end=datetime(2024, 5, 30, tzinfo=UTC),  # past clock.now
+    )
+    out = capsys.readouterr().out.lower()
+    assert "clock" in out or "end" in out
+
+
+@pytest.mark.asyncio
+async def test_backtest_provider_logs_when_partition_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C4_minor: missing parquet partition should log info-level so operators
+    can see which tickers have data gaps."""
+    cache = ParquetCache(root=tmp_path)  # nothing seeded
+    clock = Clock(now=datetime(2024, 5, 13, tzinfo=UTC))
+    p = BacktestProvider(cache=cache, clock=clock)
+    bars = await p.fetch_bars(
+        "MISSING",
+        start=datetime(2024, 5, 1, tzinfo=UTC),
+        end=datetime(2024, 5, 13, tzinfo=UTC),
+    )
+    assert bars == []
+    out = capsys.readouterr().out.lower()
+    assert "missing" in out or "no_partition" in out or "no_bars" in out

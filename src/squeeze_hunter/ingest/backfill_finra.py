@@ -46,5 +46,6 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
             )
     if not rows:
         return
-    cache.dedup_keys = ["ticker", "settlement_date"]
-    cache.append_partition("short_interest", "all", pd.DataFrame(rows))
+    cache.append_partition(
+        "short_interest", "all", pd.DataFrame(rows), dedup_keys=["ticker", "settlement_date"]
+    )

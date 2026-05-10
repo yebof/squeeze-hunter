@@ -109,9 +109,11 @@ class YahooProvider:
             cal = t.calendar
             events: list[EarningsEvent] = []
             if isinstance(cal, dict) and cal.get("Earnings Date"):
-                raw_ts = pd.Timestamp(cal["Earnings Date"][0]).tz_localize("UTC")
-                if raw_ts is not pd.NaT:
-                    ts: datetime = cast(datetime, raw_ts.to_pydatetime())
+                raw_ts = cal["Earnings Date"][0]
+                if pd.notna(raw_ts):
+                    ts: datetime = cast(
+                        datetime, pd.Timestamp(raw_ts).tz_localize("UTC").to_pydatetime()
+                    )
                     events.append(
                         EarningsEvent(
                             ticker=ticker,

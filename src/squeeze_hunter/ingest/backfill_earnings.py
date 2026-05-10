@@ -28,5 +28,6 @@ async def backfill_earnings(tickers: list[str], cache: ParquetCache) -> None:
             )
     if not rows:
         return
-    cache.dedup_keys = ["ticker", "report_at"]
-    cache.append_partition("earnings", "all", pd.DataFrame(rows))
+    cache.append_partition(
+        "earnings", "all", pd.DataFrame(rows), dedup_keys=["ticker", "report_at"]
+    )

@@ -8,6 +8,19 @@ from squeeze_hunter.data.providers.yahoo import YahooProvider
 
 
 @pytest.mark.asyncio
+async def test_yahoo_fetch_earnings_handles_pd_nat() -> None:
+    """C2_minor: pd.notna check, not identity comparison."""
+    from unittest.mock import MagicMock, patch
+
+    fake_ticker = MagicMock()
+    fake_ticker.calendar = {"Earnings Date": [pd.NaT], "Earnings Average": None}
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        p = YahooProvider()
+        events = await p.fetch_earnings("GME")
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_yahoo_fetch_bars_normalizes() -> None:
     fake = pd.DataFrame(
         {

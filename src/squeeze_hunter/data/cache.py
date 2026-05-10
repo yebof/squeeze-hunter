@@ -19,12 +19,18 @@ class ParquetCache:
         return self.root / domain / f"{partition_key}.parquet"
 
     def write_partition(
-        self: ParquetCache, domain: str, partition_key: str, df: pd.DataFrame
+        self: ParquetCache,
+        domain: str,
+        partition_key: str,
+        df: pd.DataFrame,
+        *,
+        dedup_keys: list[str] | None = None,
     ) -> None:
         path = self._path(domain, partition_key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if self.dedup_keys:
-            df = df.drop_duplicates(self.dedup_keys, keep="last")
+        keys = dedup_keys if dedup_keys is not None else self.dedup_keys
+        if keys:
+            df = df.drop_duplicates(keys, keep="last")
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
 
     def read_partition(self: ParquetCache, domain: str, partition_key: str) -> pd.DataFrame:
@@ -34,10 +40,16 @@ class ParquetCache:
         return pq.read_table(path).to_pandas()
 
     def append_partition(
-        self: ParquetCache, domain: str, partition_key: str, df: pd.DataFrame
+        self: ParquetCache,
+        domain: str,
+        partition_key: str,
+        df: pd.DataFrame,
+        *,
+        dedup_keys: list[str] | None = None,
     ) -> None:
         existing = self.read_partition(domain, partition_key)
         merged = pd.concat([existing, df], ignore_index=True) if not existing.empty else df
-        if self.dedup_keys:
-            merged = merged.drop_duplicates(self.dedup_keys, keep="last")
-        self.write_partition(domain, partition_key, merged)
+        keys = dedup_keys if dedup_keys is not None else self.dedup_keys
+        if keys:
+            merged = merged.drop_duplicates(keys, keep="last")
+        self.write_partition(domain, partition_key, merged, dedup_keys=None)
