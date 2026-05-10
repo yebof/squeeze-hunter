@@ -19,6 +19,11 @@ class LifecycleState:
     exits: list[dict[str, Any]] = field(default_factory=list)
 
 
+# Errors that are transient — log and continue. Other tickers in the same
+# tick should still be processed; the position is re-evaluated next tick.
+_TRANSIENT_FETCH_ERRORS = (ConnectionError, TimeoutError, OSError)
+
+
 async def manage_positions(
     state: LifecycleState,
     broker: IBroker,
@@ -28,10 +33,32 @@ async def manage_positions(
         meta = state.positions[ticker]
         try:
             q = await broker.fetch_quote(ticker)
-        except Exception as e:
-            log.warning("quote_unavailable", ticker=ticker, err=str(e))
+        except _TRANSIENT_FETCH_ERRORS as e:
+            log.warning(
+                "quote_transient_error",
+                ticker=ticker,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
             continue
+        # Programming / contract errors (AttributeError, NotImplementedError,
+        # TypeError) are NOT caught here — they propagate up to tick_safe,
+        # which logs them and surfaces them via structured logging. Masking
+        # them as "transient" hid real bugs in earlier reviews.
+
         price = q.last or q.bid or q.ask
+        if price <= 0.0:
+            # Stale snapshot or halt — all three fields are zero. Don't
+            # evaluate stops with a bogus price; come back next tick.
+            log.warning(
+                "quote_zero_price",
+                ticker=ticker,
+                bid=q.bid,
+                ask=q.ask,
+                last=q.last,
+            )
+            continue
+
         meta["peak_price"] = max(meta["peak_price"], price)
         stop_state = StopState(
             entry_price=meta["entry_price"],
