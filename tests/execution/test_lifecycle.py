@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -240,3 +241,172 @@ async def test_lifecycle_partial_zero_price_uses_nonzero_field() -> None:
     # No stop fires — bid 100 = entry 100, no adverse move
     assert "GME" in out.positions
     assert not broker.submit_sell.called
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_concurrent_calls_dont_double_sell() -> None:
+    """I5 regression: two overlapping manage_positions calls on the same
+    state must not both submit a sell for the same position. The second
+    caller should observe the in-flight ticker and skip.
+
+    Setup: a position with a hard stop pending, a slow fetch_quote that
+    yields. Two concurrent ticks. Only one sell should be submitted.
+    """
+    sells: list[tuple[str, int]] = []
+
+    async def slow_quote(ticker):
+        await asyncio.sleep(0.05)  # yields, allowing the other task to interleave
+        return Quote(ticker=ticker, bid=80.0, ask=80.05, last=80.0, timestamp_ns=0)
+
+    async def record_sell(ticker, qty, limit_price, ts):
+        sells.append((ticker, qty))
+        return BrokerOrder(
+            broker_order_id=f"x-{len(sells)}",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status="filled",
+            filled_qty=qty,
+            avg_fill_price=80.0,
+        )
+
+    broker = MagicMock()
+    broker.fetch_quote = slow_quote
+    broker.submit_sell = record_sell
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 100.0,
+                "entry_score": 10.0,
+                "current_score": 10.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    # Two concurrent calls
+    await asyncio.gather(
+        manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC)),
+        manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC)),
+    )
+    # Only ONE sell — the second call must observe in-flight and skip
+    assert len(sells) == 1
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_concurrent_different_tickers_processed_independently() -> None:
+    """The lock is per-ticker. Two tickers can be processed in parallel without
+    blocking each other.
+    """
+    quotes_fetched = []
+
+    async def slow_quote(ticker):
+        quotes_fetched.append(ticker)
+        await asyncio.sleep(0.05)
+        return Quote(ticker=ticker, bid=100.0, ask=100.05, last=100.0, timestamp_ns=0)
+
+    broker = MagicMock()
+    broker.fetch_quote = slow_quote
+    broker.submit_sell = AsyncMock()
+
+    state_a = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 100.0,
+                "entry_score": 10.0,
+                "current_score": 10.0,
+                "bars_held": 1,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    state_b = LifecycleState(
+        positions={
+            "AAPL": {
+                "qty": 50,
+                "entry_price": 200.0,
+                "peak_price": 200.0,
+                "entry_score": 10.0,
+                "current_score": 10.0,
+                "bars_held": 1,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    # Different state objects → independent locks → both fetch
+    start = asyncio.get_event_loop().time()
+    await asyncio.gather(
+        manage_positions(state_a, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC)),
+        manage_positions(state_b, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC)),
+    )
+    duration = asyncio.get_event_loop().time() - start
+    # If they ran sequentially: 2 x 0.05 = 0.1s. Concurrently: ~0.05s.
+    assert duration < 0.09  # generous bound for CI noise
+    assert len(quotes_fetched) == 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_in_flight_set_is_cleared_after_processing() -> None:
+    """After manage_positions completes (success or failure), in_flight
+    must be empty so subsequent ticks can process the same tickers.
+    """
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(
+            ticker="GME",
+            bid=100.0,
+            ask=100.05,
+            last=100.0,
+            timestamp_ns=0,
+        )
+    )
+    broker.submit_sell = AsyncMock()
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 100.0,
+                "entry_score": 10.0,
+                "current_score": 10.0,
+                "bars_held": 1,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    await manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    assert state.in_flight == set()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_in_flight_cleared_on_exception() -> None:
+    """If processing raises (e.g., AttributeError per I3), in_flight must still
+    be cleared so the next tick can retry.
+    """
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(side_effect=AttributeError("boom"))
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 100.0,
+                "entry_score": 10.0,
+                "current_score": 10.0,
+                "bars_held": 1,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    with pytest.raises(AttributeError):
+        await manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    # Even after the exception, in_flight is empty
+    assert state.in_flight == set()
