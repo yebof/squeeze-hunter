@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
@@ -16,8 +17,35 @@ from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
 from squeeze_hunter.logging_setup import configure_logging, get_logger
 from squeeze_hunter.scan import run_scan
 
+if TYPE_CHECKING:
+    from squeeze_hunter.runtime import RuntimeContext
+
 app = typer.Typer(no_args_is_help=True)
 log = get_logger("cli")
+
+
+def _build_runtime_callbacks(rc: RuntimeContext) -> dict[str, Callable[[], Any] | None]:
+    """Map scheduler job IDs to callbacks for paper/live runtime modes.
+
+    Phase 3 wires: nightly_scan, premarket_verify, intraday_loop, eod_close.
+    The other three (ingest_eod, premarket_data, moc_decision) are explicit None
+    with comments documenting their Phase 4 ownership so the scheduler silently
+    skips them rather than crashing on a missing key.
+    """
+    return {
+        # Phase 4: integrate live EOD data ingest (yfinance → parquet backfill)
+        "ingest_eod": None,
+        "nightly_scan": lambda: asyncio.ensure_future(rc.nightly_scan_safe(now=datetime.now(UTC))),
+        # Phase 4: overnight news + halt-list ingest
+        "premarket_data": None,
+        "premarket_verify": lambda: asyncio.ensure_future(
+            rc.premarket_verify_safe(now=datetime.now(UTC))
+        ),
+        "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
+        # Phase 4: MoC / EOL flatten logic
+        "moc_decision": None,
+        "eod_close": lambda: asyncio.ensure_future(rc.eod_close_safe(now=datetime.now(UTC))),
+    }
 
 
 @app.command()
@@ -208,11 +236,7 @@ def paper(
 
     async def main_loop() -> None:
         await rc.setup()
-        sched = build_scheduler(
-            callbacks={
-                "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
-            }
-        )
+        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
         sched.start()
         try:
             await asyncio.Event().wait()  # block forever
@@ -247,11 +271,7 @@ def live(
 
     async def main_loop() -> None:
         await rc.setup()
-        sched = build_scheduler(
-            callbacks={
-                "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
-            }
-        )
+        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
         sched.start()
         try:
             await asyncio.Event().wait()

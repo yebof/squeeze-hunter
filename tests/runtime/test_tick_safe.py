@@ -133,3 +133,32 @@ async def test_tick_safe_keeps_kill_switch_state_after_exception(tmp_path: Path)
     await rc.tick_safe(now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     # State preserved despite the exception
     assert rc.kill_switch_active is False
+
+
+# ---------------------------------------------------------------------------
+# Safe wrappers for the new daily jobs — same pattern as tick_safe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_eod_close_safe_returns_false_when_raises(tmp_path: Path) -> None:
+    """eod_close_safe mirrors tick_safe: catches exceptions and returns False."""
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    await rc.setup()
+    rc.eod_close = AsyncMock(side_effect=RuntimeError("eod_boom"))  # type: ignore[method-assign]
+    ok = await rc.eod_close_safe(now=datetime(2026, 5, 14, 21, 0, tzinfo=UTC))
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_nightly_scan_safe_returns_false_when_raises(tmp_path: Path) -> None:
+    """nightly_scan_safe mirrors tick_safe: catches exceptions and returns False."""
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    await rc.setup()
+    rc.nightly_scan = AsyncMock(side_effect=RuntimeError("scan_boom"))  # type: ignore[method-assign]
+    ok = await rc.nightly_scan_safe(now=datetime(2026, 5, 14, 22, 0, tzinfo=UTC))
+    assert ok is False

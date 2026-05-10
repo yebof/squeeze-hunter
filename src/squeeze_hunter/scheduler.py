@@ -73,7 +73,7 @@ def list_job_specs() -> list[dict[str, Any]]:
 
 
 def build_scheduler(
-    callbacks: dict[str, Callable[[], Any]],
+    callbacks: dict[str, Callable[[], Any] | None],
 ) -> AsyncIOScheduler:
     sched = AsyncIOScheduler()
     for spec in list_job_specs():

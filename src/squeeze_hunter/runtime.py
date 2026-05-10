@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
+import pandas as pd
+
 from squeeze_hunter.backtest.cost_model import StockCostModel
 from squeeze_hunter.broker.base import IBroker
 from squeeze_hunter.broker.simulator import SimulatorBroker
@@ -127,6 +129,8 @@ class RuntimeContext:
     kill_switch_active: bool = False
     _kill_reason: str | None = None
     telemetry: PortfolioTelemetry = field(default_factory=PortfolioTelemetry)
+    # Populated by nightly_scan; read by premarket_verify the next morning.
+    last_candidates: pd.DataFrame | None = None
 
     async def setup(self: RuntimeContext) -> None:
         if self.broker is None:
@@ -208,6 +212,96 @@ class RuntimeContext:
             await self.tick(now=now)
         except Exception:
             log.exception("tick_failed", as_of=now.isoformat())
+            return False
+        return True
+
+    async def nightly_scan(self: RuntimeContext, now: datetime) -> None:
+        """Nightly: scan the universe, refresh current_score for held positions,
+        persist the ranked candidates for tomorrow's premarket_verify.
+
+        Uses BacktestProvider in sim mode (reads historical parquet).
+        Phase 4 will wire a live IBKRProvider here.
+        """
+        from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
+        from squeeze_hunter.scan import run_scan
+
+        clock = Clock(now=now)
+        provider = BacktestProvider(cache=self.cache, clock=clock)
+        ranked = await run_scan(self.tickers, provider, now, self.settings)
+        self.last_candidates = ranked
+
+        if not ranked.empty:
+            ranked_by_ticker = ranked.set_index("ticker")["score"].to_dict()
+            for ticker, meta in self.lifecycle_state.positions.items():
+                if ticker in ranked_by_ticker:
+                    meta["current_score"] = float(ranked_by_ticker[ticker])
+                # If ticker isn't in scan output (e.g. dropped from universe),
+                # keep prior current_score so the position isn't silently zeroed.
+        log.info("nightly_scan_complete", n_candidates=len(ranked))
+
+    async def nightly_scan_safe(self: RuntimeContext, now: datetime) -> bool:
+        """Run nightly_scan() and swallow any exception so the scheduler keeps firing.
+
+        Returns True on success, False if an exception was caught and logged.
+        Mirrors the tick_safe contract.
+        """
+        try:
+            await self.nightly_scan(now=now)
+        except Exception:
+            log.exception("nightly_scan_failed", as_of=now.isoformat())
+            return False
+        return True
+
+    async def eod_close(self: RuntimeContext, now: datetime) -> None:
+        """End-of-day: increment bars_held for every open position.
+
+        This is the counter that powers the 21-trading-day time stop.
+        Optionally snapshot daily P&L here in a future iteration (Phase 4).
+        """
+        for meta in self.lifecycle_state.positions.values():
+            meta["bars_held"] = int(meta.get("bars_held", 0)) + 1
+        log.info(
+            "eod_close_complete",
+            positions=len(self.lifecycle_state.positions),
+        )
+
+    async def eod_close_safe(self: RuntimeContext, now: datetime) -> bool:
+        """Run eod_close() and swallow any exception so the scheduler keeps firing.
+
+        Returns True on success, False if an exception was caught and logged.
+        Mirrors the tick_safe contract.
+        """
+        try:
+            await self.eod_close(now=now)
+        except Exception:
+            log.exception("eod_close_failed", as_of=now.isoformat())
+            return False
+        return True
+
+    async def premarket_verify(self: RuntimeContext, now: datetime) -> None:
+        """Premarket: re-check overnight news and the candidate list against fresh info.
+
+        Phase 3 stub — logs intent so the cron actually fires and appears in
+        structured logs. Phase 4 will add halt-list scraping, news scoring, and
+        candidate-list filtering using last_candidates populated by nightly_scan.
+        """
+        log.info(
+            "premarket_verify_stub",
+            candidates_from_overnight=len(self.last_candidates)
+            if self.last_candidates is not None
+            else 0,
+        )
+
+    async def premarket_verify_safe(self: RuntimeContext, now: datetime) -> bool:
+        """Run premarket_verify() and swallow any exception so the scheduler keeps firing.
+
+        Returns True on success, False if an exception was caught and logged.
+        Mirrors the tick_safe contract.
+        """
+        try:
+            await self.premarket_verify(now=now)
+        except Exception:
+            log.exception("premarket_verify_failed", as_of=now.isoformat())
             return False
         return True
 
