@@ -1,0 +1,51 @@
+[project]
+name = "squeeze-hunter"
+version = "0.1.0"
+description = "Quantitative trading system for short-squeeze events"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "typer>=0.12",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=16",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    "apscheduler>=3.10",
+    "prometheus-client>=0.20",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+data = [
+    "ib-async>=1.0",
+    "yfinance>=0.2.40",
+    "praw>=7.7",
+    "finnhub-python>=2.4",
+]
+
+[project.scripts]
+squeeze-hunter = "squeeze_hunter.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "freezegun>=1.5",
+    "ruff>=0.6",
+    "ty>=0.0.1a1",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/squeeze_hunter"]
