@@ -9,21 +9,30 @@ from contextlib import contextmanager
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-
-def _engine() -> Engine:
-    url = os.environ.get(
-        "SH_DB_URL",
-        "postgresql+psycopg://squeeze:squeeze@localhost:5432/squeeze",
-    )
-    return create_engine(url, future=True, pool_pre_ping=True)
+_engine_instance: Engine | None = None
 
 
-SessionLocal = sessionmaker(bind=_engine(), expire_on_commit=False)
+def get_engine() -> Engine:
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = create_engine(
+            os.environ.get(
+                "SH_DB_URL",
+                "postgresql+psycopg://squeeze:squeeze@localhost:5432/squeeze",
+            ),
+            future=True,
+            pool_pre_ping=True,
+        )
+    return _engine_instance
+
+
+def _make_session() -> Session:
+    return sessionmaker(bind=get_engine(), expire_on_commit=False)()
 
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
-    s = SessionLocal()
+    s = _make_session()
     try:
         yield s
         s.commit()

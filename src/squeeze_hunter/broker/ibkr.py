@@ -32,19 +32,39 @@ def _translate_status(ibkr_status: str) -> str:
     return _STATUS_MAP.get(ibkr_status, "pending")
 
 
-_IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
-_IBKR_PORT = int(os.environ.get("IBKR_PORT", "7497"))
-_IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "42"))
-_IBKR_ACCOUNT = os.environ.get("IBKR_ACCOUNT", "")
+def _ibkr_default_host() -> str:
+    return os.environ.get("IBKR_HOST", "127.0.0.1")
+
+
+def _ibkr_default_port() -> int:
+    raw = os.environ.get("IBKR_PORT", "7497")
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("ibkr_port_invalid_using_default", value=raw)
+        return 7497
+
+
+def _ibkr_default_client_id() -> int:
+    raw = os.environ.get("IBKR_CLIENT_ID", "42")
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("ibkr_client_id_invalid_using_default", value=raw)
+        return 42
+
+
+def _ibkr_default_account() -> str:
+    return os.environ.get("IBKR_ACCOUNT", "")
 
 
 @dataclass
 class IBKRBroker:
     name: str = "ibkr"
-    host: str = field(default_factory=lambda: _IBKR_HOST)
-    port: int = field(default_factory=lambda: _IBKR_PORT)
-    client_id: int = field(default_factory=lambda: _IBKR_CLIENT_ID)
-    account: str = field(default_factory=lambda: _IBKR_ACCOUNT)
+    host: str = field(default_factory=_ibkr_default_host)
+    port: int = field(default_factory=_ibkr_default_port)
+    client_id: int = field(default_factory=_ibkr_default_client_id)
+    account: str = field(default_factory=_ibkr_default_account)
 
     def __post_init__(self: IBKRBroker) -> None:
         self._ib = IB()
@@ -55,7 +75,7 @@ class IBKRBroker:
         log.info("connected", server_version=self._ib.client.serverVersion())
 
     async def disconnect(self: IBKRBroker) -> None:
-        self._ib.disconnect()
+        await asyncio.to_thread(self._ib.disconnect)
 
     async def fetch_quote(self: IBKRBroker, ticker: str) -> Quote:
         contract = Stock(ticker, "SMART", "USD")

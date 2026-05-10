@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ class RedditProvider:
         self: RedditProvider, ticker: str, as_of: datetime
     ) -> RedditMention | None:
         count_24h = await self._count_24h_mentions(ticker, as_of)
-        baseline_mean, baseline_std = await self._compute_baseline_30d(ticker, as_of)
+        baseline_mean, baseline_std = self._compute_baseline_30d(ticker, as_of)
         return RedditMention(
             ticker=ticker,
             as_of=as_of,
@@ -67,15 +68,18 @@ class RedditProvider:
 
     async def _count_24h_mentions(self: RedditProvider, ticker: str, as_of: datetime) -> int:
         cutoff = as_of - timedelta(days=1)
+
+        def _fetch_posts(sub_name: str) -> list:
+            return list(self._reddit.subreddit(sub_name).new(limit=1000))
+
         total = 0
         for sub_name in self.subreddits:
-            sub = self._reddit.subreddit(sub_name)
-            posts = list(sub.new(limit=1000))
+            posts = await asyncio.to_thread(_fetch_posts, sub_name)
             posts = [p for p in posts if datetime.fromtimestamp(p.created_utc, tz=UTC) >= cutoff]
             total += _count_ticker_mentions(posts, ticker, aliases=[])
         return total
 
-    async def _compute_baseline_30d(
+    def _compute_baseline_30d(
         self: RedditProvider, ticker: str, as_of: datetime
     ) -> tuple[float, float]:
         # Cheap baseline: per-day counts over the last 30 days, taken from search.
