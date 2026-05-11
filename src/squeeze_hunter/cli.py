@@ -35,16 +35,16 @@ def _build_runtime_callbacks(rc: RuntimeContext) -> dict[str, Callable[[], Any] 
     return {
         # Phase 4: integrate live EOD data ingest (yfinance → parquet backfill)
         "ingest_eod": None,
-        "nightly_scan": lambda: asyncio.ensure_future(rc.nightly_scan_safe(now=datetime.now(UTC))),
+        "nightly_scan": lambda: asyncio.create_task(rc.nightly_scan_safe(now=datetime.now(UTC))),
         # Phase 4: overnight news + halt-list ingest
         "premarket_data": None,
-        "premarket_verify": lambda: asyncio.ensure_future(
+        "premarket_verify": lambda: asyncio.create_task(
             rc.premarket_verify_safe(now=datetime.now(UTC))
         ),
-        "intraday_loop": lambda: asyncio.ensure_future(rc.tick_safe(now=datetime.now(UTC))),
+        "intraday_loop": lambda: asyncio.create_task(rc.tick_safe(now=datetime.now(UTC))),
         # Phase 4: MoC / EOL flatten logic
         "moc_decision": None,
-        "eod_close": lambda: asyncio.ensure_future(rc.eod_close_safe(now=datetime.now(UTC))),
+        "eod_close": lambda: asyncio.create_task(rc.eod_close_safe(now=datetime.now(UTC))),
     }
 
 
@@ -82,11 +82,23 @@ def scan(
     clock = Clock(now=clock_dt)
     provider = BacktestProvider(cache=cache, clock=clock)
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
+    # R5.M5: surface an empty tickers file rather than silently doing nothing.
+    if not tickers:
+        typer.echo(f"WARNING: {tickers_file} is empty — no tickers to scan", err=True)
 
     ranked = asyncio.run(run_scan(tickers, provider, clock_dt, settings))
     out.mkdir(parents=True, exist_ok=True)
     out_path = out / f"{date_str}.csv"
     ranked.to_csv(out_path, index=False)
+    # R5.M3: warn loudly when the scan produced zero candidates so the user
+    # doesn't mistake "wrote scan.csv with 0 rows" for a healthy run.
+    if len(ranked) == 0:
+        typer.echo(
+            f"WARNING: scan produced 0 candidates for {date_str}. "
+            "Likely causes: parquet missing for that date, empty universe, or "
+            "empty score.weights in config.",
+            err=True,
+        )
     typer.echo(f"wrote {out_path} ({len(ranked)} tickers)")
 
 
@@ -292,6 +304,13 @@ def live(
 def emergency_flatten(
     confirm: Annotated[bool, typer.Option("--confirm")] = False,
     mode: Annotated[str, typer.Option("--mode", help="paper|live")] = "paper",
+    client_id: Annotated[
+        int,
+        typer.Option(
+            "--client-id",
+            help="IBKR client ID for the flatten connection. Pick something that doesn't collide with the main loop's IBKR_CLIENT_ID (default 42).",
+        ),
+    ] = 199,
 ) -> None:
     """Market-flatten every open position. Requires --confirm."""
     if not confirm:
@@ -300,43 +319,54 @@ def emergency_flatten(
     from squeeze_hunter.broker.paper import PaperBroker
 
     configure_logging()
+    # R5.C5: client_id is configurable so an operator using IBKR_CLIENT_ID=199
+    # (or whatever) for the main loop can pick a different one for the flatten
+    # connection. IBKR rejects duplicate client IDs.
     broker: IBKRBroker | PaperBroker = (
-        PaperBroker(client_id=99) if mode == "paper" else IBKRBroker(client_id=99)
+        PaperBroker(client_id=client_id) if mode == "paper" else IBKRBroker(client_id=client_id)
     )
 
     async def go() -> None:
         await broker.connect()
-        # R5: ib-async's IB.positions() is populated from TWS push events;
-        # right after connectAsync the snapshot may be empty. Force a sync
-        # before reading. reqPositionsAsync blocks until TWS responds.
         try:
-            await broker._ib.reqPositionsAsync()
-        except (AttributeError, NotImplementedError):
-            # Older ib-async versions or simulator brokers: best-effort fallback
-            await asyncio.sleep(2)
-        opens = await broker.get_open_orders()
-        for o in opens:
-            await broker.cancel_order(o.broker_order_id)
-        # Enumerate positions via ib-async — now safely populated.
-        positions = broker._ib.positions()
-        if not positions:
-            log.info("emergency_flatten_no_positions")
-            await broker.disconnect()
-            return
-        for pos in positions:
-            sym = pos.contract.symbol
-            qty = abs(int(pos.position))
-            if qty <= 0:
-                continue
-            side = "sell" if pos.position > 0 else "buy"
-            log.info("emergency_flatten", ticker=sym, qty=qty, side=side)
-            if side == "sell":
-                await broker.submit_sell(
-                    ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC)
-                )
-            else:
-                await broker.submit_buy(ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC))
-        await broker.disconnect()
+            # R5: ib-async's IB.positions() is populated from TWS push events;
+            # right after connectAsync the snapshot may be empty. Force a sync
+            # before reading. reqPositionsAsync blocks until TWS responds.
+            try:
+                await broker._ib.reqPositionsAsync()
+            except (AttributeError, NotImplementedError):
+                # Older ib-async versions or simulator brokers: best-effort fallback
+                await asyncio.sleep(2)
+            opens = await broker.get_open_orders()
+            for o in opens:
+                await broker.cancel_order(o.broker_order_id)
+            # Enumerate positions via ib-async — now safely populated.
+            positions = broker._ib.positions()
+            if not positions:
+                log.info("emergency_flatten_no_positions")
+                return
+            for pos in positions:
+                sym = pos.contract.symbol
+                qty = abs(int(pos.position))
+                if qty <= 0:
+                    continue
+                side = "sell" if pos.position > 0 else "buy"
+                log.info("emergency_flatten", ticker=sym, qty=qty, side=side)
+                if side == "sell":
+                    await broker.submit_sell(
+                        ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC)
+                    )
+                else:
+                    await broker.submit_buy(
+                        ticker=sym, qty=qty, limit_price=None, ts=datetime.now(UTC)
+                    )
+        finally:
+            # R5.M7: always disconnect, even if a submit raises mid-loop, so
+            # we don't leak the IBKR client ID slot.
+            try:
+                await broker.disconnect()
+            except Exception as e:
+                log.warning("emergency_flatten_disconnect_failed", err=str(e))
 
     asyncio.run(go())
 

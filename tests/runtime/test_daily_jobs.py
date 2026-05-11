@@ -19,6 +19,22 @@ from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.runtime import RuntimeContext
 
 
+def _settings_with_weights() -> Settings:
+    """R5.C6: tests that exercise nightly_scan need non-empty weights now
+    that the combiner fails loud on all-zero mappings."""
+    s = Settings()
+    s.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    return s
+
+
 def _seed(cache: ParquetCache) -> None:
     """Minimal cache so RuntimeContext.setup() does not crash and run_scan has data."""
     base = datetime(2024, 5, 1, tzinfo=UTC)
@@ -224,7 +240,7 @@ async def test_runtime_nightly_scan_stores_last_candidates(tmp_path: Path) -> No
     _seed(cache)
     rc = RuntimeContext(
         cache=cache,
-        settings=Settings(),
+        settings=_settings_with_weights(),
         tickers=["GME"],
         mode="sim",
     )
@@ -245,7 +261,7 @@ async def test_runtime_nightly_scan_does_not_update_unscanned_tickers(tmp_path: 
     _seed(cache)
     rc = RuntimeContext(
         cache=cache,
-        settings=Settings(),
+        settings=_settings_with_weights(),
         tickers=["GME"],
         mode="sim",
     )
@@ -312,7 +328,12 @@ async def test_eod_close_safe_returns_false_when_raises(tmp_path: Path) -> None:
 async def test_nightly_scan_safe_returns_true_on_success(tmp_path: Path) -> None:
     cache = ParquetCache(root=tmp_path)
     _seed(cache)
-    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    rc = RuntimeContext(
+        cache=cache,
+        settings=_settings_with_weights(),
+        tickers=["GME"],
+        mode="sim",
+    )
     await rc.setup()
     ok = await rc.nightly_scan_safe(now=datetime(2024, 5, 13, 22, 0, tzinfo=UTC))
     assert ok is True

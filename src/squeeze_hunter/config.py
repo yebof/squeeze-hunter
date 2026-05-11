@@ -16,6 +16,10 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from squeeze_hunter.logging_setup import get_logger
+
+_log = get_logger("config")
+
 
 class ScoreCfg(BaseModel):
     threshold: float = 8.0
@@ -76,8 +80,23 @@ class Settings(BaseSettings):
 
 
 def load_settings(yaml_path: Path | None = None) -> Settings:
-    """Load settings: yaml file (if given) merged with env overrides."""
+    """Load settings: yaml file (if given) merged with env overrides.
+
+    R5.M1: log when the YAML file is requested but missing — previously this
+    fell silently through to defaults, which include an empty score.weights
+    dict. That produced all-zero scores in scan/backtest with no warning.
+    """
     base: dict[str, Any] = {}
-    if yaml_path is not None and yaml_path.exists():
-        base = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-    return Settings(**base)
+    if yaml_path is not None:
+        if yaml_path.exists():
+            base = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            _log.info("config_loaded", path=str(yaml_path))
+        else:
+            _log.warning("config_file_missing", path=str(yaml_path))
+    settings = Settings(**base)
+    if not settings.score.weights:
+        _log.warning(
+            "config_score_weights_empty",
+            note="scan/backtest will produce all-zero scores. Set score.weights in YAML.",
+        )
+    return settings

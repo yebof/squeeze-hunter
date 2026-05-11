@@ -72,7 +72,17 @@ class IBKRBroker:
     async def connect(self: IBKRBroker) -> None:
         log.info("connecting", host=self.host, port=self.port)
         await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
-        log.info("connected", server_version=self._ib.client.serverVersion())
+        # R5.C1: subscribe to account-value push updates so accountValues()
+        # is populated. Without this, get_equity_usd always returns None and
+        # the drawdown/3-day-loss killswitch arms are dead. In ib-async,
+        # calling reqAccountUpdates(account) IS the subscribe call (no
+        # explicit subscribe kwarg; "" means default account).
+        self._ib.reqAccountUpdates(self.account or "")
+        log.info(
+            "connected",
+            server_version=self._ib.client.serverVersion(),
+            account_subscribed=True,
+        )
 
     async def disconnect(self: IBKRBroker) -> None:
         await asyncio.to_thread(self._ib.disconnect)
@@ -187,11 +197,19 @@ class IBKRBroker:
     async def get_equity_usd(self: IBKRBroker) -> float | None:
         """R4.1: pull NetLiquidation (NAV) from IB account values.
 
+        R5.C1: depends on reqAccountUpdates(subscribe=True) being called in
+        connect(). Without that subscription the cached accountValues() list
+        is empty forever.
+
         Returns None if the value isn't available yet (just-connected, account
         snapshot not received). Caller treats None as 'skip equity recording
         this tick' so the killswitch doesn't trip on a zero.
         """
         try:
+            # Idempotent re-subscribe in case connect() was bypassed (e.g.,
+            # the broker was passed pre-constructed). Calling
+            # reqAccountUpdates is the subscribe call in ib-async.
+            self._ib.reqAccountUpdates(self.account or "")
             values = await asyncio.to_thread(self._ib.accountValues)
         except Exception as e:
             log.warning("ibkr_account_values_failed", err=str(e))

@@ -410,3 +410,32 @@ async def test_lifecycle_in_flight_cleared_on_exception() -> None:
         await manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     # Even after the exception, in_flight is empty
     assert state.in_flight == set()
+
+
+def test_lifecycle_exits_list_trims_after_max() -> None:
+    """R5.I1 regression: state.exits is bounded so it doesn't grow unbounded
+    over long runs. With 60s ticks and ~390 exits/day possible in the worst
+    case, the list could otherwise grow into tens of thousands of entries
+    over months of paper trading.
+    """
+    state = LifecycleState(exits_max_entries=10)
+    for i in range(25):
+        state.record_exit(
+            {
+                "ts": datetime(2026, 5, 14, 14, 0, tzinfo=UTC),
+                "ticker": f"T{i}",
+                "qty": 1,
+                "reason": "test",
+            }
+        )
+    assert len(state.exits) == 10
+    # Most recent 10 entries kept (oldest dropped)
+    tickers = [e["ticker"] for e in state.exits]
+    assert tickers == [f"T{i}" for i in range(15, 25)]
+
+
+def test_lifecycle_exits_default_max_is_generous() -> None:
+    """Default cap is high (1000) so it never bites in normal operation;
+    only catastrophic runaway scenarios would hit it."""
+    state = LifecycleState()
+    assert state.exits_max_entries >= 1000

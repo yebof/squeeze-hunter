@@ -32,6 +32,69 @@ async def test_submit_buy_returns_pending_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connect_subscribes_to_account_updates() -> None:
+    """R5.C1 regression: IBKRBroker.connect() must call reqAccountUpdates so
+    accountValues() is populated and get_equity_usd works in real IBKR mode.
+
+    Before the fix: get_equity_usd looped over an empty list and returned
+    None forever. The drawdown/3-day-loss killswitch arms were dead in
+    paper/live mode despite the R4.1 wiring claiming to fix them.
+    """
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    fake_ib.connectAsync = AsyncMock()
+    fake_ib.client.serverVersion = MagicMock(return_value=176)
+    fake_ib.reqAccountUpdates = MagicMock()
+    broker._ib = fake_ib
+
+    await broker.connect()
+
+    # Must have called reqAccountUpdates (the ib-async API has only one
+    # positional argument, account: str, and calling it IS the subscribe call).
+    assert fake_ib.reqAccountUpdates.called
+
+
+@pytest.mark.asyncio
+async def test_get_equity_usd_returns_net_liquidation_usd() -> None:
+    """R5.C1: get_equity_usd parses NetLiquidation/USD from accountValues."""
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+
+    # Simulate ib-async AccountValue objects (just need tag/currency/value attrs)
+    av_nav = MagicMock()
+    av_nav.tag = "NetLiquidation"
+    av_nav.currency = "USD"
+    av_nav.value = "87500.00"
+    av_other = MagicMock()
+    av_other.tag = "CashBalance"
+    av_other.currency = "USD"
+    av_other.value = "10000"
+
+    fake_ib.accountValues = MagicMock(return_value=[av_other, av_nav])
+    fake_ib.reqAccountUpdates = MagicMock()
+    broker._ib = fake_ib
+
+    equity = await broker.get_equity_usd()
+    assert equity == 87500.0
+
+
+@pytest.mark.asyncio
+async def test_get_equity_usd_returns_none_when_no_nav() -> None:
+    """No NetLiquidation entry yet (just-connected) → None, not 0.
+    None tells the runtime to skip recording so the killswitch isn't tripped
+    on a phantom zero.
+    """
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    fake_ib.accountValues = MagicMock(return_value=[])
+    fake_ib.reqAccountUpdates = MagicMock()
+    broker._ib = fake_ib
+
+    equity = await broker.get_equity_usd()
+    assert equity is None
+
+
+@pytest.mark.asyncio
 async def test_submit_sell_uses_limit_when_provided() -> None:
     broker = IBKRBroker(client_id=99)
     fake_ib = MagicMock()

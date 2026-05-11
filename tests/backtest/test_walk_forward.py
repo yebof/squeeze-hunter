@@ -108,22 +108,23 @@ async def test_walk_forward_rejects_internally_disordered_holdout(
 async def test_walk_forward_accepts_empty_test_windows_when_holdout_after_train(
     tmp_path: Path,
 ) -> None:
-    """Empty test_windows is valid as long as holdout starts after train_end."""
+    """Empty test_windows is valid as long as holdout starts after train_end.
+
+    We only exercise the validator, not the full backtest. The R3 fix that
+    closed the holdout/train overlap gap should NOT reject a config with
+    empty test_windows + later-than-train_end holdout.
+    """
+    from squeeze_hunter.backtest.walk_forward import _validate_windows
+
     cfg = WalkForwardConfig(
         **_cfg_kwargs(
             test_windows=[],
             holdout=(datetime(2024, 5, 2, tzinfo=UTC), datetime(2024, 6, 1, tzinfo=UTC)),
         )
     )
-    # We are NOT exercising the full backtest here — just the validation.
-    # The function will attempt to actually run; for that, seed minimal data.
-    cache = ParquetCache(root=tmp_path)
-    # Empty cache → backtest will produce empty results but validation passes.
-    # No ValueError expected.
-    try:
-        await run_walk_forward(cfg, cache=cache, settings=Settings())
-    except ValueError:
-        pytest.fail("validation rejected a valid config")
+    # Direct call to the validator — no need to spin up the whole backtest
+    # (which would also need real signal weights, parquet data, etc.).
+    _validate_windows(cfg)  # must not raise
 
 
 @pytest.mark.asyncio

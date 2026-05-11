@@ -236,12 +236,22 @@ class RuntimeContext:
             self.telemetry.clear_position(exited)
 
         # Update broker heartbeat if broker is still responsive.
+        broker_healthy = False
         try:
             health = await self.broker.health()
             if health.connected:
                 self.telemetry.record_broker_heartbeat(now)
+                broker_healthy = True
         except Exception:
             log.warning("broker_health_check_failed")
+
+        # R5.C3: record data freshness UNCONDITIONALLY when the broker
+        # responded — not only inside the position loop. Previously, an empty
+        # portfolio meant ibkr_quotes never updated, so after 2 hours of flat
+        # portfolio the data_stale killswitch arm tripped on a healthy broker.
+        # Now: any successful broker.health() round-trip refreshes the source.
+        if broker_healthy:
+            self.telemetry.record_data_freshness("ibkr_quotes", now)
 
         # Mark to market: fetch quotes, record position marks, collect prices.
         marks: dict[str, float] = {}
@@ -262,17 +272,16 @@ class RuntimeContext:
         if isinstance(self.broker, SimulatorBroker):
             self.broker.mark_to_market(marks, now)
 
-        # R4.1: query equity through IBroker.get_equity_usd in ALL modes
-        # (previously only sim mode recorded equity, so the drawdown and
-        # 3-day-loss killswitch arms were dead in paper/live). Skip recording
-        # if the broker returns None (e.g., IBKR account snapshot not yet
-        # received) so the killswitch isn't tripped by a phantom zero.
+        # R4.1: query equity through IBroker.get_equity_usd in ALL modes.
+        # R5.M2: record even when negative — a leveraged account NAV<0 is
+        # exactly the catastrophic case the drawdown killswitch should catch.
+        # Only skip when the broker returns None (snapshot not yet available).
         try:
             equity_usd = await self.broker.get_equity_usd()
         except Exception as e:
             log.warning("equity_fetch_failed", err=str(e))
             equity_usd = None
-        if equity_usd is not None and equity_usd > 0:
+        if equity_usd is not None:
             ts_set = {t for t, _ in self.telemetry.equity_history}
             if now not in ts_set:
                 self.telemetry.record_equity(now, equity_usd)
@@ -319,6 +328,20 @@ class RuntimeContext:
                 mode=self.mode,
                 note="f5 OI velocity will be 0 until a live options ingest job is added (Phase 4)",
             )
+
+        # R5.C2: when the killswitch is active, suppress new-candidate
+        # emission so the operator can't accidentally open a position that
+        # the killswitch would have rejected (the entry-time gate from the
+        # backtest runner has no equivalent in Phase 3's manual review
+        # workflow). Existing positions still run through their stops in
+        # tick() — that's the spec's "no panic-flatten" behavior.
+        if self.kill_switch_active:
+            log.warning(
+                "nightly_scan_suppressed_killswitch_active",
+                reason=self._kill_reason,
+            )
+            self.last_candidates = pd.DataFrame()
+            return
 
         clock = Clock(now=now)
         provider = BacktestProvider(cache=self.cache, clock=clock)

@@ -8,7 +8,7 @@ Tests cover the 5 metrics that feed evaluate_killswitch:
 - critical_data_stale_for_seconds
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -125,6 +125,24 @@ def test_data_stale_uses_oldest_critical_source() -> None:
     tel.record_data_freshness("finra", datetime(2026, 4, 30, tzinfo=UTC))
     later = datetime(2026, 5, 1, 13, tzinfo=UTC)  # 2h after ibkr_quotes
     assert tel.critical_data_stale_for_seconds(later) == 2 * 60 * 60  # 7200s
+
+
+def test_data_freshness_unconditional_recording() -> None:
+    """R5.C3 regression: data_freshness should be updatable independent of
+    whether positions exist. Previously runtime.tick() only called
+    record_data_freshness inside the position loop, so an empty portfolio
+    meant the timestamp never updated → after 2 hours of flat portfolio the
+    data_stale killswitch arm tripped on a healthy broker. The runtime fix
+    moves the record outside the position loop; this unit test confirms the
+    telemetry API supports that usage.
+    """
+    tel = PortfolioTelemetry()
+    # Fresh recording with no positions
+    tel.record_data_freshness("ibkr_quotes", _t(1))
+    assert tel.critical_data_stale_for_seconds(_t(1)) == 0
+    # 2 hours later without re-recording, staleness grows correctly
+    later = _t(1) + timedelta(hours=2)
+    assert tel.critical_data_stale_for_seconds(later) == 7200
 
 
 def test_telemetry_to_killswitch_inputs() -> None:

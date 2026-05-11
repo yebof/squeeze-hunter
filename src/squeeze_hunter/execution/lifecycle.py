@@ -22,6 +22,16 @@ class LifecycleState:
     # double-processing the same position.
     in_flight: set[str] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # R5.I1: cap exits history so it doesn't grow unbounded over long runs.
+    # 1000 entries is plenty for any practical lookback; older entries should
+    # be persisted to the DB if needed (Phase 4).
+    exits_max_entries: int = 1000
+
+    def record_exit(self: LifecycleState, entry: dict[str, Any]) -> None:
+        """Append a new exit and trim to the configured max length."""
+        self.exits.append(entry)
+        if len(self.exits) > self.exits_max_entries:
+            del self.exits[: len(self.exits) - self.exits_max_entries]
 
 
 # Errors that are transient — log and continue. Other tickers in the same
@@ -97,9 +107,7 @@ async def _process_one_position(
             reason=sig.reason,
             broker_order_id=order.broker_order_id,
         )
-        state.exits.append(
-            {"ts": now, "ticker": ticker, "qty": qty, "reason": sig.reason or "exit"}
-        )
+        state.record_exit({"ts": now, "ticker": ticker, "qty": qty, "reason": sig.reason or "exit"})
         if sig.action == "exit":
             state.positions.pop(ticker, None)
         else:
