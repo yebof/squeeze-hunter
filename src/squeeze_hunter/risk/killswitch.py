@@ -37,8 +37,10 @@ def evaluate_killswitch(
         return KillSwitchVerdict(True, "three_day_loss")
     if inp.worst_position_gap_pct <= gap_through_stop_max:
         return KillSwitchVerdict(True, "gap_through_stop")
-    if inp.broker_disconnected_for_seconds > broker_outage_max_seconds:
+    # R7.M3: >= so the spec's "at or above 5 minutes" / "at or above 2 hours"
+    # readings actually trip at the stated threshold, not one second past it.
+    if inp.broker_disconnected_for_seconds >= broker_outage_max_seconds:
         return KillSwitchVerdict(True, "broker_outage")
-    if inp.critical_data_stale_for_seconds > data_stale_max_seconds:
+    if inp.critical_data_stale_for_seconds >= data_stale_max_seconds:
         return KillSwitchVerdict(True, "data_stale")
     return KillSwitchVerdict(False)

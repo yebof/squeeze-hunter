@@ -377,6 +377,13 @@ def emergency_flatten(
     ] = 199,
 ) -> None:
     """Market-flatten every open position. Requires --confirm."""
+    # R7.C8: validate mode against the allowed set up front. Previously any
+    # value other than "paper" silently fell into the IBKRBroker (live)
+    # branch — including "sim" or typos like "papr". On a live account
+    # this is dangerous.
+    if mode not in {"paper", "live"}:
+        typer.echo(f"emergency-flatten: --mode must be 'paper' or 'live', got {mode!r}", err=True)
+        raise typer.Exit(code=2)
     if not confirm:
         typer.echo("Refusing without --confirm", err=True)
         raise typer.Exit(code=2)

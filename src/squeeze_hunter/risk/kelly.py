@@ -50,9 +50,21 @@ _PRIORS_BY_SETUP: dict[str, tuple[float, float]] = {
 def kelly_priors_for_setup(setup_type: str) -> KellyParams:
     """Return KellyParams with per-setup-type priors.
 
-    Falls back to Mixed priors for unknown setup_type so we always have a
-    positive raw Kelly and avoid the flat 4% fallback.
+    R7.M2: "Weak" returns fraction=0 (and a noticeably-low cap) so any Weak
+    candidate that slips past the gate sizes to zero. Previously Weak fell
+    through to Mixed priors — the gate happened to reject Weak first, but
+    that's defensive-coding fragility. Unknown setup_type still falls back
+    to Mixed (so a new setup doesn't crash sizing) — known-bad setups get
+    explicit zero sizing.
     """
+    if setup_type == "Weak":
+        return KellyParams(
+            prior_win_rate=0.0,
+            prior_payoff=1.0,
+            prior_n=30,
+            fraction=0.0,  # zero sizing for explicitly weak setups
+            cap=0.0,
+        )
     pwr, ppay = _PRIORS_BY_SETUP.get(setup_type, _PRIORS_BY_SETUP["Mixed"])
     return KellyParams(
         prior_win_rate=pwr,

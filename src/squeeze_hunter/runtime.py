@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo
 
@@ -52,6 +52,11 @@ class PortfolioTelemetry:
     """
 
     equity_history: list[tuple[datetime, float]] = field(default_factory=list)
+    # R7.I1: parallel tracker for the per-day MAX equity. equity_history
+    # collapses to last-of-day for the 3-day PnL metric (which wants
+    # close-vs-close), but the drawdown calc needs intraday peaks. Two
+    # accumulators keep both metrics correct without conflating them.
+    equity_peak_per_day: dict[date, float] = field(default_factory=dict)
     position_marks: dict[str, tuple[float, float]] = field(default_factory=dict)
     # ticker -> (entry_price, mark_price); negative gap = adverse move
     last_broker_heartbeat: datetime | None = None
@@ -71,10 +76,20 @@ class PortfolioTelemetry:
             self.equity_history[-1] = (ts, equity_usd)
         else:
             self.equity_history.append((ts, equity_usd))
+        # R7.I1: separately track the per-day max so the drawdown metric does
+        # not lose intraday peaks when a later same-day overwrite is lower.
+        prior_peak = self.equity_peak_per_day.get(ts_date, equity_usd)
+        self.equity_peak_per_day[ts_date] = max(prior_peak, equity_usd)
         # Cap to last 60 entries (~60 trading days). All metrics use at most
         # a 30-day window, so 60 entries is a generous ceiling.
         if len(self.equity_history) > 60:
             self.equity_history = self.equity_history[-60:]
+        # Also cap the peak dict to ~90 days so dictionary size stays bounded
+        # across multi-month runs (matches R7.I1 spec for headroom on future
+        # 60-day metrics).
+        if len(self.equity_peak_per_day) > 90:
+            keep = sorted(self.equity_peak_per_day)[-90:]
+            self.equity_peak_per_day = {d: self.equity_peak_per_day[d] for d in keep}
 
     def record_position(
         self: PortfolioTelemetry, ticker: str, entry_price: float, mark_price: float
@@ -95,14 +110,26 @@ class PortfolioTelemetry:
         recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
         if len(recent) < 2:
             return 0.0
-        peak = max(e for _, e in recent)
+        # R7.I1: read peak from the per-day-max tracker so intraday peaks
+        # survive R6.C1's dedupe-by-day. Fall back to recent equity_history
+        # if the parallel tracker is missing entries (shouldn't happen, but
+        # keeps the metric defined for old PortfolioTelemetry instances).
+        cutoff_date = cutoff.date()
+        peaks_in_window = [e for d, e in self.equity_peak_per_day.items() if d >= cutoff_date]
+        peak = max(peaks_in_window) if peaks_in_window else max(e for _, e in recent)
         current = recent[-1][1]
         if peak <= 0:
             return 0.0
         return (current - peak) / peak
 
     def last_3_days_cumulative_pnl_pct(self: PortfolioTelemetry, as_of: datetime) -> float:
-        cutoff = as_of - timedelta(days=3)
+        # R7.I2: 3 *trading* days, not calendar days. On a Monday the calendar
+        # cutoff would only include Sat+Sun+today → at most 1 equity entry,
+        # and the metric silently returns 0 (killswitch dead on Mondays).
+        # Use a 4-business-day window ending at as_of so we capture the prior
+        # 3 trading days plus today.
+        bdays = pd.bdate_range(end=as_of, periods=4)
+        cutoff = bdays[0].to_pydatetime().replace(tzinfo=UTC)
         recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
         if len(recent) < 2:
             return 0.0
@@ -151,6 +178,12 @@ class PortfolioTelemetry:
         )
 
 
+# R7.I3: transient broker/data errors caught around per-tick I/O. Programming
+# errors (AttributeError, NotImplementedError, TypeError, ValueError) must
+# propagate up to tick_safe so they surface in structured logs.
+_TRANSIENT_IO_ERRORS = (ConnectionError, TimeoutError, OSError)
+
+
 @dataclass
 class RuntimeContext:
     cache: ParquetCache
@@ -162,6 +195,13 @@ class RuntimeContext:
     lifecycle_state: LifecycleState = field(default_factory=LifecycleState)
     kill_switch_active: bool = False
     _kill_reason: str | None = None
+    # R7.C1: sticky-cooldown bookkeeping. Once tripped, the killswitch stays
+    # tripped for `_kill_cooldown_days` calendar days regardless of fresh
+    # telemetry. Spec: "Auto-resume after 7 calendar days OR explicit manual
+    # reset." Prior behavior recomputed every tick → would untrip the same
+    # tick the triggering input recovered.
+    _kill_first_tripped_at: datetime | None = None
+    _kill_cooldown_days: int = 7
     telemetry: PortfolioTelemetry = field(default_factory=PortfolioTelemetry)
     # Populated by nightly_scan; read by premarket_verify the next morning.
     last_candidates: pd.DataFrame | None = None
@@ -212,8 +252,14 @@ class RuntimeContext:
             health = await self.broker.health()
             if health.connected:
                 self.telemetry.record_broker_heartbeat(datetime.now(UTC))
-        except Exception:
-            log.warning("broker_health_unreachable_at_setup")
+        except _TRANSIENT_IO_ERRORS as e:
+            # R7.I3: narrow to transient errors at setup. Programming bugs
+            # (AttributeError etc.) should propagate so setup() callers see them.
+            log.warning(
+                "broker_health_unreachable_at_setup",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
             # Seed heartbeat anyway so disconnect timer measures from now.
             # If still down at next tick, broker_disconnected_for_seconds grows.
             self.telemetry.record_broker_heartbeat(datetime.now(UTC))
@@ -251,8 +297,10 @@ class RuntimeContext:
             if health.connected:
                 self.telemetry.record_broker_heartbeat(now)
                 broker_healthy = True
-        except Exception:
-            log.warning("broker_health_check_failed")
+        except _TRANSIENT_IO_ERRORS as e:
+            # R7.I3: narrow to transient errors. AttributeError / TypeError
+            # etc. are real bugs and must propagate to tick_safe.
+            log.warning("broker_health_check_failed", err=str(e), err_type=type(e).__name__)
 
         # R5.C3: record data freshness UNCONDITIONALLY when the broker
         # responded — not only inside the position loop. Previously, an empty
@@ -263,17 +311,28 @@ class RuntimeContext:
             self.telemetry.record_data_freshness("ibkr_quotes", now)
 
         # Mark to market: fetch quotes, record position marks, collect prices.
+        # R7.Q-I2: skip the loop entirely when the broker is unhealthy — every
+        # fetch_quote will likely raise the same connection issue. Compounds
+        # tick latency for no benefit; quotes will refresh next tick anyway.
         marks: dict[str, float] = {}
-        for ticker, meta in self.lifecycle_state.positions.items():
-            try:
-                q = await self.broker.fetch_quote(ticker)
+        if broker_healthy:
+            for ticker, meta in self.lifecycle_state.positions.items():
+                try:
+                    q = await self.broker.fetch_quote(ticker)
+                except _TRANSIENT_IO_ERRORS as e:
+                    # R7.I3: narrow exception; programming errors propagate.
+                    log.debug(
+                        "quote_fetch_transient",
+                        ticker=ticker,
+                        err=str(e),
+                        err_type=type(e).__name__,
+                    )
+                    continue
                 price = q.last or q.bid or q.ask
                 if price > 0:
                     marks[ticker] = price
                     self.telemetry.record_position(ticker, meta["entry_price"], price)
                     self.telemetry.record_data_freshness("ibkr_quotes", now)
-            except Exception:
-                pass
 
         # Update broker equity with current marks and record for telemetry.
         # Mark-to-market the simulator first so its `equity` field is fresh
@@ -287,8 +346,9 @@ class RuntimeContext:
         # Only skip when the broker returns None (snapshot not yet available).
         try:
             equity_usd = await self.broker.get_equity_usd()
-        except Exception as e:
-            log.warning("equity_fetch_failed", err=str(e))
+        except _TRANSIENT_IO_ERRORS as e:
+            # R7.I3: narrow exception; programming errors propagate.
+            log.warning("equity_fetch_failed", err=str(e), err_type=type(e).__name__)
             equity_usd = None
         if equity_usd is not None:
             # R6.C1 made record_equity dedupe-by-day; safe to call every tick.
@@ -303,12 +363,53 @@ class RuntimeContext:
 
         # Build killswitch inputs from real telemetry and evaluate.
         ks = evaluate_killswitch(self.telemetry.to_killswitch_inputs(as_of=now))
+
+        # R7.C1: sticky cooldown. Once tripped, stay tripped for
+        # `_kill_cooldown_days` calendar days regardless of fresh telemetry,
+        # per the design doc's "Auto-resume after 7 calendar days OR explicit
+        # manual reset." Prior behavior recomputed every tick → a single
+        # green tick after a drawdown event would un-trip and resume entries.
+        if self._kill_first_tripped_at is not None:
+            cooldown_end = self._kill_first_tripped_at + timedelta(days=self._kill_cooldown_days)
+            if now < cooldown_end:
+                # Stay tripped, preserve the original reason.
+                self.kill_switch_active = True
+                if self.metrics_registry:
+                    self.metrics_registry.set_kill_switch_active(self._kill_reason or "cooldown")
+                return
+            # Cooldown elapsed — clear sticky state and accept fresh verdict.
+            log.info(
+                "killswitch_cooldown_expired",
+                prior_reason=self._kill_reason,
+                first_tripped_at=self._kill_first_tripped_at.isoformat(),
+            )
+            self._kill_first_tripped_at = None
+
         self.kill_switch_active = ks.tripped
         self._kill_reason = ks.reason
         if ks.tripped:
+            self._kill_first_tripped_at = now
             log.warning("killswitch_tripped", reason=ks.reason)
             if self.metrics_registry:
                 self.metrics_registry.set_kill_switch_active(ks.reason or "unknown")
+
+    def reset_killswitch(self: RuntimeContext) -> None:
+        """R7.C1: explicit manual reset. Clears sticky cooldown state and
+        un-trips the switch even if the cooldown window hasn't elapsed.
+
+        The operator is responsible for verifying that the triggering
+        condition has actually resolved before calling this.
+        """
+        log.warning(
+            "killswitch_manual_reset",
+            prior_reason=self._kill_reason,
+            first_tripped_at=(
+                self._kill_first_tripped_at.isoformat() if self._kill_first_tripped_at else None
+            ),
+        )
+        self._kill_first_tripped_at = None
+        self.kill_switch_active = False
+        self._kill_reason = None
 
     async def tick_safe(self: RuntimeContext, now: datetime) -> bool:
         """Run tick() and swallow any exception so the scheduler keeps firing.

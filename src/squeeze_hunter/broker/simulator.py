@@ -31,6 +31,11 @@ class SimulatorBroker:
     equity: float = field(init=False)
     positions: dict[str, Lot] = field(default_factory=dict)
     realized: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    # R7.C6: last per-ticker mark fed in via mark_to_market(). fetch_quote
+    # uses this so lifecycle stop evaluation sees the CURRENT bar's price,
+    # not the stale `lot.avg_price` (entry). Without this, sim-mode stops
+    # never fire because pnl_pct = (entry - entry) / entry = 0 forever.
+    last_marks: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self: SimulatorBroker) -> None:
         self.cash = self.initial_cash
@@ -46,9 +51,15 @@ class SimulatorBroker:
         return BrokerHealth(connected=True, last_ping_ms=0, account="simulator")
 
     async def fetch_quote(self: SimulatorBroker, ticker: str) -> Quote:
-        lot = self.positions.get(ticker)
-        if lot is not None:
-            price = lot.avg_price
+        # R7.C6: prefer the most recent mark-to-market price (real current
+        # bar) over lot.avg_price (entry, stale). Without this, lifecycle
+        # daemon's stop evaluation in sim mode always sees pnl_pct = 0 and
+        # no stop ever fires.
+        price = self.last_marks.get(ticker)
+        if price is None or price <= 0:
+            lot = self.positions.get(ticker)
+            price = lot.avg_price if lot is not None else 0.0
+        if price > 0:
             return Quote(
                 ticker=ticker,
                 bid=price,
@@ -154,6 +165,11 @@ class SimulatorBroker:
         return notional / self.equity
 
     def mark_to_market(self: SimulatorBroker, marks: dict[str, float], ts: datetime) -> None:
+        # R7.C6: remember the latest per-ticker marks so fetch_quote can serve
+        # the current price (not entry) to lifecycle/oms callers.
+        for t, px in marks.items():
+            if px > 0:
+                self.last_marks[t] = px
         notional = sum(marks.get(t, lot.avg_price) * lot.qty for t, lot in self.positions.items())
         self.equity = self.cash + notional
 

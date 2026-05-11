@@ -54,14 +54,23 @@ class OrderManager:
                 await asyncio.sleep(wait_s)
                 max_wall_seconds -= wait_s
 
-            # Fetch fresh quote; fall back to slice's static price if unavailable
+            # Fetch fresh quote; fall back to slice's static price if unavailable.
+            # R7.I4: narrow to transient I/O errors per CLAUDE.md. Programming
+            # errors (AttributeError on a misconfigured broker, NotImplementedError
+            # from a wrong provider) must propagate up instead of silently
+            # executing at the slice's stale planned price.
             try:
                 q = await self.broker.fetch_quote(plan.ticker)
                 mid = (q.bid + q.ask) / 2 if q.bid > 0 and q.ask > 0 else q.last
                 if mid <= 0:
                     mid = slc.limit_price
-            except Exception:
-                log.warning("oms_quote_fallback", ticker=plan.ticker)
+            except (ConnectionError, TimeoutError, OSError) as e:
+                log.warning(
+                    "oms_quote_fallback",
+                    ticker=plan.ticker,
+                    err=str(e),
+                    err_type=type(e).__name__,
+                )
                 mid = slc.limit_price
 
             # Pick aggression: base schedule, escalated if fills are lagging.

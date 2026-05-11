@@ -85,7 +85,11 @@ class IBKRBroker:
         )
 
     async def disconnect(self: IBKRBroker) -> None:
-        await asyncio.to_thread(self._ib.disconnect)
+        # R7.C7: ib-async is event-loop native. R6.C4 already removed the
+        # to_thread wrap from accountValues() for the same reason — disconnect()
+        # should match. Calling it from a worker thread can race the loop's
+        # pending push tasks. Direct call is the documented usage.
+        self._ib.disconnect()
 
     async def fetch_quote(self: IBKRBroker, ticker: str) -> Quote:
         contract = Stock(ticker, "SMART", "USD")

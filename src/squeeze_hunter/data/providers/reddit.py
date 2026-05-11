@@ -56,7 +56,15 @@ class RedditProvider:
         self: RedditProvider, ticker: str, as_of: datetime
     ) -> RedditMention | None:
         count_24h = await self._count_24h_mentions(ticker, as_of)
-        baseline_mean, baseline_std = self._compute_baseline_30d(ticker, as_of)
+        baseline = self._compute_baseline_30d(ticker, as_of)
+        # R7.C9: when no real baseline is available (the cached daily-count
+        # store is not yet implemented), return None so cross_sectional_z
+        # treats f4 as missing for this ticker. Previously a hard-coded
+        # (10, 20) prior was returned and applied to every ticker, every
+        # day — masking a placeholder as a live signal with weight 1.5.
+        if baseline is None:
+            return None
+        baseline_mean, baseline_std = baseline
         return RedditMention(
             ticker=ticker,
             as_of=as_of,
@@ -81,12 +89,21 @@ class RedditProvider:
 
     def _compute_baseline_30d(
         self: RedditProvider, ticker: str, as_of: datetime
-    ) -> tuple[float, float]:
-        # Cheap baseline: per-day counts over the last 30 days, taken from search.
-        # In Phase 1 we approximate from cached daily counts (recorded by nightly job).
-        # Without history yet, fall back to a wide flat prior (mean=10, std=20) to
-        # give well-behaved z-scores until enough days accumulate.
-        return 10.0, 20.0
+    ) -> tuple[float, float] | None:
+        """R7.C9: returns None until the cached daily-count store exists.
+
+        Caller treats None as "f4 unavailable for this ticker" and skips the
+        factor row, so cross_sectional_z computes z over only the tickers
+        with real data. Previously this returned a flat (10, 20) prior that
+        was identical for every ticker — turning a 1.5-weighted live factor
+        into noise-around-zero across the universe, with no warning.
+
+        Re-introduction plan: nightly ingest writes per-day mention counts
+        to `cache.write_partition('reddit_baseline', ticker, df)`. This
+        method then reads the last 30 entries, computes mean/std, and
+        returns those.
+        """
+        return None
 
     # -- protocol stubs --
     async def fetch_bars(self: RedditProvider, *_a: object, **_kw: object) -> list[Bar]:

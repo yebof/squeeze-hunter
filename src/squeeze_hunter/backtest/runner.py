@@ -14,8 +14,10 @@ from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
 from squeeze_hunter.risk.gates import GateContext, PortfolioState, TradeProposal, evaluate_gates
 from squeeze_hunter.risk.kelly import kelly_position_pct, kelly_priors_for_setup
+from squeeze_hunter.risk.killswitch import KillSwitchInputs, evaluate_killswitch
 from squeeze_hunter.risk.stops import StopState, evaluate_stops
 from squeeze_hunter.scan import run_scan
+from squeeze_hunter.signals.earnings_reaction import _trading_days_between
 
 
 @dataclass
@@ -48,6 +50,14 @@ async def run_backtest(
     trade_log: list[dict] = []
     equity_series: list[tuple[datetime, float]] = []
     daily_rows: list[dict] = []
+    # R7.C2: per-day equity series for the killswitch input. We track daily
+    # closes here and feed evaluate_killswitch each day so the backtest
+    # discovers strategies that would have tripped the killswitch live.
+    # Without this, Gate 1 silently accepts strategies whose realized
+    # drawdown exceeds the production -10% kill threshold.
+    kill_active = False
+    kill_first_tripped_at: datetime | None = None
+    kill_cooldown_days = 7  # mirrors RuntimeContext._kill_cooldown_days
 
     # C7: iterate over trading (business) days only — skips weekends.
     # US holidays are not filtered here (minor inaccuracy, acceptable for now).
@@ -101,6 +111,11 @@ async def run_backtest(
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L so Kelly observed-trades counter works
                     realized = (order.avg_fill_price - st["entry_price"]) * qty
+                    # R7.C3+C4: record pct return for Kelly's b. Dollar PnL biases
+                    # avg_payoff toward larger-cap trades; pct normalizes across
+                    # position sizes and is invariant to equity growth.
+                    cost_basis = st["entry_price"] * qty
+                    pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
                         {
                             "ts": cur,
@@ -110,7 +125,10 @@ async def run_backtest(
                             "price": order.avg_fill_price,
                             "reason": sig.reason or "exit",
                             "realized": realized,
+                            "pct_return": pct_return,
                             "setup_type": st["setup_type"],
+                            # R7.C3: full exits are the "trade" unit for Kelly.
+                            "partial": False,
                         }
                     )
                 tickers_to_remove.append(ticker)
@@ -120,6 +138,8 @@ async def run_backtest(
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L for the halved quantity
                     realized = (order.avg_fill_price - st["entry_price"]) * qty
+                    cost_basis = st["entry_price"] * qty
+                    pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
                         {
                             "ts": cur,
@@ -129,15 +149,23 @@ async def run_backtest(
                             "price": order.avg_fill_price,
                             "reason": "signal_decay_half",
                             "realized": realized,
+                            "pct_return": pct_return,
                             "setup_type": st["setup_type"],
+                            # R7.C3: halve sells are partial — exclude from Kelly's
+                            # observed-trades counter to prevent double-counting a
+                            # single position as both win (halve leg) AND loss
+                            # (remainder close) in the same setup bucket.
+                            "partial": True,
                         }
                     )
 
         for ticker in tickers_to_remove:
             open_states.pop(ticker, None)
 
-        # 3) Propose new entries from today's scan results
-        if not ranked.empty:
+        # 3) Propose new entries from today's scan results.
+        # R7.C2: skip new entries entirely when the killswitch is active.
+        # This mirrors RuntimeContext.nightly_scan's suppression behavior.
+        if not ranked.empty and not kill_active:
             # I10: compute earnings proximity gate for each candidate (calendar days for now).
             # We read the earnings cache directly (not through the provider's lookahead guard)
             # because knowing an earnings date 3 days in advance is public information —
@@ -151,7 +179,12 @@ async def run_backtest(
                 if not earnings_df.empty:
                     t_events = earnings_df[earnings_df["ticker"] == t]
                     for _, erow in t_events.iterrows():
-                        days_away = (erow["report_at"] - cur).days
+                        # R7.M1: trading days, not calendar days. A Friday with
+                        # earnings on Monday is 1 trading day away; the calendar-
+                        # day version would have read 3 and halved size. The
+                        # design's "fewer high-quality sources, simple/stable
+                        # methods" doctrine prefers trading-day consistency.
+                        days_away = _trading_days_between(cur, erow["report_at"])
                         if 0 <= days_away <= 3:
                             flag = True
                             break
@@ -159,7 +192,9 @@ async def run_backtest(
 
             ctx = GateContext(
                 as_of=cur,
-                kill_switch_active=False,
+                # R7.C2: pass the live killswitch state into the gate context
+                # so evaluate_gates can also reject entries when tripped.
+                kill_switch_active=kill_active,
                 adv20_dollar_volume_by_ticker={
                     t: 1e9 for t in cfg.tickers
                 },  # placeholder large enough for backtest universe
@@ -178,34 +213,45 @@ async def run_backtest(
                 opened_today=0,
             )
 
+            # R7.I5: read max_new_per_day from settings so YAML overrides
+            # actually take effect (previously hardcoded literal 3).
+            max_new = settings.risk.max_new_per_day
             for _, row in ranked.iterrows():
-                if state.opened_today >= 3:
+                if state.opened_today >= max_new:
                     break
                 # C3: use per-setup priors so raw Kelly is positive from trade 0
                 setup = str(row["setup_type"])
                 setup_params = kelly_priors_for_setup(setup)
 
-                # Per-setup observed wins/trades from trade_log
+                # R7.C3: only FULL exits (partial=False) count as "trades" for
+                # the Kelly observed-rate update. Halve-sells go into trade_log
+                # for P&L accounting but must not inflate the win counter.
                 setup_sells = [
-                    r for r in trade_log if r["side"] == "sell" and r.get("setup_type") == setup
+                    r
+                    for r in trade_log
+                    if r["side"] == "sell"
+                    and r.get("setup_type") == setup
+                    and not r.get("partial", False)
                 ]
                 wins = sum(1 for r in setup_sells if r.get("realized", 0) > 0)
                 trades = len(setup_sells)
-                wins_pl = [r["realized"] for r in setup_sells if r.get("realized", 0) > 0]
-                losses_pl = [-r["realized"] for r in setup_sells if r.get("realized", 0) < 0]
-                # Use observed win/loss ratio when both sides have happened.
+                # R7.C4: use pct_return, not dollar realized, for avg_payoff.
+                # Kelly's `b` is the return ratio (win% / |loss%|). Dollar PnL
+                # biased the ratio toward larger-cap entries and shifted Kelly
+                # as equity grew — both wrong.
+                wins_pct = [r["pct_return"] for r in setup_sells if r.get("pct_return", 0) > 0]
+                losses_pct = [-r["pct_return"] for r in setup_sells if r.get("pct_return", 0) < 0]
                 # When only wins or only losses are observed, fall back to the
                 # per-setup prior payoff. The Bayesian shrinkage inside
                 # kelly_position_pct still blends observed win-rate with prior
                 # win-rate, so an all-wins streak still raises Kelly above the
-                # prior baseline — just not unboundedly. This is intentionally
-                # conservative (R9 reviewed and accepted).
-                avg_payoff = (
-                    (sum(wins_pl) / max(len(wins_pl), 1))
-                    / max(sum(losses_pl) / max(len(losses_pl), 1), 1.0)
-                    if wins_pl and losses_pl
-                    else setup_params.prior_payoff
-                )
+                # prior baseline — just not unboundedly.
+                if wins_pct and losses_pct:
+                    avg_win_pct = sum(wins_pct) / len(wins_pct)
+                    avg_loss_pct = max(sum(losses_pct) / len(losses_pct), 1e-6)
+                    avg_payoff = avg_win_pct / avg_loss_pct
+                else:
+                    avg_payoff = setup_params.prior_payoff
                 kelly_pct = kelly_position_pct(
                     observed_wins=wins,
                     observed_trades=trades,
@@ -213,9 +259,14 @@ async def run_backtest(
                     params=setup_params,
                 )
                 target_size = state.equity_usd * kelly_pct
+                # R7.C5: removed the 4% safety floor. Per-setup priors all
+                # produce positive raw Kelly (CAR=2.5%, GME=4.375%, Mixed=5.45%),
+                # so the floor only ever fired during losing streaks — exactly
+                # when sizing should drop, not floor. Per the conservative-bias
+                # design principle, prefer zero sizing over a forced trade when
+                # Kelly says zero.
                 if target_size <= 0:
-                    # Safety floor — should rarely fire now that per-setup priors are positive
-                    target_size = state.equity_usd * 0.04
+                    continue
 
                 p = TradeProposal(
                     ticker=row["ticker"],
@@ -267,6 +318,21 @@ async def run_backtest(
         equity_series.append((cur, broker.equity))
         daily_rows.append({"date": cur.date(), "equity": broker.equity, "cash": broker.cash})
 
+        # R7.C2: evaluate the killswitch against the per-day equity series.
+        # Strategy realism: if a strategy would have tripped live, it must
+        # also be locked-out in backtest so Gate 1 sees the same behavior.
+        kill_inputs = _build_killswitch_inputs(cur, equity_series)
+        ks = evaluate_killswitch(kill_inputs)
+        if ks.tripped and not kill_active:
+            kill_active = True
+            kill_first_tripped_at = cur
+        elif kill_active and kill_first_tripped_at is not None:
+            cooldown_end = kill_first_tripped_at + timedelta(days=kill_cooldown_days)
+            if cur >= cooldown_end:
+                # Sticky cooldown expired; re-evaluate cleanly.
+                kill_active = ks.tripped
+                kill_first_tripped_at = cur if ks.tripped else None
+
     eq = pd.Series(
         data=[e for _, e in equity_series],
         index=pd.DatetimeIndex([t for t, _ in equity_series]),
@@ -276,4 +342,52 @@ async def run_backtest(
         equity_curve=eq,
         trade_log=pd.DataFrame(trade_log),
         daily_metrics=pd.DataFrame(daily_rows),
+    )
+
+
+def _build_killswitch_inputs(
+    as_of: datetime, equity_series: list[tuple[datetime, float]]
+) -> KillSwitchInputs:
+    """R7.C2: derive the 3 equity-based killswitch inputs from the backtest
+    series. The backtest has no broker / no data-source heartbeats, so
+    broker_disconnected_for_seconds and critical_data_stale_for_seconds are
+    always zero. Position-gap is also zero — gap-through-stop is a paper/live
+    concept (intraday halt + open gap) that doesn't apply to EOD bar replay.
+    """
+    if len(equity_series) < 2:
+        return KillSwitchInputs(
+            as_of=as_of,
+            rolling_30d_max_drawdown=0.0,
+            last_3_days_cumulative_pnl_pct=0.0,
+            worst_position_gap_pct=0.0,
+            broker_disconnected_for_seconds=0,
+            critical_data_stale_for_seconds=0,
+        )
+    # 30-day rolling drawdown: peak vs current within the trailing 30 days.
+    cutoff_30 = as_of - timedelta(days=30)
+    recent_30 = [(t, e) for t, e in equity_series if t >= cutoff_30]
+    if len(recent_30) >= 2:
+        peak = max(e for _, e in recent_30)
+        current = recent_30[-1][1]
+        dd = (current - peak) / peak if peak > 0 else 0.0
+    else:
+        dd = 0.0
+    # 3-trading-day cumulative pnl: start equity vs current within the
+    # trailing 4-business-day window.
+    bdays = pd.bdate_range(end=as_of, periods=4)
+    cutoff_3 = bdays[0].to_pydatetime()
+    # equity_series timestamps are tz-naive datetimes from bdate_range
+    # .to_pydatetime() in the main loop, so this comparison is consistent.
+    recent_3 = [(t, e) for t, e in equity_series if t >= cutoff_3]
+    if len(recent_3) >= 2 and recent_3[0][1] > 0:
+        pnl_3d = (recent_3[-1][1] - recent_3[0][1]) / recent_3[0][1]
+    else:
+        pnl_3d = 0.0
+    return KillSwitchInputs(
+        as_of=as_of,
+        rolling_30d_max_drawdown=dd,
+        last_3_days_cumulative_pnl_pct=pnl_3d,
+        worst_position_gap_pct=0.0,
+        broker_disconnected_for_seconds=0,
+        critical_data_stale_for_seconds=0,
     )

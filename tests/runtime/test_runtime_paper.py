@@ -164,6 +164,10 @@ async def test_tick_clears_telemetry_position_marks_on_exit(tmp_path: Path) -> N
             avg_fill_price=70.0,
         ),
     )
+    # R7.I3: tick() catches only transient I/O errors now, so the broker
+    # has to actually answer get_equity_usd. Return 95k → small drawdown
+    # below killswitch threshold.
+    mock_broker.get_equity_usd = AsyncMock(return_value=95_000.0)
     rc.broker = mock_broker
     await rc.setup()
 
@@ -357,6 +361,85 @@ async def test_setup_connect_times_out(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     # restore
     monkeypatch.setattr(paper_module, "PaperBroker", original_paper_broker)
+
+
+@pytest.mark.asyncio
+async def test_killswitch_sticky_cooldown_after_trip(tmp_path: Path) -> None:
+    """R7.C1: once tripped, the killswitch stays tripped for 7 calendar days
+    even when fresh telemetry shows the triggering condition has resolved.
+
+    Spec: 'Auto-resume after 7 calendar days OR explicit manual reset.'
+    Prior behavior recomputed every tick, so a single green tick would
+    untrip the switch and resume entries the moment the input recovered.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    mock_broker = MagicMock()
+    mock_broker.name = "cooldown-mock"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
+    )
+    # Equity returned changes per call: first 80k (DD), then 100k (recovered).
+    equities = [80_000.0, 100_000.0, 100_000.0]
+    mock_broker.get_equity_usd = AsyncMock(side_effect=lambda: equities.pop(0))
+    rc.broker = mock_broker
+    await rc.setup()
+
+    # Seed prior peak so the first tick records a confirmed drawdown.
+    rc.telemetry.record_equity(datetime(2026, 5, 8, 14, 0, tzinfo=UTC), 100_000.0)
+
+    # Tick 1 (Monday): drawdown → killswitch trips.
+    await rc.tick(now=datetime(2026, 5, 11, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is True
+    assert rc._kill_first_tripped_at is not None
+
+    # Tick 2 (next day): equity recovers to 100k. Killswitch must STAY tripped.
+    await rc.tick(now=datetime(2026, 5, 12, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is True, "sticky cooldown not honored"
+
+    # Tick 3 (8 days later): cooldown elapsed, fresh telemetry is healthy.
+    await rc.tick(now=datetime(2026, 5, 19, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is False
+    assert rc._kill_first_tripped_at is None
+
+
+@pytest.mark.asyncio
+async def test_killswitch_manual_reset_clears_cooldown(tmp_path: Path) -> None:
+    """R7.C1: reset_killswitch() clears the sticky state even mid-cooldown."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    mock_broker = MagicMock()
+    mock_broker.name = "reset-mock"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
+    )
+    mock_broker.get_equity_usd = AsyncMock(return_value=80_000.0)
+    rc.broker = mock_broker
+    await rc.setup()
+
+    rc.telemetry.record_equity(datetime(2026, 5, 8, 14, 0, tzinfo=UTC), 100_000.0)
+    await rc.tick(now=datetime(2026, 5, 11, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is True
+
+    rc.reset_killswitch()
+    assert rc.kill_switch_active is False
+    assert rc._kill_first_tripped_at is None
+    assert rc._kill_reason is None
 
 
 @pytest.mark.asyncio

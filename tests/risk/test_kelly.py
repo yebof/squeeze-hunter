@@ -29,14 +29,32 @@ def test_kelly_per_setup_priors_mixed_positive() -> None:
 
 
 def test_kelly_priors_for_unknown_setup_falls_back_to_safe_prior() -> None:
-    """Unknown setup_type returns a safe (e.g., Mixed) prior, not the negative default."""
+    """Unknown setup_type returns the Mixed prior (positive raw Kelly)."""
     from squeeze_hunter.risk.kelly import kelly_priors_for_setup
 
-    p = kelly_priors_for_setup("Weak")  # or anything unknown
+    p = kelly_priors_for_setup("UnknownSetupName")  # truly unknown
     assert isinstance(p, KellyParams)
     # raw kelly with these priors must not be negative
     raw = (p.prior_win_rate * p.prior_payoff - (1 - p.prior_win_rate)) / p.prior_payoff
     assert raw >= 0.0
+
+
+def test_kelly_priors_for_weak_returns_zero_sizing() -> None:
+    """R7.M2: a 'Weak' setup must size to zero, not silently fall through to
+    Mixed priors. The classifier emits Weak when factor evidence is too thin
+    for confident sizing; the gate rejects Weak by name, but if it ever slips
+    past (e.g., gate ordering changes), Kelly must enforce the zero floor.
+    """
+    from squeeze_hunter.risk.kelly import kelly_position_pct, kelly_priors_for_setup
+
+    p = kelly_priors_for_setup("Weak")
+    assert p.fraction == 0.0
+    assert p.cap == 0.0
+    # Even with a strong observed track record, the zero fraction means zero size.
+    pct = kelly_position_pct(
+        observed_wins=20, observed_trades=20, observed_avg_payoff=10.0, params=p
+    )
+    assert pct == 0.0
 
 
 def test_kelly_zero_when_priors_negative_and_no_obs() -> None:

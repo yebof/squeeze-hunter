@@ -57,3 +57,25 @@ def test_data_stale_trips() -> None:
     v = evaluate_killswitch(inp)
     assert v.tripped
     assert v.reason == "data_stale"
+
+
+def test_broker_outage_at_exact_threshold_trips() -> None:
+    """R7.M3: spec reads 'at or above 5 minutes' — comparison must be >=, not >.
+
+    Before R7.M3: 300s exactly returned tripped=False, leaving a 1-second
+    window where the broker outage trigger silently disarmed.
+    """
+    inp = _base()
+    inp.broker_disconnected_for_seconds = 300  # exactly at threshold
+    v = evaluate_killswitch(inp)
+    assert v.tripped
+    assert v.reason == "broker_outage"
+
+
+def test_data_stale_at_exact_threshold_trips() -> None:
+    """R7.M3: same logic for data_stale threshold."""
+    inp = _base()
+    inp.critical_data_stale_for_seconds = 60 * 60 * 2  # exactly 2h
+    v = evaluate_killswitch(inp)
+    assert v.tripped
+    assert v.reason == "data_stale"

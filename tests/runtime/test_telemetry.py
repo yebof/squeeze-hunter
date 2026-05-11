@@ -145,6 +145,44 @@ def test_data_freshness_unconditional_recording() -> None:
     assert tel.critical_data_stale_for_seconds(later) == 7200
 
 
+def test_drawdown_preserves_intraday_peak_after_dedupe_by_day() -> None:
+    """R7.I1: R6.C1's dedupe-by-day (last write wins) would otherwise erase an
+    intraday equity peak. Drawdown math should still see the peak via the
+    parallel equity_peak_per_day tracker.
+    """
+    tel = PortfolioTelemetry()
+    # Day 1: ramp from 100k up to 110k, then close back at 100k. The latest
+    # entry by-day will overwrite to 100k, but the peak should still be 110k.
+    tel.record_equity(datetime(2026, 5, 11, 10, 0, tzinfo=UTC), 100_000.0)
+    tel.record_equity(datetime(2026, 5, 11, 12, 0, tzinfo=UTC), 110_000.0)
+    tel.record_equity(datetime(2026, 5, 11, 16, 0, tzinfo=UTC), 100_000.0)
+    # Day 2: equity drops to 99k. Drawdown vs the 110k peak should be -10%.
+    tel.record_equity(datetime(2026, 5, 12, 16, 0, tzinfo=UTC), 99_000.0)
+    dd = tel.rolling_30d_max_drawdown(datetime(2026, 5, 12, 17, tzinfo=UTC))
+    assert dd == pytest.approx(-0.10, abs=0.001)
+
+
+def test_three_day_pnl_uses_trading_days_not_calendar() -> None:
+    """R7.I2: Monday-morning call should look back 3 trading days (Wed/Thu/Fri
+    of previous week), not 3 calendar days (Sat/Sun/Mon) which would yield
+    1 trading day of history at best.
+    """
+    tel = PortfolioTelemetry()
+    # The trailing 3 trading days before Monday 2026-05-11 are Wed 5/6, Thu 5/7,
+    # Fri 5/8. Seed equity values across those days plus the current Monday.
+    tel.record_equity(datetime(2026, 5, 6, 16, tzinfo=UTC), 100_000.0)  # Wed
+    tel.record_equity(datetime(2026, 5, 7, 16, tzinfo=UTC), 99_000.0)  # Thu
+    tel.record_equity(datetime(2026, 5, 8, 16, tzinfo=UTC), 98_000.0)  # Fri
+    tel.record_equity(datetime(2026, 5, 11, 16, tzinfo=UTC), 95_000.0)  # Mon
+    pnl = tel.last_3_days_cumulative_pnl_pct(
+        datetime(2026, 5, 11, 16, 30, tzinfo=UTC),
+    )
+    # 95k vs 100k → -5%, far below the -5% killswitch threshold. With the old
+    # calendar-day cutoff (Sat-Sun-Mon), only one entry would be in the
+    # window and the metric would return 0.0 → killswitch dead on Mondays.
+    assert pnl == pytest.approx(-0.05, abs=0.005)
+
+
 def test_telemetry_to_killswitch_inputs() -> None:
     """Convenience: telemetry can produce KillSwitchInputs in one call."""
     from squeeze_hunter.risk.killswitch import KillSwitchInputs

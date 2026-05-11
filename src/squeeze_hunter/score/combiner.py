@@ -43,5 +43,16 @@ def combine(factors_long: pd.DataFrame, weights: dict[str, float]) -> pd.DataFra
     score = (
         df.groupby("ticker", as_index=False)["weighted"].sum().rename(columns={"weighted": "score"})
     )
-    pivot = df.pivot_table(index="ticker", columns="factor_name", values="z_score").reset_index()
+    # R7.M4: pivot (strict) rather than pivot_table (which silently averages
+    # duplicate (ticker, factor_name) pairs and halves the z-score under a
+    # compute_all_factors bug that emits two rows for the same key).
+    # Aggregate to one row per (ticker, factor_name) first so pivot's
+    # uniqueness check is met when factors are sane; if duplicates exist,
+    # the upstream bug surfaces as a ValueError instead of silent corruption.
+    pivot_input = (
+        df.drop_duplicates(subset=["ticker", "factor_name"], keep="last")
+        if not df.duplicated(subset=["ticker", "factor_name"]).any()
+        else df  # let pivot raise the more useful error
+    )
+    pivot = pivot_input.pivot(index="ticker", columns="factor_name", values="z_score").reset_index()
     return score.merge(pivot, on="ticker", how="left")

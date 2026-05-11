@@ -94,10 +94,19 @@ async def _process_one_position(
         qty = meta["qty"] // 2 if sig.action == "halve" else meta["qty"]
         if qty <= 0:
             return
+        # R7.I7: emit a marketable limit (50 bps below current bid/last)
+        # instead of a market order. Market sells route into whatever
+        # liquidity is available — during halts, AH, or thin sessions
+        # they can fill 5-20% adverse on small-float tickers. A limit
+        # 50 bps below mid is still aggressive enough to hit the inside
+        # in normal liquidity but caps catastrophic fills. The spec's
+        # design principle #1 (conservative bias) prefers controlled
+        # exits over guaranteed-fill market orders.
+        marketable_limit = round(price * 0.995, 4)  # 50 bps below current
         order = await broker.submit_sell(
             ticker=ticker,
             qty=qty,
-            limit_price=None,
+            limit_price=marketable_limit,
             ts=now,
         )
         log.info(
