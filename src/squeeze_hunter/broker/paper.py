@@ -16,11 +16,12 @@ class PaperBroker(IBKRBroker):
     name: str = "ibkr-paper"
 
     def __post_init__(self: PaperBroker) -> None:
-        # Paper is always 7497 regardless of env. Caller can't accidentally hit live.
-        self.port = 7497
+        # R6.M3: check the env FIRST, then set port. IBKRBroker's
+        # default_factory has already evaluated IBKR_PORT at dataclass init
+        # time (could be 8888); the env-mismatch check raises before we
+        # overwrite, which gives a clearer error path.
         # R5.C4: guard the env-var int() with try/except so a malformed
-        # IBKR_PORT (e.g., "abc") raises a clear error rather than a cryptic
-        # ValueError. Mirrors the IBKRBroker module-load guard.
+        # IBKR_PORT (e.g., "abc") doesn't raise cryptic ValueError.
         raw = os.environ.get("IBKR_PORT")
         if raw:
             try:
@@ -30,4 +31,6 @@ class PaperBroker(IBKRBroker):
                 env_port = 7497
             if env_port != 7497:
                 raise RuntimeError(f"PaperBroker refusing to connect to non-paper port {env_port}")
+        # Paper is always 7497 regardless of env. Caller can't accidentally hit live.
+        self.port = 7497
         super().__post_init__()

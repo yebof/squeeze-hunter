@@ -434,8 +434,30 @@ def test_lifecycle_exits_list_trims_after_max() -> None:
     assert tickers == [f"T{i}" for i in range(15, 25)]
 
 
-def test_lifecycle_exits_default_max_is_generous() -> None:
-    """Default cap is high (1000) so it never bites in normal operation;
-    only catastrophic runaway scenarios would hit it."""
+def test_lifecycle_exits_trim_keeps_most_recent_with_default_cap() -> None:
+    """R6.M1: a meaningful test of the default trim behavior.
+
+    Replaces the prior `assert state.exits_max_entries >= 1000` tautology
+    (the field was just being checked against its own default — would have
+    passed if someone changed the default to 99999).
+
+    Now we drive the actual trim path: record N+1 entries with the default
+    cap, verify it shrinks back to N and keeps the newest.
+    """
     state = LifecycleState()
-    assert state.exits_max_entries >= 1000
+    cap = state.exits_max_entries
+    # Push cap+5 entries
+    for i in range(cap + 5):
+        state.record_exit(
+            {
+                "ts": datetime(2026, 5, 14, 14, 0, tzinfo=UTC),
+                "ticker": f"T{i}",
+                "qty": 1,
+                "reason": "test",
+            }
+        )
+    assert len(state.exits) == cap
+    # The newest 5 must be present
+    last_tickers = [e["ticker"] for e in state.exits[-5:]]
+    expected = [f"T{i}" for i in range(cap, cap + 5)]
+    assert last_tickers == expected

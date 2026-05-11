@@ -87,7 +87,15 @@ def build_scheduler(
                 day_of_week="mon-fri",
                 timezone=spec.get("tz"),
             )
-        else:
+        elif spec["trigger"] == "interval":
             trigger = IntervalTrigger(seconds=spec["seconds"])
+        else:
+            # R6.M4: explicit fail-loud rather than the prior else-branch
+            # that silently fell through to IntervalTrigger and then
+            # KeyError'd on spec["seconds"].
+            raise ValueError(
+                f"build_scheduler: unknown trigger type {spec['trigger']!r} "
+                f"for job {spec['id']!r}"
+            )
         sched.add_job(cb, trigger=trigger, id=spec["id"])
     return sched

@@ -24,27 +24,44 @@ app = typer.Typer(no_args_is_help=True)
 log = get_logger("cli")
 
 
-def _build_runtime_callbacks(rc: RuntimeContext) -> dict[str, Callable[[], Any] | None]:
+def _build_runtime_callbacks(
+    rc: RuntimeContext,
+    pending_tasks: set[asyncio.Task[Any]] | None = None,
+) -> dict[str, Callable[[], Any] | None]:
     """Map scheduler job IDs to callbacks for paper/live runtime modes.
 
     Phase 3 wires: nightly_scan, premarket_verify, intraday_loop, eod_close.
     The other three (ingest_eod, premarket_data, moc_decision) are explicit None
     with comments documenting their Phase 4 ownership so the scheduler silently
     skips them rather than crashing on a missing key.
+
+    R6.C2: `pending_tasks` is an external set the caller maintains so it can
+    await in-flight tasks at shutdown. Each scheduled task is added to the
+    set on creation and removed via done-callback. APScheduler's
+    `sched.shutdown(wait=True)` only waits for the synchronous lambda to
+    return — NOT for the coroutine the lambda spawned via create_task —
+    so without external tracking, in-flight ticks get cancelled mid-flight
+    when the process tries to exit.
     """
+    tracker = pending_tasks if pending_tasks is not None else set()
+
+    def _spawn(coro: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        tracker.add(task)
+        task.add_done_callback(tracker.discard)
+        return task
+
     return {
         # Phase 4: integrate live EOD data ingest (yfinance → parquet backfill)
         "ingest_eod": None,
-        "nightly_scan": lambda: asyncio.create_task(rc.nightly_scan_safe(now=datetime.now(UTC))),
+        "nightly_scan": lambda: _spawn(rc.nightly_scan_safe(now=datetime.now(UTC))),
         # Phase 4: overnight news + halt-list ingest
         "premarket_data": None,
-        "premarket_verify": lambda: asyncio.create_task(
-            rc.premarket_verify_safe(now=datetime.now(UTC))
-        ),
-        "intraday_loop": lambda: asyncio.create_task(rc.tick_safe(now=datetime.now(UTC))),
+        "premarket_verify": lambda: _spawn(rc.premarket_verify_safe(now=datetime.now(UTC))),
+        "intraday_loop": lambda: _spawn(rc.tick_safe(now=datetime.now(UTC))),
         # Phase 4: MoC / EOL flatten logic
         "moc_decision": None,
-        "eod_close": lambda: asyncio.create_task(rc.eod_close_safe(now=datetime.now(UTC))),
+        "eod_close": lambda: _spawn(rc.eod_close_safe(now=datetime.now(UTC))),
     }
 
 
@@ -106,6 +123,19 @@ ingest_app = typer.Typer(help="Historical backfill commands")
 app.add_typer(ingest_app, name="ingest")
 
 
+def _parse_iso_to_utc(s: str) -> datetime:
+    """R6.M7: parse an ISO date string into a UTC datetime.
+
+    If the input already carries a tz offset, convert (not replace) so a
+    timestamp like '10:00+05:00' becomes '05:00 UTC' instead of being
+    silently relabeled to '10:00 UTC' (off by 5 hours).
+    """
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 @ingest_app.command("bars")
 def ingest_bars(
     start: Annotated[str, typer.Option("--start", help="YYYY-MM-DD")],
@@ -119,14 +149,22 @@ def ingest_bars(
     configure_logging()
     cache = ParquetCache(root=parquet_root)
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
-    asyncio.run(
-        backfill_bars_for_universe(
-            tickers,
-            datetime.fromisoformat(start).replace(tzinfo=UTC),
-            datetime.fromisoformat(end).replace(tzinfo=UTC),
-            cache,
+    if not tickers:
+        typer.echo(f"WARNING: {tickers_file} is empty — nothing to backfill", err=True)
+        return
+
+    start_dt = _parse_iso_to_utc(start)
+    end_dt = _parse_iso_to_utc(end)
+    # R6.I4: reject inverted ranges loudly. yfinance silently returns empty
+    # data for `start > end`, leaving no on-disk signal of the misconfiguration.
+    if start_dt >= end_dt:
+        typer.echo(
+            f"ERROR: --start ({start}) must be before --end ({end})",
+            err=True,
         )
-    )
+        raise typer.Exit(code=2)
+
+    asyncio.run(backfill_bars_for_universe(tickers, start_dt, end_dt, cache))
 
 
 @ingest_app.command("finra")
@@ -193,8 +231,20 @@ def backtest(
         train_end=datetime.fromisoformat(train_end).replace(tzinfo=UTC),
         test_windows=[_parse_range(w) for w in test_windows],
         holdout=_parse_range(holdout_range),
+        # R6.C3: wire score.threshold from YAML so the backtest uses the
+        # same entry gate as production. Previously this defaulted to 8.0
+        # in WalkForwardConfig regardless of YAML override → backtests
+        # were inconsistent with live trading.
+        score_threshold=settings.score.threshold,
     )
-    report = asyncio.run(run_walk_forward(cfg, cache=cache, settings=settings))
+    try:
+        report = asyncio.run(run_walk_forward(cfg, cache=cache, settings=settings))
+    except ValueError as e:
+        # R6.I1: combine() raises ValueError when score.weights is empty
+        # (R5.C6 fail-loud behavior). Bubble a clean error to the user
+        # rather than a raw Python traceback.
+        typer.echo(f"ERROR: backtest configuration is invalid: {e}", err=True)
+        raise typer.Exit(code=2) from e
     out.mkdir(parents=True, exist_ok=True)
     holdout_eq = report["raw"]["holdout_equity"]
     n_obs = max(20, len(holdout_eq.dropna()))
@@ -248,15 +298,24 @@ def paper(
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
 
     rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="paper")
+    pending_tasks: set[asyncio.Task[Any]] = set()
 
     async def main_loop() -> None:
         await rc.setup(connect_timeout_s=connect_timeout_s)
-        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
+        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc, pending_tasks))
         sched.start()
         try:
             await asyncio.Event().wait()  # block forever
         finally:
+            # R6.C2: APScheduler's shutdown(wait=True) only awaits the
+            # synchronous lambda, not the create_task it spawned. We must
+            # explicitly await pending tasks so an in-flight tick can finish
+            # cleanly before broker.disconnect tears down the socket.
             sched.shutdown()
+            if pending_tasks:
+                log.info("awaiting_in_flight_tasks", count=len(pending_tasks))
+                # Snapshot the set — done callbacks will mutate it during await
+                await asyncio.gather(*list(pending_tasks), return_exceptions=True)
             await rc.shutdown()
 
     asyncio.run(main_loop())
@@ -286,15 +345,20 @@ def live(
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
 
     rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="live")
+    pending_tasks: set[asyncio.Task[Any]] = set()
 
     async def main_loop() -> None:
         await rc.setup(connect_timeout_s=connect_timeout_s)
-        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
+        sched = build_scheduler(callbacks=_build_runtime_callbacks(rc, pending_tasks))
         sched.start()
         try:
             await asyncio.Event().wait()
         finally:
+            # R6.C2: see paper() above for rationale.
             sched.shutdown()
+            if pending_tasks:
+                log.info("awaiting_in_flight_tasks", count=len(pending_tasks))
+                await asyncio.gather(*list(pending_tasks), return_exceptions=True)
             await rc.shutdown()
 
     asyncio.run(main_loop())

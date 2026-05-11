@@ -59,13 +59,22 @@ class PortfolioTelemetry:
     critical_sources: set[str] = field(default_factory=lambda: {"ibkr_quotes"})
 
     def record_equity(self: PortfolioTelemetry, ts: datetime, equity_usd: float) -> None:
-        self.equity_history.append((ts, equity_usd))
-        # R4.9: trim to last 31 days so the list doesn't grow unbounded over
-        # long runs. The longest window used by any metric is 30 days
-        # (rolling_30d_max_drawdown), so 31 days is safe.
-        if len(self.equity_history) > 100:
-            cutoff = ts - timedelta(days=31)
-            self.equity_history = [(t, e) for t, e in self.equity_history if t >= cutoff]
+        # R6.C1: dedupe by date — keep only the LATEST equity reading per
+        # calendar day (in UTC). At 60s intraday ticks this collapses ~390
+        # entries/day into 1, so over 30 days we hold ≤31 entries — the trim
+        # is then trivial. The previous R4.9 implementation tried to trim by
+        # 31-day cutoff after len>100, but in a single trading session ALL
+        # entries were within the cutoff → no actual trim → unbounded growth.
+        ts_date = ts.date()
+        if self.equity_history and self.equity_history[-1][0].date() == ts_date:
+            # Same day as the last entry — replace it with the newer mark
+            self.equity_history[-1] = (ts, equity_usd)
+        else:
+            self.equity_history.append((ts, equity_usd))
+        # Cap to last 60 entries (~60 trading days). All metrics use at most
+        # a 30-day window, so 60 entries is a generous ceiling.
+        if len(self.equity_history) > 60:
+            self.equity_history = self.equity_history[-60:]
 
     def record_position(
         self: PortfolioTelemetry, ticker: str, entry_price: float, mark_price: float
@@ -282,9 +291,15 @@ class RuntimeContext:
             log.warning("equity_fetch_failed", err=str(e))
             equity_usd = None
         if equity_usd is not None:
-            ts_set = {t for t, _ in self.telemetry.equity_history}
-            if now not in ts_set:
-                self.telemetry.record_equity(now, equity_usd)
+            # R6.C1 made record_equity dedupe-by-day; safe to call every tick.
+            self.telemetry.record_equity(now, equity_usd)
+            # R6.I3: wire equity and basic state into the Prometheus metrics
+            # registry. Most metric families were defined but never updated,
+            # so Grafana dashboards would have shown all zeros.
+            if self.metrics_registry is not None:
+                self.metrics_registry.set_equity(equity_usd)
+                self.metrics_registry.position_count.set(len(self.lifecycle_state.positions))
+                self.metrics_registry.broker_connected.set(1.0 if broker_healthy else 0.0)
 
         # Build killswitch inputs from real telemetry and evaluate.
         ks = evaluate_killswitch(self.telemetry.to_killswitch_inputs(as_of=now))

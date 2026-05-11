@@ -70,15 +70,33 @@ async def test_tick_skipped_outside_us_regular_session(tmp_path: Path) -> None:
 
     Before the fix: stops were evaluated 24/7 and after-hours triggers
     submitted MarketOrders into AH liquidity (3-8% adverse slippage typical).
+
+    R6.C1 note: record_equity now dedupes by day, so the in-session tick at
+    the end would overwrite a same-day manual seed with the broker's NAV.
+    A mock broker reporting 80_000 makes tick's own recording confirm the
+    drawdown, instead of relying on a seed that gets replaced.
     """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth
+
     cache = ParquetCache(root=tmp_path)
     _seed(cache)
     rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    mock_broker = MagicMock()
+    mock_broker.name = "drawdown-mock"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
+    )
+    mock_broker.get_equity_usd = AsyncMock(return_value=80_000.0)  # -20% vs peak
+    rc.broker = mock_broker
     await rc.setup()
 
-    # Seed a clearly-tripping killswitch state — if tick runs, killswitch flips.
-    rc.telemetry.record_equity(datetime(2026, 5, 11, 14, 0, tzinfo=UTC), 100_000.0)
-    rc.telemetry.record_equity(datetime(2026, 5, 11, 15, 0, tzinfo=UTC), 80_000.0)  # -20%
+    # Seed peak on a prior day so tick's same-day record creates the drawdown.
+    rc.telemetry.record_equity(datetime(2026, 5, 10, 14, 0, tzinfo=UTC), 100_000.0)
     rc.telemetry.record_broker_heartbeat(datetime(2026, 5, 11, 15, 0, tzinfo=UTC))
     rc.telemetry.record_data_freshness("ibkr_quotes", datetime(2026, 5, 11, 15, 0, tzinfo=UTC))
 
@@ -345,28 +363,39 @@ async def test_setup_connect_times_out(monkeypatch: pytest.MonkeyPatch, tmp_path
 async def test_runtime_killswitch_uses_real_telemetry(tmp_path: Path) -> None:
     """C1 regression: tick() must feed real telemetry to evaluate_killswitch,
     not all-zero placeholders.
+
+    R6.C1 note: record_equity now dedupes by day (last write wins). The
+    test uses a mock broker with get_equity_usd returning the desired
+    drawdown number so tick's own recording confirms the killswitch state
+    rather than being overwritten by it.
     """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth
+
     cache = ParquetCache(root=tmp_path)
-    _seed(cache)  # existing helper in this file
-    settings = Settings()
-    rc = RuntimeContext(
-        cache=cache,
-        settings=settings,
-        tickers=["GME"],
-        mode="sim",
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    # Use a mock broker that reports 93.5k NAV → confirmed drawdown after seed.
+    mock_broker = MagicMock()
+    mock_broker.name = "drawdown-mock"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
+    mock_broker.get_equity_usd = AsyncMock(return_value=93_500.0)
+    rc.broker = mock_broker
     await rc.setup()
-    # Simulate a -15% drawdown in the telemetry. Use weekday timestamps within
-    # US regular session (10:00 ET = 14:00 UTC during EDT) — the R3.2 market
-    # hours guard now skips tick() outside the session.
+
+    # Seed peak on prior days. tick() will record (day2, 93.5k) — same-day
+    # dedup just confirms the value we already have.
     day0 = datetime(2026, 5, 11, 14, 0, tzinfo=UTC)  # Mon
     day1 = datetime(2026, 5, 12, 14, 0, tzinfo=UTC)  # Tue
     day2 = datetime(2026, 5, 13, 14, 0, tzinfo=UTC)  # Wed
     rc.telemetry.record_equity(day0, 100_000.0)
     rc.telemetry.record_equity(day1, 110_000.0)
-    rc.telemetry.record_equity(day2, 93_500.0)  # -15% from peak
-    rc.telemetry.record_broker_heartbeat(day2)
-    rc.telemetry.record_data_freshness("ibkr_quotes", day2)
 
     await rc.tick(now=day2)
     assert rc.kill_switch_active is True

@@ -9,6 +9,23 @@ from typing import Protocol, runtime_checkable
 
 @dataclass(slots=True, frozen=True)
 class Quote:
+    """Broker-side quote returned by IBroker.fetch_quote.
+
+    R6.M6 note: there is a second `Quote` model in
+    `squeeze_hunter.data.schema` used by DataProvider.fetch_quote. The two
+    intentionally diverge:
+      - broker.base.Quote (this one): ticker/bid/ask/last/timestamp_ns —
+        nanosecond epoch timestamp, no sizes. Optimized for execution-loop
+        round-trips.
+      - data.schema.Quote: ticker/ts/bid/ask/last/bid_size/ask_size —
+        datetime + sizes, used by historical / analytical paths.
+
+    Callers in lifecycle.py and runtime.py access only the common fields
+    (bid/ask/last/ticker). Do NOT add a field to one without the other; if
+    you need a common attribute, add it to BOTH. A future refactor could
+    unify them, but doing so would touch every provider implementation.
+    """
+
     ticker: str
     bid: float
     ask: float

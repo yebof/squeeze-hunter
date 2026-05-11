@@ -210,7 +210,12 @@ class IBKRBroker:
             # the broker was passed pre-constructed). Calling
             # reqAccountUpdates is the subscribe call in ib-async.
             self._ib.reqAccountUpdates(self.account or "")
-            values = await asyncio.to_thread(self._ib.accountValues)
+            # R6.C4: ib-async maintains the accountValues list via push events
+            # on the asyncio event loop. Reading it from a thread (via
+            # to_thread) races with those updates and can produce an
+            # inconsistent partial view. accountValues() is a cheap in-memory
+            # snapshot read, so call it directly on the event loop.
+            values = self._ib.accountValues()
         except Exception as e:
             log.warning("ibkr_account_values_failed", err=str(e))
             return None

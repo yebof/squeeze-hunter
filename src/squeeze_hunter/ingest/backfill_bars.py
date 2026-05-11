@@ -8,6 +8,9 @@ import pandas as pd
 
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.data.providers.yahoo import YahooProvider
+from squeeze_hunter.logging_setup import get_logger
+
+log = get_logger("ingest.bars")
 
 
 async def backfill_bars_for_ticker(
@@ -16,6 +19,15 @@ async def backfill_bars_for_ticker(
     provider = YahooProvider()
     bars = await provider.fetch_bars(ticker, start, end)
     if not bars:
+        # R6.M5: log when yfinance returns empty so a rate-limited or
+        # delisted ticker is visible in structured logs. Otherwise a
+        # silent skip during a large backfill leaves no trail.
+        log.warning(
+            "backfill_bars_empty",
+            ticker=ticker,
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
         return
     df = pd.DataFrame(
         [

@@ -49,9 +49,11 @@ async def test_connect_subscribes_to_account_updates() -> None:
 
     await broker.connect()
 
-    # Must have called reqAccountUpdates (the ib-async API has only one
-    # positional argument, account: str, and calling it IS the subscribe call).
+    # R6.I2: assert the exact argument, not just that the method was called.
+    # ib-async's reqAccountUpdates(account: str) — calling it IS the
+    # subscribe call. The default account is "" (IBKR uses primary account).
     assert fake_ib.reqAccountUpdates.called
+    fake_ib.reqAccountUpdates.assert_called_with("")
 
 
 @pytest.mark.asyncio
