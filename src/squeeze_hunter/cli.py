@@ -222,6 +222,9 @@ def paper(
     config_path: Annotated[Path, typer.Option("--config")] = Path("config/settings.example.yml"),
     parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
     tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
+    connect_timeout_s: Annotated[
+        float, typer.Option("--connect-timeout", help="seconds to wait for TWS connect")
+    ] = 30.0,
 ) -> None:
     """Run the paper-trading loop indefinitely."""
     from squeeze_hunter.runtime import RuntimeContext
@@ -235,7 +238,7 @@ def paper(
     rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="paper")
 
     async def main_loop() -> None:
-        await rc.setup()
+        await rc.setup(connect_timeout_s=connect_timeout_s)
         sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
         sched.start()
         try:
@@ -253,6 +256,9 @@ def live(
     parquet_root: Annotated[Path, typer.Option("--data")] = Path("data/parquet"),
     tickers_file: Annotated[Path, typer.Option("--tickers")] = Path("config/universe.txt"),
     confirm: Annotated[bool, typer.Option("--confirm-real-money")] = False,
+    connect_timeout_s: Annotated[
+        float, typer.Option("--connect-timeout", help="seconds to wait for TWS connect")
+    ] = 30.0,
 ) -> None:
     """Run the live-trading loop. Requires --confirm-real-money."""
     if not confirm:
@@ -270,7 +276,7 @@ def live(
     rc = RuntimeContext(cache=cache, settings=settings, tickers=tickers, mode="live")
 
     async def main_loop() -> None:
-        await rc.setup()
+        await rc.setup(connect_timeout_s=connect_timeout_s)
         sched = build_scheduler(callbacks=_build_runtime_callbacks(rc))
         sched.start()
         try:

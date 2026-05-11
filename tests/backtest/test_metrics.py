@@ -118,3 +118,37 @@ def test_sharpe_uses_sample_std_ddof_1() -> None:
     daily_returns_calc = eq.pct_change().dropna()
     expected = float(daily_returns_calc.mean() / daily_returns_calc.std(ddof=1) * np.sqrt(252))
     assert sr == pytest.approx(expected, rel=1e-6)
+
+
+def test_sharpe_returns_zero_for_two_point_curve() -> None:
+    """R4.3 regression: a 2-point equity curve gives 1 daily return →
+    std(ddof=1) = NaN. The original guard `r.std == 0` didn't catch NaN,
+    so sharpe returned NaN and gate1 silently passed (NaN < 1.0 is False).
+    The fix: explicit len-check + isfinite guard.
+    """
+    eq = pd.Series([100_000.0, 105_000.0], index=pd.date_range("2024-01-01", periods=2, freq="B"))
+    sr = sharpe(eq)
+    assert sr == 0.0
+    assert not np.isnan(sr)
+
+
+def test_sharpe_returns_zero_for_one_point_curve() -> None:
+    """Edge case: a 1-point series has no returns."""
+    eq = pd.Series([100_000.0], index=pd.date_range("2024-01-01", periods=1, freq="B"))
+    sr = sharpe(eq)
+    assert sr == 0.0
+
+
+def test_sortino_returns_zero_for_two_point_curve_one_downside() -> None:
+    """R4.6 regression: same NaN-vs-zero gap on the downside std."""
+    from squeeze_hunter.backtest.metrics import sortino
+
+    # Series with exactly one negative return
+    eq = pd.Series(
+        [100_000.0, 95_000.0, 96_000.0],
+        index=pd.date_range("2024-01-01", periods=3, freq="B"),
+    )
+    s = sortino(eq)
+    # Only 1 downside return → std(ddof=1) is NaN → guard returns 0
+    assert s == 0.0
+    assert not np.isnan(s)

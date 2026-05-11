@@ -60,6 +60,12 @@ class PortfolioTelemetry:
 
     def record_equity(self: PortfolioTelemetry, ts: datetime, equity_usd: float) -> None:
         self.equity_history.append((ts, equity_usd))
+        # R4.9: trim to last 31 days so the list doesn't grow unbounded over
+        # long runs. The longest window used by any metric is 30 days
+        # (rolling_30d_max_drawdown), so 31 days is safe.
+        if len(self.equity_history) > 100:
+            cutoff = ts - timedelta(days=31)
+            self.equity_history = [(t, e) for t, e in self.equity_history if t >= cutoff]
 
     def record_position(
         self: PortfolioTelemetry, ticker: str, entry_price: float, mark_price: float
@@ -166,12 +172,15 @@ class RuntimeContext:
 
                 self.broker = PaperBroker(client_id=int(os.environ.get("IBKR_CLIENT_ID", "42")))
                 # R3.3: bound the connect attempt so a hung TWS doesn't freeze
-                # the process forever with no diagnostic. The supervisor can
-                # then restart or alert.
+                # the process forever with no diagnostic.
+                # R4.4: clean up the broker on TimeoutError so we don't leak
+                # a partial socket connection. Re-raise so the supervisor
+                # learns about the failure.
                 try:
                     await asyncio.wait_for(self.broker.connect(), timeout=connect_timeout_s)
                 except TimeoutError:
                     log.error("paper_broker_connect_timeout", timeout_s=connect_timeout_s)
+                    await self._try_cleanup_partial_broker()
                     raise
             elif self.mode == "live":
                 from squeeze_hunter.broker.ibkr import IBKRBroker
@@ -181,6 +190,7 @@ class RuntimeContext:
                     await asyncio.wait_for(self.broker.connect(), timeout=connect_timeout_s)
                 except TimeoutError:
                     log.error("live_broker_connect_timeout", timeout_s=connect_timeout_s)
+                    await self._try_cleanup_partial_broker()
                     raise
             else:
                 raise ValueError(f"unknown mode: {self.mode}")
@@ -247,13 +257,25 @@ class RuntimeContext:
                 pass
 
         # Update broker equity with current marks and record for telemetry.
-        # Only append if there is no existing record already at this exact timestamp
-        # (avoids overwriting pre-seeded telemetry in tests and backfill scenarios).
+        # Mark-to-market the simulator first so its `equity` field is fresh
+        # before we query it through the unified get_equity_usd path.
         if isinstance(self.broker, SimulatorBroker):
             self.broker.mark_to_market(marks, now)
+
+        # R4.1: query equity through IBroker.get_equity_usd in ALL modes
+        # (previously only sim mode recorded equity, so the drawdown and
+        # 3-day-loss killswitch arms were dead in paper/live). Skip recording
+        # if the broker returns None (e.g., IBKR account snapshot not yet
+        # received) so the killswitch isn't tripped by a phantom zero.
+        try:
+            equity_usd = await self.broker.get_equity_usd()
+        except Exception as e:
+            log.warning("equity_fetch_failed", err=str(e))
+            equity_usd = None
+        if equity_usd is not None and equity_usd > 0:
             ts_set = {t for t, _ in self.telemetry.equity_history}
             if now not in ts_set:
-                self.telemetry.record_equity(now, self.broker.equity)
+                self.telemetry.record_equity(now, equity_usd)
 
         # Build killswitch inputs from real telemetry and evaluate.
         ks = evaluate_killswitch(self.telemetry.to_killswitch_inputs(as_of=now))
@@ -330,7 +352,21 @@ class RuntimeContext:
 
         This is the counter that powers the 21-trading-day time stop.
         Optionally snapshot daily P&L here in a future iteration (Phase 4).
+
+        R4.5: skip increment on US federal holidays. The scheduler fires on
+        every weekday, but NYSE is closed on ~9 federal holidays per year.
+        Counting those as trading days would force the time-stop ~2 calendar
+        weeks earlier than intended.
         """
+        # Avoid a circular import: pull the holiday cache from the earnings
+        # signal module which already maintains it.
+        from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+
+        et = now.astimezone(_NY)
+        if et.date() in set(_us_business_holidays()):
+            log.info("eod_close_skipped_holiday", date=et.date().isoformat())
+            return
+
         for meta in self.lifecycle_state.positions.values():
             meta["bars_held"] = int(meta.get("bars_held", 0)) + 1
         log.info(
@@ -377,6 +413,21 @@ class RuntimeContext:
             log.exception("premarket_verify_failed", as_of=now.isoformat())
             return False
         return True
+
+    async def _try_cleanup_partial_broker(self: RuntimeContext) -> None:
+        """R4.4: best-effort disconnect when setup fails mid-way (e.g., timeout).
+
+        Doesn't raise — we're already in an error path. Logs failures.
+        """
+        if self.broker is None:
+            return
+        try:
+            if hasattr(self.broker, "disconnect"):
+                await self.broker.disconnect()
+        except Exception as e:
+            log.warning("partial_broker_cleanup_failed", err=str(e))
+        finally:
+            self.broker = None
 
     async def shutdown(self: RuntimeContext) -> None:
         if self.broker is not None and hasattr(self.broker, "disconnect"):

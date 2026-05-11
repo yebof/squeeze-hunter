@@ -24,17 +24,24 @@ def annualized_return(equity: pd.Series) -> float:
 
 def sharpe(equity: pd.Series, periods_per_year: int = 252) -> float:
     r = daily_returns(equity)
-    if len(r) == 0 or r.std(ddof=1) == 0:
+    # R4.3: a 1-element series gives std(ddof=1)=NaN. NaN != 0, so the original
+    # `r.std(ddof=1) == 0` guard failed → return value was NaN → gate1's
+    # `< threshold` check is False for NaN → Gate 1 silently passes a
+    # degenerate equity curve.
+    sd = r.std(ddof=1) if len(r) >= 2 else 0.0
+    if len(r) <= 1 or sd == 0.0 or not np.isfinite(sd):
         return 0.0
-    return float(r.mean() / r.std(ddof=1) * np.sqrt(periods_per_year))
+    return float(r.mean() / sd * np.sqrt(periods_per_year))
 
 
 def sortino(equity: pd.Series, periods_per_year: int = 252) -> float:
     r = daily_returns(equity)
     downside = r[r < 0]
-    if len(downside) == 0 or downside.std(ddof=1) == 0:
+    # R4.6: same NaN-vs-zero gap as sharpe — fix with len + finite guard.
+    sd = downside.std(ddof=1) if len(downside) >= 2 else 0.0
+    if len(downside) <= 1 or sd == 0.0 or not np.isfinite(sd):
         return 0.0
-    return float(r.mean() / downside.std(ddof=1) * np.sqrt(periods_per_year))
+    return float(r.mean() / sd * np.sqrt(periods_per_year))
 
 
 def max_drawdown(equity: pd.Series) -> float:

@@ -44,8 +44,12 @@ class AlertSender:
                 log.error("telegram_send_failed", status=r.status_code, body=r.text)
 
     async def _send_slack(self: AlertSender, text: str) -> None:
+        # R4.8: explicit None check rather than `assert` — `assert` is stripped
+        # by `python -O` and would yield a cryptic httpx.InvalidURL instead of
+        # a clear ValueError in a hot path.
+        if self.slack_webhook_url is None:
+            raise ValueError("_send_slack called without a configured webhook")
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            assert self.slack_webhook_url is not None
             r = await client.post(self.slack_webhook_url, json={"text": text})
             if r.status_code >= 400:
                 log.error("slack_send_failed", status=r.status_code, body=r.text)

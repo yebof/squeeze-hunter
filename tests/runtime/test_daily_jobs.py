@@ -138,6 +138,40 @@ async def test_runtime_eod_close_no_positions_does_not_crash(tmp_path: Path) -> 
     # no assertion needed — just must not raise
 
 
+@pytest.mark.asyncio
+async def test_eod_close_skips_us_federal_holidays(tmp_path: Path) -> None:
+    """R4.5 regression: eod_close must NOT increment bars_held on US federal
+    holidays. The scheduler fires on every weekday including Christmas,
+    Thanksgiving, July 4th, etc. — without this guard the 21-day time stop
+    fires ~9 calendar days early per year.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    rc.lifecycle_state.positions["GME"] = {
+        "qty": 100,
+        "entry_price": 100.0,
+        "peak_price": 100.0,
+        "entry_score": 10.0,
+        "current_score": 10.0,
+        "bars_held": 5,
+        "setup_type": "CAR",
+    }
+    await rc.setup()
+    # Christmas 2024 was Wednesday Dec 25 — a federal holiday on a weekday.
+    # The scheduler fires (day_of_week mon-fri), but eod_close must skip.
+    christmas = datetime(2024, 12, 25, 21, 0, tzinfo=UTC)  # 16:00 ET on Christmas Day
+    await rc.eod_close(now=christmas)
+    assert (
+        rc.lifecycle_state.positions["GME"]["bars_held"] == 5
+    ), "bars_held must not increment on US federal holidays"
+
+    # Sanity: a normal trading day DOES increment.
+    normal_day = datetime(2024, 12, 26, 21, 0, tzinfo=UTC)  # Thursday after Christmas
+    await rc.eod_close(now=normal_day)
+    assert rc.lifecycle_state.positions["GME"]["bars_held"] == 6
+
+
 # ---------------------------------------------------------------------------
 # R2: nightly_scan refreshes current_score
 # ---------------------------------------------------------------------------

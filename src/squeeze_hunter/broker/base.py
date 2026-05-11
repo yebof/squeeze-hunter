@@ -63,3 +63,13 @@ class IBroker(Protocol):
     async def cancel_order(self: IBroker, broker_order_id: str) -> bool: ...
 
     async def get_open_orders(self: IBroker) -> list[BrokerOrder]: ...
+
+    async def get_equity_usd(self: IBroker) -> float | None:
+        """Return total account equity (NAV) in USD, or None if unavailable.
+
+        R4.1: this powers PortfolioTelemetry.equity_history in paper/live mode.
+        Without it, rolling_30d_max_drawdown and last_3_days_cumulative_pnl_pct
+        always return 0 outside sim mode → the drawdown-based killswitch arms
+        are dead in production.
+        """
+        ...

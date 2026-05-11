@@ -174,6 +174,123 @@ async def test_tick_clears_telemetry_position_marks_on_exit(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_tick_records_equity_in_all_modes(tmp_path: Path) -> None:
+    """R4.1 regression: equity must be recorded every tick regardless of mode,
+    so the drawdown and 3-day-loss killswitch arms work in paper/live too.
+
+    Before the fix: record_equity was guarded by
+    `isinstance(self.broker, SimulatorBroker)`. In paper/live mode,
+    equity_history stayed empty forever and the two equity-based killswitch
+    triggers were dead.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth, Quote
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    # Mock broker that returns a real equity number from get_equity_usd
+    mock_broker = MagicMock()
+    mock_broker.name = "live-mock"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="live-mock"),
+    )
+    mock_broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=100.0, ask=100.05, last=100.0, timestamp_ns=0),
+    )
+    mock_broker.get_equity_usd = AsyncMock(return_value=87_500.0)  # IBKR NAV
+    rc.broker = mock_broker
+    await rc.setup()
+
+    # Tick during market hours
+    await rc.tick(now=datetime(2026, 5, 11, 14, 0, tzinfo=UTC))  # Mon 10:00 ET
+
+    # Equity must be recorded even though this broker is NOT SimulatorBroker
+    assert len(rc.telemetry.equity_history) >= 1
+    assert rc.telemetry.equity_history[-1][1] == pytest.approx(87_500.0)
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_equity_when_broker_returns_none(tmp_path: Path) -> None:
+    """R4.1: if broker.get_equity_usd returns None (e.g., IBKR account
+    snapshot not yet received), don't record a phantom zero — that would
+    trip the drawdown killswitch falsely.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth, Quote
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    mock_broker = MagicMock()
+    mock_broker.name = "snapshot-pending"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="pending"),
+    )
+    mock_broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=100.0, ask=100.05, last=100.0, timestamp_ns=0),
+    )
+    mock_broker.get_equity_usd = AsyncMock(return_value=None)  # not yet known
+    rc.broker = mock_broker
+    await rc.setup()
+
+    await rc.tick(now=datetime(2026, 5, 11, 14, 0, tzinfo=UTC))
+    # No equity recorded — the killswitch's drawdown check uses len<2 → returns 0
+    assert all(eq > 0 for _, eq in rc.telemetry.equity_history)
+
+
+@pytest.mark.asyncio
+async def test_setup_cleans_up_partial_broker_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R4.4 regression: when setup() times out connecting, the partially-
+    constructed broker must be disconnected and rc.broker reset to None.
+    Previously the broker (with its open socket) leaked.
+    """
+    import asyncio as _asyncio
+
+    from squeeze_hunter.broker import paper as paper_module
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="paper")
+
+    disconnect_called: list[bool] = []
+
+    class HangingBroker:
+        name = "hanging"
+        port = 7497
+
+        async def connect(self) -> None:
+            await _asyncio.sleep(10_000)
+
+        async def disconnect(self) -> None:
+            disconnect_called.append(True)
+
+        async def health(self):
+            from squeeze_hunter.broker.base import BrokerHealth
+
+            return BrokerHealth(connected=False, last_ping_ms=0, account="hanging")
+
+    monkeypatch.setattr(paper_module, "PaperBroker", lambda *a, **kw: HangingBroker())
+
+    with pytest.raises(TimeoutError):
+        await rc.setup(connect_timeout_s=0.3)
+
+    # The broker should have been disconnect()ed in cleanup, and rc.broker reset
+    assert disconnect_called == [True]
+    assert rc.broker is None
+
+
+@pytest.mark.asyncio
 async def test_setup_connect_times_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """R3.3 regression: setup() bounds broker.connect with asyncio.wait_for.
     Previously a hung connectAsync froze the process indefinitely with no

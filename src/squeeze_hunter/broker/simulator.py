@@ -136,6 +136,10 @@ class SimulatorBroker:
     async def get_open_orders(self: SimulatorBroker) -> list[BrokerOrder]:
         return []
 
+    async def get_equity_usd(self: SimulatorBroker) -> float | None:
+        """R4.1: return the simulator's tracked equity (cash + last mark-to-market)."""
+        return self.equity
+
     def position_qty(self: SimulatorBroker, ticker: str) -> int:
         lot = self.positions.get(ticker)
         return lot.qty if lot else 0

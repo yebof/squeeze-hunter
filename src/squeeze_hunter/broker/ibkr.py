@@ -183,3 +183,29 @@ class IBKRBroker:
                 )
             )
         return out
+
+    async def get_equity_usd(self: IBKRBroker) -> float | None:
+        """R4.1: pull NetLiquidation (NAV) from IB account values.
+
+        Returns None if the value isn't available yet (just-connected, account
+        snapshot not received). Caller treats None as 'skip equity recording
+        this tick' so the killswitch doesn't trip on a zero.
+        """
+        try:
+            values = await asyncio.to_thread(self._ib.accountValues)
+        except Exception as e:
+            log.warning("ibkr_account_values_failed", err=str(e))
+            return None
+        for v in values:
+            # NetLiquidation in USD is the broker-side NAV. Some accounts also
+            # report it in BASE currency; we want USD specifically for our
+            # USD-equity universe.
+            if (
+                getattr(v, "tag", None) == "NetLiquidation"
+                and getattr(v, "currency", None) == "USD"
+            ):
+                try:
+                    return float(v.value)
+                except (ValueError, TypeError):
+                    return None
+        return None

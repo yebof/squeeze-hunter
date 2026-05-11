@@ -77,8 +77,14 @@ async def test_runtime_three_ticks_no_crash(tmp_path: Path) -> None:
         }
     )
     await rc.setup()
-    # Three ticks at increasing time. fetch_quote now works correctly —
-    # lifecycle evaluates stops and manages positions without crashing (C4 fix).
+    # Three ticks at increasing time during the US regular session
+    # (Thu 2026-06-11 10:00 ET = 14:00 UTC during EDT). R4.2 fix: previous
+    # timestamps were `base + 29 days = 2026-06-12 00:00 UTC = 2026-06-11
+    # 20:00 ET`, outside the session — the R3.2 guard early-returned and
+    # the test never actually exercised manage_positions.
+    in_session_base = datetime(2026, 6, 11, 14, 0, tzinfo=UTC)  # Thu 10:00 ET
     for offset in (0, 60, 120):
-        await rc.tick(now=base + timedelta(days=29, seconds=offset))
+        await rc.tick(now=in_session_base + timedelta(seconds=offset))
     await rc.shutdown()
+    # Position is still held (price didn't move adversely from entry)
+    assert "GME" in rc.lifecycle_state.positions
