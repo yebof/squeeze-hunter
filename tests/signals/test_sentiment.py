@@ -35,5 +35,7 @@ async def test_wsb_sentiment_uses_nan_for_missing_data() -> None:
     provider = AsyncMock()
     provider.fetch_sentiment.return_value = None
     factor = await compute_wsb_sentiment(["UNKNOWN"], provider, datetime(2024, 5, 13, tzinfo=UTC))
-    if not factor.values.empty:
-        assert np.isnan(factor.values["raw_value"].iloc[0])
+    # R3.4: assert the factor emitted a row before checking the value,
+    # otherwise the test passes trivially if a refactor drops the row entirely.
+    assert not factor.values.empty, "compute_wsb_sentiment must emit a row per ticker"
+    assert np.isnan(factor.values["raw_value"].iloc[0])

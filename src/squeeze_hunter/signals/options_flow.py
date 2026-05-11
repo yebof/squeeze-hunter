@@ -54,7 +54,14 @@ async def compute_call_oi_velocity(
         if prior is None or not prior.quotes:
             try:
                 prior = await provider.fetch_option_chain_at(t, clock - timedelta(days=7))
-            except (NotImplementedError, LookupError, AttributeError):
+            except (NotImplementedError, LookupError):
+                # NotImplementedError: provider doesn't support historical chains.
+                # LookupError: chain not found for the requested date.
+                # AttributeError is intentionally NOT caught: every concrete
+                # provider implements fetch_option_chain_at (it's in the
+                # DataProvider Protocol). An AttributeError here is a real bug
+                # (wrong object passed, None provider) and must propagate up
+                # to tick_safe rather than silently zeroing the signal.
                 prior = None
         if prior is None or not prior.quotes:
             rows.append({"ticker": t, "raw_value": 0.0})

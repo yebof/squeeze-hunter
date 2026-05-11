@@ -176,8 +176,11 @@ async def test_runtime_nightly_scan_updates_current_score(tmp_path: Path) -> Non
     }
     await rc.setup()
     await rc.nightly_scan(now=datetime(2024, 5, 13, 22, 0, tzinfo=UTC))
-    # last_candidates should be populated (even if empty DataFrame) after the scan runs
-    assert hasattr(rc, "last_candidates") or hasattr(rc, "candidates")
+    # R3.7: last_candidates is a dataclass field with default None, so hasattr
+    # is always True regardless of whether nightly_scan ran. Check the actual
+    # value to verify the scan populated it (a DataFrame, possibly empty,
+    # never None after a successful scan).
+    assert rc.last_candidates is not None
 
 
 @pytest.mark.asyncio

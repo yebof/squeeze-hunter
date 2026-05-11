@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -23,6 +25,23 @@ if TYPE_CHECKING:
     from squeeze_hunter.risk.killswitch import KillSwitchInputs
 
 log = get_logger("runtime")
+
+# R3.2: US regular session for the intraday loop. 09:30-16:00 ET, Mon-Fri.
+# We do NOT filter US federal holidays here — the cost of trading on a
+# holiday (rare false positive) is a logged debug skip, and we'd rather
+# err on the side of being available than silently skip a half-day session
+# (which is unusual but legal). Holiday-exact filtering can be added if needed.
+_NY = ZoneInfo("America/New_York")
+_SESSION_OPEN = time(9, 30)
+_SESSION_CLOSE = time(16, 0)
+
+
+def _is_us_regular_session(now: datetime) -> bool:
+    """True if `now` falls within Mon-Fri 09:30-16:00 ET (regular trading)."""
+    et = now.astimezone(_NY)
+    if et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return _SESSION_OPEN <= et.time() < _SESSION_CLOSE
 
 
 @dataclass
@@ -132,7 +151,7 @@ class RuntimeContext:
     # Populated by nightly_scan; read by premarket_verify the next morning.
     last_candidates: pd.DataFrame | None = None
 
-    async def setup(self: RuntimeContext) -> None:
+    async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
         if self.broker is None:
             if self.mode == "sim":
                 self.broker = cast(
@@ -146,12 +165,23 @@ class RuntimeContext:
                 from squeeze_hunter.broker.paper import PaperBroker
 
                 self.broker = PaperBroker(client_id=int(os.environ.get("IBKR_CLIENT_ID", "42")))
-                await self.broker.connect()
+                # R3.3: bound the connect attempt so a hung TWS doesn't freeze
+                # the process forever with no diagnostic. The supervisor can
+                # then restart or alert.
+                try:
+                    await asyncio.wait_for(self.broker.connect(), timeout=connect_timeout_s)
+                except TimeoutError:
+                    log.error("paper_broker_connect_timeout", timeout_s=connect_timeout_s)
+                    raise
             elif self.mode == "live":
                 from squeeze_hunter.broker.ibkr import IBKRBroker
 
                 self.broker = IBKRBroker(client_id=int(os.environ.get("IBKR_CLIENT_ID", "42")))
-                await self.broker.connect()
+                try:
+                    await asyncio.wait_for(self.broker.connect(), timeout=connect_timeout_s)
+                except TimeoutError:
+                    log.error("live_broker_connect_timeout", timeout_s=connect_timeout_s)
+                    raise
             else:
                 raise ValueError(f"unknown mode: {self.mode}")
         self.metrics_registry = MetricsRegistry()
@@ -170,10 +200,30 @@ class RuntimeContext:
             self.telemetry.record_broker_heartbeat(datetime.now(UTC))
 
     async def tick(self: RuntimeContext, now: datetime) -> None:
-        """One intraday tick: manage positions + check killswitch."""
+        """One intraday tick: manage positions + check killswitch.
+
+        R3.2: skips work outside US regular trading hours (Mon-Fri 09:30-16:00 ET).
+        Stops, mark-to-market, and killswitch evaluation only run during the
+        regular session — preventing after-hours market orders from auto-exits
+        that would otherwise route through AH liquidity (3-8% adverse slippage
+        on thin stocks).
+        """
         if self.broker is None or self.metrics_registry is None:
             raise RuntimeError("setup() not called")
+        if not _is_us_regular_session(now):
+            log.debug("tick_skipped_outside_session", now=now.isoformat())
+            return
+
+        # R3.1: capture position keys BEFORE manage_positions so we can detect
+        # which positions were exited this tick and clear their stale telemetry
+        # marks. Without this, worst_position_gap_pct keeps reading the last
+        # mark of exited positions forever, permanently arming the killswitch
+        # gap-through-stop trigger.
+        positions_before = set(self.lifecycle_state.positions.keys())
         await manage_positions(self.lifecycle_state, self.broker, now)
+        positions_after = set(self.lifecycle_state.positions.keys())
+        for exited in positions_before - positions_after:
+            self.telemetry.clear_position(exited)
 
         # Update broker heartbeat if broker is still responsive.
         try:
@@ -232,11 +282,21 @@ class RuntimeContext:
         """Nightly: scan the universe, refresh current_score for held positions,
         persist the ranked candidates for tomorrow's premarket_verify.
 
-        Uses BacktestProvider in sim mode (reads historical parquet).
-        Phase 4 will wire a live IBKRProvider here.
+        Uses BacktestProvider in all modes — it reads historical parquet. In
+        paper/live mode the cache must be kept current by a separate ingest
+        job (Phase 4); otherwise the scan operates on stale data and f5
+        (call OI velocity) will be 0 for every ticker. We log this limitation
+        explicitly when in paper/live so it shows up in structured logs.
         """
         from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
         from squeeze_hunter.scan import run_scan
+
+        if self.mode in {"paper", "live"}:
+            log.warning(
+                "nightly_scan_using_cache_only",
+                mode=self.mode,
+                note="f5 OI velocity will be 0 until a live options ingest job is added (Phase 4)",
+            )
 
         clock = Clock(now=now)
         provider = BacktestProvider(cache=self.cache, clock=clock)
