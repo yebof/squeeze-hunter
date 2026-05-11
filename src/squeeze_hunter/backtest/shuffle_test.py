@@ -42,4 +42,7 @@ def random_shuffle_pvalue(equity: pd.Series, *, n_permutations: int = 200, seed:
         perm = rng.permutation(rets)
         if _trend_quality(perm) >= obs_score:
             hits += 1
-    return hits / n_permutations
+    # R8.M3: (hits + 1) / (N + 1) is the standard Monte-Carlo p-value
+    # correction so the result is never exactly 0 (which would force any
+    # downstream `< 0.05` check to pass even with very few permutations).
+    return (hits + 1) / (n_permutations + 1)

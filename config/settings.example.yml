@@ -4,7 +4,14 @@ score:
     f1_si_pct: 2.0
     f2_days_to_cover: 1.0
     f3_earnings_reaction: 2.0
-    f4_wsb_mention: 1.5
+    # R8.S-C3: f4 weight is intentionally 0.0 until a real Reddit baseline
+    # cache exists. RedditProvider._compute_baseline_30d returns None today
+    # so the factor is NaN for every ticker → cross_sectional_z drops them
+    # → z=0 universally → multiplying by 1.5 was misleading. Restore to 1.5
+    # when a nightly cached-count store is wired in.
+    f4_wsb_mention: 0.0
+    # f5 also returns 0 until the option-chain ingest job exists (Phase 4).
+    # The weight stays at 1.5 so a future job activation flips it on.
     f5_call_oi_velocity: 1.5
     f6_bollinger_breakout: 1.0
     f7_volume_spike: 1.0

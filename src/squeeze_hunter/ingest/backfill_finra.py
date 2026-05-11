@@ -28,8 +28,11 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
         if t not in float_cache:
             try:
                 float_cache[t] = await yahoo.get_float_shares(t)
-            except Exception as e:
-                log.warning("yahoo_float_failed", ticker=t, err=str(e))
+            except (ConnectionError, TimeoutError, OSError, KeyError, ValueError) as e:
+                # R8.M11: narrow per CLAUDE.md. KeyError/ValueError cover
+                # yfinance's "no float in info" path; transient errors cover
+                # network. AttributeError must propagate (real provider bug).
+                log.warning("yahoo_float_failed", ticker=t, err=str(e), err_type=type(e).__name__)
                 float_cache[t] = None
         float_shares = float_cache[t]
 

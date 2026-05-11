@@ -126,6 +126,10 @@ class SimulatorBroker:
         new_qty = existing.qty - qty
         if new_qty == 0:
             del self.positions[ticker]
+            # R8.Q-I8: drop the per-ticker mark when the position closes so
+            # last_marks doesn't grow unbounded across long backtests with a
+            # rotating universe.
+            self.last_marks.pop(ticker, None)
         else:
             self.positions[ticker] = Lot(new_qty, existing.avg_price, existing.opened_at)
         order_id = f"sim-{ticker}-{ts.isoformat()}-sell-{uuid.uuid4().hex[:8]}"

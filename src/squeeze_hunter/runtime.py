@@ -84,12 +84,14 @@ class PortfolioTelemetry:
         # a 30-day window, so 60 entries is a generous ceiling.
         if len(self.equity_history) > 60:
             self.equity_history = self.equity_history[-60:]
-        # Also cap the peak dict to ~90 days so dictionary size stays bounded
-        # across multi-month runs (matches R7.I1 spec for headroom on future
-        # 60-day metrics).
-        if len(self.equity_peak_per_day) > 90:
-            keep = sorted(self.equity_peak_per_day)[-90:]
-            self.equity_peak_per_day = {d: self.equity_peak_per_day[d] for d in keep}
+        # R8.Q-I9: evict equity_peak_per_day entries strictly older than 90
+        # CALENDAR DAYS from this `ts`, not just by count. After a long
+        # outage the count-only cap would retain entries from months ago
+        # because the dict was below the threshold.
+        stale_cutoff = ts_date - timedelta(days=90)
+        self.equity_peak_per_day = {
+            d: p for d, p in self.equity_peak_per_day.items() if d >= stale_cutoff
+        }
 
     def record_position(
         self: PortfolioTelemetry, ticker: str, entry_price: float, mark_price: float
@@ -107,17 +109,25 @@ class PortfolioTelemetry:
 
     def rolling_30d_max_drawdown(self: PortfolioTelemetry, as_of: datetime) -> float:
         cutoff = as_of - timedelta(days=30)
-        recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
-        if len(recent) < 2:
-            return 0.0
-        # R7.I1: read peak from the per-day-max tracker so intraday peaks
-        # survive R6.C1's dedupe-by-day. Fall back to recent equity_history
-        # if the parallel tracker is missing entries (shouldn't happen, but
-        # keeps the metric defined for old PortfolioTelemetry instances).
         cutoff_date = cutoff.date()
+        # R8.S-I5: read the per-day peak tracker FIRST so a same-day drawdown
+        # (Day 1 of operation: peak intraday + adverse close) is detected.
+        # Prior order required len(equity_history) >= 2 first, returning 0
+        # for single-day drawdowns even though equity_peak_per_day had today's
+        # high recorded.
         peaks_in_window = [e for d, e in self.equity_peak_per_day.items() if d >= cutoff_date]
-        peak = max(peaks_in_window) if peaks_in_window else max(e for _, e in recent)
-        current = recent[-1][1]
+        if self.equity_history:
+            current = self.equity_history[-1][1]
+        else:
+            return 0.0
+        if peaks_in_window:
+            peak = max(peaks_in_window)
+        else:
+            # Parallel tracker empty (legacy state): fall back to equity_history.
+            recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
+            if len(recent) < 2:
+                return 0.0
+            peak = max(e for _, e in recent)
         if peak <= 0:
             return 0.0
         return (current - peak) / peak
@@ -275,6 +285,12 @@ class RuntimeContext:
         """
         if self.broker is None or self.metrics_registry is None:
             raise RuntimeError("setup() not called")
+        # R8.Q-I1: normalize tz-naive `now` to UTC so downstream comparisons
+        # against tz-aware `_kill_first_tripped_at` and tz-aware telemetry
+        # timestamps don't raise TypeError. Production schedules supply UTC,
+        # but tests or future schedulers may pass naive.
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
         if not _is_us_regular_session(now):
             log.debug("tick_skipped_outside_session", now=now.isoformat())
             return
@@ -362,36 +378,50 @@ class RuntimeContext:
                 self.metrics_registry.broker_connected.set(1.0 if broker_healthy else 0.0)
 
         # Build killswitch inputs from real telemetry and evaluate.
-        ks = evaluate_killswitch(self.telemetry.to_killswitch_inputs(as_of=now))
+        # R8.S-I2: pass YAML monthly_drawdown_kill so the YAML knob is wired.
+        # The YAML value is positive magnitude; killswitch expects negative.
+        monthly_dd_kill = -abs(self.settings.risk.monthly_drawdown_kill)
+        ks = evaluate_killswitch(
+            self.telemetry.to_killswitch_inputs(as_of=now),
+            monthly_drawdown_max=monthly_dd_kill,
+        )
 
-        # R7.C1: sticky cooldown. Once tripped, stay tripped for
-        # `_kill_cooldown_days` calendar days regardless of fresh telemetry,
-        # per the design doc's "Auto-resume after 7 calendar days OR explicit
-        # manual reset." Prior behavior recomputed every tick → a single
-        # green tick after a drawdown event would un-trip and resume entries.
-        if self._kill_first_tripped_at is not None:
-            cooldown_end = self._kill_first_tripped_at + timedelta(days=self._kill_cooldown_days)
-            if now < cooldown_end:
-                # Stay tripped, preserve the original reason.
-                self.kill_switch_active = True
-                if self.metrics_registry:
-                    self.metrics_registry.set_kill_switch_active(self._kill_reason or "cooldown")
-                return
-            # Cooldown elapsed — clear sticky state and accept fresh verdict.
-            log.info(
-                "killswitch_cooldown_expired",
-                prior_reason=self._kill_reason,
-                first_tripped_at=self._kill_first_tripped_at.isoformat(),
-            )
-            self._kill_first_tripped_at = None
+        # R7.C1 + R8.C1: sticky-cooldown window. From the first trip, stay
+        # tripped for `_kill_cooldown_days` calendar days regardless of fresh
+        # telemetry, per the design doc's "Auto-resume after 7 calendar days
+        # OR explicit manual reset."
+        #
+        # R8.C1 fix: after the sticky window elapses, the killswitch state
+        # follows the real-time verdict but does NOT auto-rearm a new 7-day
+        # window when conditions are still bad. Prior behavior cleared the
+        # sticky timestamp at expiry, then set it again the same tick on a
+        # persistently-bad metric — extending the window forever and hiding
+        # the actual real-time state from the operator.
+        in_sticky_window = (
+            self._kill_first_tripped_at is not None
+            and now < self._kill_first_tripped_at + timedelta(days=self._kill_cooldown_days)
+        )
+        if in_sticky_window:
+            self.kill_switch_active = True
+            if self.metrics_registry:
+                self.metrics_registry.set_kill_switch_active(self._kill_reason or "cooldown")
+            return
 
+        was_active = self.kill_switch_active
         self.kill_switch_active = ks.tripped
         self._kill_reason = ks.reason
         if ks.tripped:
-            self._kill_first_tripped_at = now
-            log.warning("killswitch_tripped", reason=ks.reason)
+            # Open a new sticky window ONLY on a transition from clear → tripped.
+            if not was_active:
+                self._kill_first_tripped_at = now
+                log.warning("killswitch_tripped", reason=ks.reason)
             if self.metrics_registry:
                 self.metrics_registry.set_kill_switch_active(ks.reason or "unknown")
+        elif self._kill_first_tripped_at is not None:
+            # Conditions cleared — close the trip cycle so the next fresh trip
+            # opens a new cooldown window.
+            log.info("killswitch_cleared", prior_reason=self._kill_reason)
+            self._kill_first_tripped_at = None
 
     def reset_killswitch(self: RuntimeContext) -> None:
         """R7.C1: explicit manual reset. Clears sticky cooldown state and
@@ -563,8 +593,15 @@ class RuntimeContext:
         try:
             if hasattr(self.broker, "disconnect"):
                 await self.broker.disconnect()
-        except Exception as e:
-            log.warning("partial_broker_cleanup_failed", err=str(e))
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
+            # R8.Q-I2: narrow per CLAUDE.md. RuntimeError covers "event loop
+            # closed" during shutdown. AttributeError / TypeError must still
+            # propagate so a broker-impl bug surfaces.
+            log.warning(
+                "partial_broker_cleanup_failed",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
         finally:
             self.broker = None
 

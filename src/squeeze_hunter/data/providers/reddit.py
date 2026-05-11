@@ -23,7 +23,10 @@ from squeeze_hunter.data.schema import (
 def _count_ticker_mentions(posts: Iterable[object], ticker: str, aliases: list[str]) -> int:
     patterns = [
         re.compile(rf"\${ticker}\b", re.IGNORECASE),
-        re.compile(rf"\b{ticker}\b"),
+        # R8.Q-M2: case-insensitive so 'gme' matches GME on WSB (lowercase
+        # ticker mentions are common). Prior bare-word pattern was the only
+        # case-sensitive one in this list — inconsistent and undercounted.
+        re.compile(rf"\b{ticker}\b", re.IGNORECASE),
     ]
     for a in aliases:
         patterns.append(re.compile(rf"\b{re.escape(a)}\b", re.IGNORECASE))

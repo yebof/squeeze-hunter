@@ -27,24 +27,38 @@ def _atm_call_oi(chain: OptionChain, window_pct: float = 0.05) -> int:
 
 
 def _trading_days_ago(clock: datetime, n_trading_days: int) -> datetime:
-    """R7.C10: subtract `n_trading_days` (Mon-Fri minus US federal holidays)
-    from `clock`. Calendar-day arithmetic would land on a non-trading day
-    after a holiday week → cache lookup misses → factor zeros for the entire
-    universe.
+    """Subtract `n_trading_days` (Mon-Fri minus US federal holidays) from
+    `clock`. Calendar-day arithmetic would land on a non-trading day after
+    a holiday week → cache lookup misses → factor zeros for the entire
+    universe (R7.C10).
+
+    R8.Q-C4: when `clock` itself falls on a non-business day (weekend or
+    holiday), first align it to the preceding business day, THEN offset.
+    Otherwise numpy's `roll="backward"` rolled the start and then subtracted,
+    producing an off-by-one — a Saturday + 5-day step landed on the same
+    date as a Friday + 5-day step.
+    R8.Q-M9: replace assert (stripped under `python -O`) with explicit raise.
     """
     holidays_dt64 = np.array(_us_business_holidays(), dtype="datetime64[D]")
-    target = np.busday_offset(
+    # Step 1: align clock.date() to the preceding business day (no-op if
+    # already a business day). roll="preceding" only moves when needed.
+    aligned = np.busday_offset(
         clock.date(),
-        -n_trading_days,
-        roll="backward",
+        0,
+        roll="preceding",
         holidays=holidays_dt64,
     )
-    # numpy returns datetime64[D]; convert back to a tz-aware datetime if needed.
-    # Timestamp.to_pydatetime() is typed as `datetime | NaTType`, but
-    # busday_offset never returns NaT for a valid in-range input — narrow
-    # explicitly via assert so the type checker sees a clean datetime.
+    # Step 2: subtract n_trading_days from the aligned base. roll="raise"
+    # because the base is guaranteed to be a business day after step 1.
+    target = np.busday_offset(
+        aligned,
+        -n_trading_days,
+        roll="raise",
+        holidays=holidays_dt64,
+    )
     ts = pd.Timestamp(target).to_pydatetime()
-    assert isinstance(ts, datetime), "busday_offset returned NaT"
+    if not isinstance(ts, datetime):
+        raise ValueError(f"busday_offset returned non-datetime: {target!r}")
     if clock.tzinfo is not None:
         ts = ts.replace(tzinfo=clock.tzinfo)
     return ts

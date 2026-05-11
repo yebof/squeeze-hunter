@@ -95,7 +95,10 @@ async def test_backfill_finra_yahoo_exception_does_not_abort(tmp_path: Path) -> 
 
     async def fake_float_fetch(self, ticker):
         if ticker == "BAD":
-            raise RuntimeError("yahoo down")
+            # R8.M11 narrowed the catch to actual yfinance failure modes.
+            # ConnectionError is what httpx raises on transient network failures
+            # and is in the narrowed catch list.
+            raise ConnectionError("yahoo down")
         return 10_000_000  # GOOD: 2M / 10M = 0.20
 
     with (

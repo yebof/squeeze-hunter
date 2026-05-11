@@ -436,8 +436,14 @@ def emergency_flatten(
             # we don't leak the IBKR client ID slot.
             try:
                 await broker.disconnect()
-            except Exception as e:
-                log.warning("emergency_flatten_disconnect_failed", err=str(e))
+            except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
+                # R8.Q-I4: narrow per CLAUDE.md. Programming errors must
+                # propagate even in shutdown-cleanup paths.
+                log.warning(
+                    "emergency_flatten_disconnect_failed",
+                    err=str(e),
+                    err_type=type(e).__name__,
+                )
 
     asyncio.run(go())
 

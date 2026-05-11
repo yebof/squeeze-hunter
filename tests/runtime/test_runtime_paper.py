@@ -412,6 +412,56 @@ async def test_killswitch_sticky_cooldown_after_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_killswitch_cooldown_does_not_rearm_when_conditions_persist(
+    tmp_path: Path,
+) -> None:
+    """R8.C1 regression: after the 7-day sticky cooldown expires, a still-bad
+    metric must NOT re-arm a fresh 7-day window. Prior R7 code cleared
+    _kill_first_tripped_at at expiry then set it again the same tick,
+    effectively producing an indefinite lockout when conditions persisted.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from squeeze_hunter.broker.base import BrokerHealth
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+
+    mock_broker = MagicMock()
+    mock_broker.name = "persistent-bad"
+    mock_broker.connect = AsyncMock()
+    mock_broker.disconnect = AsyncMock()
+    mock_broker.health = AsyncMock(
+        return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
+    )
+    # Persistently-bad equity — drawdown stays below -10%.
+    mock_broker.get_equity_usd = AsyncMock(return_value=80_000.0)
+    rc.broker = mock_broker
+    await rc.setup()
+    rc.telemetry.record_equity(datetime(2026, 5, 8, 14, 0, tzinfo=UTC), 100_000.0)
+
+    # Day 0: tripped → sticky cooldown opens.
+    await rc.tick(now=datetime(2026, 5, 11, 14, 0, tzinfo=UTC))
+    first_trip = rc._kill_first_tripped_at
+    assert first_trip is not None
+
+    # Day 8 (after sticky window): conditions still bad. Killswitch stays
+    # tripped, BUT _kill_first_tripped_at must NOT be moved forward.
+    await rc.tick(now=datetime(2026, 5, 19, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is True
+    assert (
+        rc._kill_first_tripped_at == first_trip
+    ), "sticky cooldown should not rearm when conditions persist past the window"
+
+    # Day 30: conditions clear (equity recovers). Trip cycle closes.
+    mock_broker.get_equity_usd = AsyncMock(return_value=100_000.0)
+    await rc.tick(now=datetime(2026, 6, 10, 14, 0, tzinfo=UTC))
+    assert rc.kill_switch_active is False
+    assert rc._kill_first_tripped_at is None
+
+
+@pytest.mark.asyncio
 async def test_killswitch_manual_reset_clears_cooldown(tmp_path: Path) -> None:
     """R7.C1: reset_killswitch() clears the sticky state even mid-cooldown."""
     from unittest.mock import AsyncMock, MagicMock

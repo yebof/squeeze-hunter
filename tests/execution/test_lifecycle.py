@@ -9,6 +9,54 @@ from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
 
 
 @pytest.mark.asyncio
+async def test_manage_keeps_position_when_exit_order_pending(tmp_path=None) -> None:
+    """R8.S-C1 regression: when the broker returns a non-filled status
+    (pending/submitted/partial), the position must remain in state until
+    a future tick confirms the fill. Popping immediately would leave real
+    exposure at the broker while lifecycle thinks the position is closed.
+    """
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=85.0, ask=85.05, last=85.0, timestamp_ns=0)
+    )
+    # Broker returns status="pending" (e.g., IBKR limit didn't fill yet).
+    broker.submit_sell = AsyncMock(
+        return_value=BrokerOrder(
+            broker_order_id="pending-1",
+            ticker="GME",
+            side="sell",
+            qty=100,
+            limit_price=84.5,
+            status="pending",
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+    )
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    out = await manage_positions(
+        state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+    )
+    # Position must STILL be present so the next tick can retry.
+    assert "GME" in out.positions
+    # No exit record yet — we only record on confirmed fill.
+    assert not out.exits
+    # The pending order id should be tracked on the meta.
+    assert "pending-1" in out.positions["GME"].get("pending_exits", [])
+
+
+@pytest.mark.asyncio
 async def test_manage_exits_on_hard_stop() -> None:
     broker = MagicMock()
     broker.fetch_quote = AsyncMock(

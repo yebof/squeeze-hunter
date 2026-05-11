@@ -145,6 +145,24 @@ def test_data_freshness_unconditional_recording() -> None:
     assert tel.critical_data_stale_for_seconds(later) == 7200
 
 
+def test_drawdown_detects_same_day_intraday_loss() -> None:
+    """R8.S-I5 regression: a Day 1 of operation with a +5% intraday peak
+    followed by a -10% adverse close must surface as a drawdown. Prior code
+    required len(equity_history) >= 2 in the deduped series, returning 0
+    for single-day drawdowns even though equity_peak_per_day knew about the
+    intraday high.
+    """
+    tel = PortfolioTelemetry()
+    # Day 1 only — single deduped equity entry, but the peak tracker has
+    # captured the intraday max.
+    tel.record_equity(datetime(2026, 5, 11, 10, 0, tzinfo=UTC), 100_000.0)
+    tel.record_equity(datetime(2026, 5, 11, 12, 0, tzinfo=UTC), 105_000.0)  # +5% peak
+    tel.record_equity(datetime(2026, 5, 11, 16, 0, tzinfo=UTC), 94_500.0)  # adverse close
+    dd = tel.rolling_30d_max_drawdown(datetime(2026, 5, 11, 16, 0, tzinfo=UTC))
+    # peak=105_000, current=94_500 → -10%
+    assert dd == pytest.approx(-0.10, abs=0.001)
+
+
 def test_drawdown_preserves_intraday_peak_after_dedupe_by_day() -> None:
     """R7.I1: R6.C1's dedupe-by-day (last write wins) would otherwise erase an
     intraday equity peak. Drawdown math should still see the peak via the

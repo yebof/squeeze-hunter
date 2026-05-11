@@ -220,8 +220,15 @@ class IBKRBroker:
             # inconsistent partial view. accountValues() is a cheap in-memory
             # snapshot read, so call it directly on the event loop.
             values = self._ib.accountValues()
-        except Exception as e:
-            log.warning("ibkr_account_values_failed", err=str(e))
+        except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
+            # R8.Q-I3: narrow per CLAUDE.md. RuntimeError covers ib-async
+            # "not connected" raises. AttributeError must propagate so a
+            # broker-impl typo (renamed attr) surfaces as a real bug.
+            log.warning(
+                "ibkr_account_values_failed",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
             return None
         for v in values:
             # NetLiquidation in USD is the broker-side NAV. Some accounts also

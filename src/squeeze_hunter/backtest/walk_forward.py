@@ -27,6 +27,9 @@ class WalkForwardConfig:
     test_windows: list[tuple[datetime, datetime]]
     holdout: tuple[datetime, datetime]
     initial_cash: float = 100_000.0
+    # R8.Q-I11: this default MUST equal `config.ScoreCfg.threshold` (8.0). CLI
+    # passes settings.score.threshold explicitly; ad-hoc callers that omit it
+    # rely on this match. Update both sites together if changed.
     score_threshold: float = 8.0
     validation_events: list[tuple[str, datetime]] = field(default_factory=list)
 

@@ -86,6 +86,11 @@ def build_twap_plan(
 ) -> TwapPlan:
     if total_qty <= 0 or n_slices <= 0:
         return TwapPlan(ticker=ticker, side=side, slices=[])
+    # R8.S-I3: when total_qty < n_slices, base_qty=0 and only the last slice
+    # carries the remainder. Submitting zero-qty slices wastes broker
+    # round-trips and confuses the OMS aggression-escalation accounting.
+    # Cap n_slices so every emitted slice has qty >= 1.
+    n_slices = min(n_slices, total_qty)
     base_qty = total_qty // n_slices
     remainder = total_qty - base_qty * n_slices
     spacing = timedelta(seconds=(window_minutes * 60) // max(n_slices - 1, 1))
@@ -93,6 +98,9 @@ def build_twap_plan(
     slices: list[Slice] = []
     for i in range(n_slices):
         qty = base_qty + (remainder if i == n_slices - 1 else 0)
+        if qty <= 0:
+            # Defensive — shouldn't happen given the n_slices clamp above.
+            continue
         agg = starting_aggression_bps + (
             (ending_aggression_bps - starting_aggression_bps) * i / max(n_slices - 1, 1)
         )

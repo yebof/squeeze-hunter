@@ -57,6 +57,12 @@ def evaluate_gates(
     min_days_listed: int = 30,
     max_correlation: float = 0.70,
 ) -> GateResult:
+    # R8.S-I4: reject when equity is non-positive. The later position-cap math
+    # (`size / state.equity_usd`) would raise ZeroDivisionError otherwise, and
+    # tick_safe would swallow it forever — preventing the killswitch from ever
+    # evaluating on a bankrupt account.
+    if state.equity_usd <= 0:
+        return GateResult(False, "equity_nonpositive")
     if p.score < score_threshold:
         return GateResult(False, "score_below_threshold")
     if p.setup_type == "Weak":

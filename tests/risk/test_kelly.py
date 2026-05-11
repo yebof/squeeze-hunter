@@ -77,3 +77,17 @@ def test_kelly_capped_at_position_cap() -> None:
         observed_wins=99, observed_trades=100, observed_avg_payoff=20.0, params=p
     )
     assert pct == pytest.approx(0.08)
+
+
+def test_kelly_priors_accept_yaml_overrides() -> None:
+    """R8.S-I2 regression: kelly_priors_for_setup must accept fraction/cap/prior_n
+    kwargs so settings.risk.* YAML overrides actually flow through. Previously
+    these were hardcoded function locals — changing kelly_fraction in YAML did
+    nothing.
+    """
+    from squeeze_hunter.risk.kelly import kelly_priors_for_setup
+
+    p = kelly_priors_for_setup("CAR", fraction=0.10, cap=0.04, prior_n=10)
+    assert p.fraction == 0.10
+    assert p.cap == 0.04
+    assert p.prior_n == 10

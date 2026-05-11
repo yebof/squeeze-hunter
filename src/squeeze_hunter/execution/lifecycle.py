@@ -99,9 +99,7 @@ async def _process_one_position(
         # liquidity is available — during halts, AH, or thin sessions
         # they can fill 5-20% adverse on small-float tickers. A limit
         # 50 bps below mid is still aggressive enough to hit the inside
-        # in normal liquidity but caps catastrophic fills. The spec's
-        # design principle #1 (conservative bias) prefers controlled
-        # exits over guaranteed-fill market orders.
+        # in normal liquidity but caps catastrophic fills.
         marketable_limit = round(price * 0.995, 4)  # 50 bps below current
         order = await broker.submit_sell(
             ticker=ticker,
@@ -115,12 +113,38 @@ async def _process_one_position(
             qty=qty,
             reason=sig.reason,
             broker_order_id=order.broker_order_id,
+            status=order.status,
         )
-        state.record_exit({"ts": now, "ticker": ticker, "qty": qty, "reason": sig.reason or "exit"})
-        if sig.action == "exit":
-            state.positions.pop(ticker, None)
+        # R8.S-C1: only pop the position on a CONFIRMED fill. With market
+        # orders (R7.I7 replaced them) the simulator always filled, so
+        # popping immediately was safe. With marketable limits, IBKR may
+        # return "pending"/"submitted" — popping immediately leaves real
+        # exposure at the broker while the lifecycle daemon thinks it's
+        # closed. On a gap-down through the limit, the order may never
+        # fill at the original price and needs to be retried (cancel-replace
+        # or escalate). Until then, keep the position so the next tick
+        # re-evaluates the stop with a fresh quote.
+        if order.status == "filled":
+            state.record_exit(
+                {"ts": now, "ticker": ticker, "qty": qty, "reason": sig.reason or "exit"}
+            )
+            if sig.action == "exit":
+                state.positions.pop(ticker, None)
+            else:
+                meta["qty"] -= qty
         else:
-            meta["qty"] -= qty
+            # Pending / partial — leave the position in place; next tick will
+            # re-evaluate. Track the pending order on the meta so a future
+            # cancel-replace path can find it.
+            meta.setdefault("pending_exits", []).append(order.broker_order_id)
+            log.warning(
+                "lifecycle_exit_unfilled",
+                ticker=ticker,
+                qty=qty,
+                status=order.status,
+                broker_order_id=order.broker_order_id,
+                note="position retained; next tick re-evaluates the stop",
+            )
 
 
 async def manage_positions(
