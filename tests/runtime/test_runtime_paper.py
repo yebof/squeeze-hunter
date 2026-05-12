@@ -46,6 +46,44 @@ def _seed(cache: ParquetCache) -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_propagates_yaml_stops_into_lifecycle_state(tmp_path: Path) -> None:
+    """R9.1 regression: YAML stops settings (hard_stop, trailing_*, time_stop_days,
+    signal_decay_*) must reach LifecycleState so paper/live use the operator's
+    configured thresholds. Trailing values store negative; lifecycle expects
+    positive magnitudes — verify both the value AND the sign conversion.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {"f1_si_pct": 1.0}
+    settings.stops.hard_stop = -0.15
+    settings.stops.trailing_car = -0.30  # YAML negative
+    settings.stops.trailing_gme = -0.40
+    settings.stops.trailing_mixed = -0.18
+    settings.stops.time_stop_days = 14
+    settings.stops.signal_decay_halve = 0.45
+    settings.stops.signal_decay_exit = 0.80
+
+    rc = RuntimeContext(
+        cache=cache,
+        settings=settings,
+        tickers=["GME"],
+        mode="sim",
+        broker=None,
+    )
+    await rc.setup()
+
+    assert rc.lifecycle_state.hard_stop == -0.15
+    # Magnitudes: YAML negative → lifecycle positive
+    assert rc.lifecycle_state.trailing_car == 0.30
+    assert rc.lifecycle_state.trailing_gme == 0.40
+    assert rc.lifecycle_state.trailing_mixed == 0.18
+    assert rc.lifecycle_state.time_stop_bars == 14
+    assert rc.lifecycle_state.signal_decay_halve == 0.45
+    assert rc.lifecycle_state.signal_decay_exit == 0.80
+
+
+@pytest.mark.asyncio
 async def test_runtime_one_tick_no_signals(tmp_path: Path) -> None:
     cache = ParquetCache(root=tmp_path)
     _seed(cache)
@@ -450,9 +488,9 @@ async def test_killswitch_cooldown_does_not_rearm_when_conditions_persist(
     # tripped, BUT _kill_first_tripped_at must NOT be moved forward.
     await rc.tick(now=datetime(2026, 5, 19, 14, 0, tzinfo=UTC))
     assert rc.kill_switch_active is True
-    assert (
-        rc._kill_first_tripped_at == first_trip
-    ), "sticky cooldown should not rearm when conditions persist past the window"
+    assert rc._kill_first_tripped_at == first_trip, (
+        "sticky cooldown should not rearm when conditions persist past the window"
+    )
 
     # Day 30: conditions clear (equity recovers). Trip cycle closes.
     mock_broker.get_equity_usd = AsyncMock(return_value=100_000.0)

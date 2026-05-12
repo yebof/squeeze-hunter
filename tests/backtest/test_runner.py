@@ -216,6 +216,72 @@ async def test_runner_records_realized_pnl_on_sells(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_realized_pnl_subtracts_round_trip_commission(tmp_path: Path) -> None:
+    """R9.10 regression: trade_log realized P&L must be NET of round-trip
+    commission. Buy commission + sell commission = round-trip; both should be
+    subtracted from `(sell_fill - buy_fill) * qty` so Kelly's avg_payoff is
+    not biased optimistically.
+    """
+    from unittest.mock import patch
+
+    from squeeze_hunter.backtest.cost_model import StockCostModel
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    cfg = BacktestConfig(
+        tickers=_ALL_TICKERS,
+        start=datetime(2024, 5, 14, tzinfo=UTC),
+        end=datetime(2024, 6, 30, tzinfo=UTC),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    # Crank commission per share so the difference is measurable in the test.
+    big_commission_model = StockCostModel(commission_per_share=0.50)
+    with patch(
+        "squeeze_hunter.backtest.runner.StockCostModel",
+        return_value=big_commission_model,
+    ):
+        result = await run_backtest(cfg, cache=cache, settings=settings)
+    sells = result.trade_log[
+        (result.trade_log["side"] == "sell")
+        & (result.trade_log["partial"].fillna(False).astype(bool) == False)  # noqa: E712
+    ]
+    assert len(sells) > 0, "need at least one full exit to verify commission accounting"
+    # For each sell, recompute gross and confirm realized < gross by commission size.
+    buys = result.trade_log[result.trade_log["side"] == "buy"].set_index("ticker")
+    for _, sell in sells.iterrows():
+        ticker = sell["ticker"]
+        if ticker not in buys.index:
+            continue
+        # buys may have multiple rows per ticker; take the first (entry)
+        buy_row = buys.loc[ticker]
+        if isinstance(buy_row, pd.DataFrame):
+            buy_row = buy_row.iloc[0]
+        qty = sell["qty"]
+        gross = (sell["price"] - buy_row["price"]) * qty
+        # round-trip commission at $0.50/share = qty * 1.0
+        expected_commission = qty * 0.50 * 2  # buy + sell
+        # Realized must be lower than gross by approximately round-trip commission
+        assert sell["realized"] < gross, (
+            f"realized {sell['realized']} >= gross {gross} for {ticker} — commissions not deducted"
+        )
+        diff = gross - sell["realized"]
+        assert abs(diff - expected_commission) < 0.01, (
+            f"expected commission deduction ≈ {expected_commission}, got {diff} for {ticker}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_runner_gross_exposure_invariant(tmp_path: Path) -> None:
     """R6 regression (loose form): regardless of how many same-day buys
     happen, the cumulative notional from buys must never exceed 90% of equity.
@@ -252,9 +318,9 @@ async def test_runner_gross_exposure_invariant(tmp_path: Path) -> None:
     if len(buys) > 0:
         for day, day_buys in buys.groupby("ts"):
             notional = (day_buys["qty"] * day_buys["price"]).sum()
-            assert (
-                notional <= 100_000.0 * 0.90 + 1.0
-            ), f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
+            assert notional <= 100_000.0 * 0.90 + 1.0, (
+                f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
+            )
 
 
 def test_runner_gross_exposure_updates_state() -> None:
@@ -268,6 +334,6 @@ def test_runner_gross_exposure_updates_state() -> None:
 
     src = inspect.getsource(runner_mod)
     # The R6 fix line must be present in the daily loop
-    assert (
-        "state.gross_exposure_pct += size_usd / state.equity_usd" in src
-    ), "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
+    assert "state.gross_exposure_pct += size_usd / state.equity_usd" in src, (
+        "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
+    )

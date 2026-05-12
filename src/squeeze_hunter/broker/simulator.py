@@ -104,6 +104,9 @@ class SimulatorBroker:
             status="filled",
             filled_qty=qty,
             avg_fill_price=fill.fill_price,
+            # R9.10: surface the commission so the backtest runner can
+            # compute net realized P&L for Kelly avg_payoff accuracy.
+            commission_usd=fill.commission_usd,
         )
 
     async def submit_sell(
@@ -142,6 +145,8 @@ class SimulatorBroker:
             status="filled",
             filled_qty=qty,
             avg_fill_price=fill.fill_price,
+            # R9.10: see submit_buy.
+            commission_usd=fill.commission_usd,
         )
 
     async def cancel_order(self: SimulatorBroker, broker_order_id: str) -> bool:

@@ -251,12 +251,17 @@ def backtest(
     verdict = evaluate_gate1(report["holdout"], n_trials=n_trials, n_obs=n_obs)
     holdout_eq.to_csv(out / "holdout_equity.csv")
     report["raw"]["trades"].to_csv(out / "holdout_trades.csv", index=False)
+    # R9.2: surface setup-type coverage so a "PASSED" with only CAR trades is
+    # explicitly flagged. f4/f5 are 0-by-design today → no GME/Mixed labels.
+    from squeeze_hunter.backtest.gate1 import setup_type_coverage_warning
+
+    coverage_warning = setup_type_coverage_warning(report["raw"]["trades"])
     summary_path = out / "gate1_report.txt"
-    summary_path.write_text(_format_report(report, verdict))
+    summary_path.write_text(_format_report(report, verdict, coverage_warning))
     typer.echo(summary_path.read_text())
 
 
-def _format_report(report: dict, verdict: Any) -> str:
+def _format_report(report: dict, verdict: Any, coverage_warning: str | None = None) -> str:
     lines = ["=== Walk-forward report ==="]
     for label, m in [
         ("Train", report["train"]),
@@ -276,6 +281,12 @@ def _format_report(report: dict, verdict: Any) -> str:
         for f in verdict.failures:
             lines.append(f"  - {f}")
     lines.append(f"deflated_sharpe = {verdict.deflated_sharpe_value:.3f}")
+    # R9.2: setup-type coverage banner — warns if Gate 1 passed on a subset
+    # of setups (typically the CAR-only case while f4/f5 are still zero).
+    if coverage_warning:
+        lines.append("")
+        lines.append("=== Coverage warning ===")
+        lines.append(coverage_warning)
     return "\n".join(lines)
 
 

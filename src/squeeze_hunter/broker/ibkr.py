@@ -58,6 +58,18 @@ def _ibkr_default_account() -> str:
     return os.environ.get("IBKR_ACCOUNT", "")
 
 
+# R9.6: most short-squeeze targets in our universe list on NASDAQ; this is the
+# safe default for new tickers. Names known to list elsewhere are overridden
+# below. Operators trading additional NYSE/AMEX names should add them here
+# (or override at construction via `primary_exchange_overrides`).
+_DEFAULT_PRIMARY_EXCHANGE = "NASDAQ"
+_PRIMARY_EXCHANGE_DEFAULTS: dict[str, str] = {
+    "GME": "NYSE",
+    "AMC": "NYSE",
+    "RBLX": "NYSE",
+}
+
+
 @dataclass
 class IBKRBroker:
     name: str = "ibkr"
@@ -65,9 +77,31 @@ class IBKRBroker:
     port: int = field(default_factory=_ibkr_default_port)
     client_id: int = field(default_factory=_ibkr_default_client_id)
     account: str = field(default_factory=_ibkr_default_account)
+    # R9.6: per-ticker primaryExchange. Stock("X","SMART","USD") without
+    # primaryExchange is ambiguous when more than one contract on TWS shares
+    # the symbol (e.g., a delisted-then-reused ticker like BBBY). qualifyContracts
+    # may then match the wrong contract or fail outright. We set primaryExchange
+    # on every Stock — SMART still does the routing, primaryExchange is just
+    # the disambiguator. Operators can extend the map per-deployment.
+    primary_exchange_overrides: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self: IBKRBroker) -> None:
         self._ib = IB()
+
+    def _make_stock(self: IBKRBroker, ticker: str) -> Stock:
+        """R9.6: build a Stock contract with a non-ambiguous primaryExchange.
+
+        Lookup order: per-instance overrides > module-level defaults > NASDAQ.
+        Returning a `Stock(ticker, "SMART", "USD", primaryExchange=...)` keeps
+        SMART routing intact while ensuring TWS uniquely identifies the
+        contract during qualification.
+        """
+        primary = (
+            self.primary_exchange_overrides.get(ticker)
+            or _PRIMARY_EXCHANGE_DEFAULTS.get(ticker)
+            or _DEFAULT_PRIMARY_EXCHANGE
+        )
+        return Stock(ticker, "SMART", "USD", primaryExchange=primary)
 
     async def connect(self: IBKRBroker) -> None:
         log.info("connecting", host=self.host, port=self.port)
@@ -92,7 +126,7 @@ class IBKRBroker:
         self._ib.disconnect()
 
     async def fetch_quote(self: IBKRBroker, ticker: str) -> Quote:
-        contract = Stock(ticker, "SMART", "USD")
+        contract = self._make_stock(ticker)
         await self._ib.qualifyContractsAsync(contract)
         ticker_data = self._ib.reqMktData(contract, "", snapshot=True, regulatorySnapshot=False)
         # Wait for snapshot — ib-async populates fields as updates arrive
@@ -122,7 +156,7 @@ class IBKRBroker:
         limit_price: float | None,
         ts: datetime,
     ) -> BrokerOrder:
-        contract = Stock(ticker, "SMART", "USD")
+        contract = self._make_stock(ticker)
         await self._ib.qualifyContractsAsync(contract)
         order = LimitOrder("BUY", qty, limit_price) if limit_price else MarketOrder("BUY", qty)
         trade = self._ib.placeOrder(contract, order)
@@ -150,7 +184,7 @@ class IBKRBroker:
         limit_price: float | None,
         ts: datetime,
     ) -> BrokerOrder:
-        contract = Stock(ticker, "SMART", "USD")
+        contract = self._make_stock(ticker)
         await self._ib.qualifyContractsAsync(contract)
         order = LimitOrder("SELL", qty, limit_price) if limit_price else MarketOrder("SELL", qty)
         trade = self._ib.placeOrder(contract, order)

@@ -97,6 +97,11 @@ class BacktestProvider:
     async def fetch_option_chain(
         self: BacktestProvider, ticker: str, expiry: date | None = None
     ) -> OptionChain:
+        # R9.11: partition key format is `{ticker}__{YYYY-MM-DD}`. There is NO
+        # writer for this partition in src/ today — Phase 4 must add an
+        # options-chain ingest job that writes via cache.append_partition with
+        # this exact key format. Otherwise f5 (call OI velocity) returns 0
+        # for every ticker and Gate 1 cannot validate the GME setup.
         df = self.cache.read_partition("options", f"{ticker}__{self.clock.now.date().isoformat()}")
         if df.empty:
             return OptionChain(underlying=ticker, as_of=self.clock.now, spot=0.0, quotes=[])
@@ -126,6 +131,10 @@ class BacktestProvider:
         Reads the parquet partition for the requested date. If absent, returns an
         empty OptionChain (so the caller distinguishes "no data" from "real zeros").
         Respects the clock — cannot read future dates.
+
+        R9.11: shares the partition key format `{ticker}__{YYYY-MM-DD}` with
+        fetch_option_chain — keep them in lockstep when writing the Phase 4
+        ingest job.
         """
         if as_of > self.clock.now:
             return OptionChain(underlying=ticker, as_of=as_of, spot=0.0, quotes=[])

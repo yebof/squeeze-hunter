@@ -9,7 +9,7 @@ from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
 
 
 @pytest.mark.asyncio
-async def test_manage_keeps_position_when_exit_order_pending(tmp_path=None) -> None:
+async def test_manage_keeps_position_when_exit_order_pending() -> None:
     """R8.S-C1 regression: when the broker returns a non-filled status
     (pending/submitted/partial), the position must remain in state until
     a future tick confirms the fill. Popping immediately would leave real
@@ -458,6 +458,111 @@ async def test_lifecycle_in_flight_cleared_on_exception() -> None:
         await manage_positions(state, broker, datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     # Even after the exception, in_flight is empty
     assert state.in_flight == set()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cancels_stale_pending_exit_before_resubmitting() -> None:
+    """R9.3 regression: when a prior tick left an unfilled exit limit on the
+    broker (status=pending → recorded in meta["pending_exits"]), the next tick
+    that re-evaluates the stop MUST cancel the old order before submitting a
+    fresh one. Otherwise the broker carries two live sell orders for the same
+    position; if both fill, the position flips short — a serious safety bug.
+    """
+    cancel_calls: list[str] = []
+
+    async def fake_cancel(order_id):
+        cancel_calls.append(order_id)
+        return True
+
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=85.0, ask=85.05, last=85.0, timestamp_ns=0)
+    )
+    broker.submit_sell = AsyncMock(
+        return_value=BrokerOrder(
+            broker_order_id="new-order",
+            ticker="GME",
+            side="sell",
+            qty=100,
+            limit_price=84.5,
+            status="pending",
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+    )
+    broker.cancel_order = fake_cancel
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+                # Simulate a prior tick that already placed a still-unfilled exit
+                "pending_exits": ["stale-order-1", "stale-order-2"],
+            }
+        }
+    )
+    await manage_positions(state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    # Both stale orders must have been cancelled before the new submit
+    assert "stale-order-1" in cancel_calls
+    assert "stale-order-2" in cancel_calls
+    # The new submit replaced them; pending_exits should now reflect the new id only
+    assert state.positions["GME"]["pending_exits"] == ["new-order"]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_pending_exit_cancel_failure_does_not_block_resubmit() -> None:
+    """If cancelling a stale order errors with a transient ConnectionError
+    (broker hiccup), we still want to attempt the new exit. Programming errors
+    (AttributeError, etc.) MUST propagate — same rule as the rest of lifecycle.
+    """
+    submitted: list[int] = []
+
+    async def fake_cancel(order_id):
+        raise ConnectionError("transient")
+
+    async def fake_submit(ticker, qty, limit_price, ts):
+        submitted.append(qty)
+        return BrokerOrder(
+            broker_order_id="new",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status="filled",
+            filled_qty=qty,
+            avg_fill_price=85.0,
+        )
+
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=85.0, ask=85.05, last=85.0, timestamp_ns=0)
+    )
+    broker.submit_sell = fake_submit
+    broker.cancel_order = fake_cancel
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+                "pending_exits": ["stale"],
+            }
+        }
+    )
+    # Should NOT raise; cancel failure logged, submit proceeds
+    await manage_positions(state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    assert submitted == [100]
 
 
 def test_lifecycle_exits_list_trims_after_max() -> None:

@@ -41,8 +41,12 @@ class RiskCfg(BaseModel):
 
 class StopsCfg(BaseModel):
     hard_stop: float = -0.12
+    # R9.1: trailing stops are stored as the negative threshold (e.g., -0.20 =
+    # exit when 20% below the peak). evaluate_stops takes a positive magnitude;
+    # callers must pass `abs(settings.stops.trailing_car)` etc.
     trailing_car: float = -0.20
     trailing_gme: float = -0.25
+    trailing_mixed: float = -0.22
     time_stop_days: int = 21
     signal_decay_halve: float = 0.50
     signal_decay_exit: float = 0.75

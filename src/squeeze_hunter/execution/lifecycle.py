@@ -9,7 +9,13 @@ from typing import Any
 
 from squeeze_hunter.broker.base import IBroker
 from squeeze_hunter.logging_setup import get_logger
-from squeeze_hunter.risk.stops import StopState, evaluate_stops
+from squeeze_hunter.risk.stops import (
+    _DEFAULT_TRAILING_CAR,
+    _DEFAULT_TRAILING_GME,
+    _DEFAULT_TRAILING_MIXED,
+    StopState,
+    evaluate_stops,
+)
 
 log = get_logger("execution.lifecycle")
 
@@ -26,6 +32,16 @@ class LifecycleState:
     # 1000 entries is plenty for any practical lookback; older entries should
     # be persisted to the DB if needed (Phase 4).
     exits_max_entries: int = 1000
+    # R9.1: stops parameters live on the state so RuntimeContext can populate
+    # them from settings. Defaults match the prior hardcoded values so existing
+    # tests that construct LifecycleState() directly behave identically.
+    hard_stop: float = -0.12
+    time_stop_bars: int = 21
+    signal_decay_halve: float = 0.50
+    signal_decay_exit: float = 0.75
+    trailing_car: float = _DEFAULT_TRAILING_CAR
+    trailing_gme: float = _DEFAULT_TRAILING_GME
+    trailing_mixed: float = _DEFAULT_TRAILING_MIXED
 
     def record_exit(self: LifecycleState, entry: dict[str, Any]) -> None:
         """Append a new exit and trim to the configured max length."""
@@ -87,13 +103,50 @@ async def _process_one_position(
         bars_held=meta["bars_held"],
         setup_type=meta["setup_type"],
     )
-    sig = evaluate_stops(stop_state, current_price=price)
+    # R9.1: pass the YAML-driven stops parameters (carried on LifecycleState)
+    # so paper/live behave identically to the backtest. Previously this call
+    # used only defaults — every YAML knob in `stops:` was silently dead.
+    sig = evaluate_stops(
+        stop_state,
+        current_price=price,
+        hard_stop=state.hard_stop,
+        time_stop_bars=state.time_stop_bars,
+        signal_decay_halve=state.signal_decay_halve,
+        signal_decay_exit=state.signal_decay_exit,
+        trailing_car=state.trailing_car,
+        trailing_gme=state.trailing_gme,
+        trailing_mixed=state.trailing_mixed,
+    )
     if sig.action == "hold":
         return
     if sig.action in {"halve", "exit"}:
         qty = meta["qty"] // 2 if sig.action == "halve" else meta["qty"]
         if qty <= 0:
             return
+        # R9.3: cancel any prior unfilled exit orders before resubmitting.
+        # Without this, a stop that triggers two ticks in a row leaves TWO
+        # live sell orders on the broker. If both fill the position flips
+        # short — a serious safety bug. Transient cancel failures are logged
+        # and we proceed with the new exit (the broker will eventually time
+        # out the stale order or the next tick will retry the cancel).
+        # Programming errors (AttributeError on a misconfigured broker) MUST
+        # propagate per the same rule as fetch_quote above.
+        stale_pending: list[str] = list(meta.get("pending_exits", []))
+        for stale_id in stale_pending:
+            try:
+                await broker.cancel_order(stale_id)
+            except _TRANSIENT_FETCH_ERRORS as e:
+                log.warning(
+                    "lifecycle_cancel_stale_failed",
+                    ticker=ticker,
+                    broker_order_id=stale_id,
+                    err=str(e),
+                    err_type=type(e).__name__,
+                )
+        # Clear the list now — the new submit will repopulate it if the
+        # fresh order also goes pending.
+        if stale_pending:
+            meta["pending_exits"] = []
         # R7.I7: emit a marketable limit (50 bps below current bid/last)
         # instead of a market order. Market sells route into whatever
         # liquidity is available — during halts, AH, or thin sessions

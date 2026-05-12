@@ -203,6 +203,69 @@ async def test_oms_escalates_to_marketable_when_fills_lag() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oms_partial_fills_still_escalate() -> None:
+    """R9.5 regression: persistent partial fills must still escalate aggression.
+
+    Prior behavior incremented `slices_filled` on ANY filled_qty>0 (including
+    partial), so 5 slices each at 30% fill made escalate_aggression think
+    fills were full → no marketable escalation → TWAP ended with ~70%
+    unfilled at end-of-window.
+
+    Fixed: only fully-filled slices count toward `slices_filled`. After a few
+    persistent partials, the marketable-limit threshold trips and later slices
+    use a more aggressive limit price.
+    """
+    submitted_limits: list[float] = []
+
+    async def fake_quote(ticker):
+        return Quote(ticker=ticker, bid=20.0, ask=20.05, last=20.0, timestamp_ns=0)
+
+    async def fake_submit_buy(ticker, qty, limit_price, ts):
+        submitted_limits.append(limit_price)
+        # Every order partially fills 30% — never reaches "filled" status
+        return BrokerOrder(
+            broker_order_id=f"id-{len(submitted_limits)}",
+            ticker=ticker,
+            side="buy",
+            qty=qty,
+            limit_price=limit_price,
+            status="partial",
+            filled_qty=qty // 3,
+            avg_fill_price=limit_price,
+        )
+
+    broker = MagicMock()
+    broker.fetch_quote = fake_quote
+    broker.submit_buy = fake_submit_buy
+
+    open_at = datetime(2026, 5, 14, 13, 30, tzinfo=UTC)
+    plan = build_twap_plan(
+        total_qty=600,
+        reference_price=20.0,
+        market_open=open_at,
+        ticker="GME",
+        side="buy",
+        n_slices=6,
+        window_minutes=10,
+        slice_offset_minutes=0,
+    )
+    oms = OrderManager(broker=broker, clock=lambda: open_at + timedelta(minutes=15))
+    await oms.execute(plan, max_wall_seconds=0)
+
+    # The natural aggression ramp goes from ~5 bps to ~30 bps. Escalation to
+    # MARKETABLE bumps to 50 bps. If partials are mis-counted as fully filled,
+    # escalation never trips and the last slice's limit caps at ~30 bps above
+    # mid (=20.025 * 1.0030 ≈ 20.085). With the fix, late slices should hit
+    # marketable territory: 20.025 * 1.0050 ≈ 20.125. Use a threshold above
+    # the natural-ramp ceiling to detect escalation specifically.
+    natural_ramp_ceiling = 20.025 * (1 + 35 / 10_000)  # ~20.095
+    assert any(lim > natural_ramp_ceiling for lim in submitted_limits[-2:]), (
+        "persistent partial fills did not escalate to marketable; "
+        f"limits {submitted_limits} all under natural ramp ceiling {natural_ramp_ceiling:.4f}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_oms_marketable_for_sell_uses_negative_aggression() -> None:
     """For sell side, aggression bps means below mid (lower price = more
     aggressive sell)."""

@@ -215,8 +215,27 @@ class RuntimeContext:
     telemetry: PortfolioTelemetry = field(default_factory=PortfolioTelemetry)
     # Populated by nightly_scan; read by premarket_verify the next morning.
     last_candidates: pd.DataFrame | None = None
+    # R9.7: top-level guard against overlapping ticks. APScheduler's
+    # IntervalTrigger fires every 60s; the lambda dispatches via create_task
+    # and returns immediately, so a tick that takes >60s would otherwise be
+    # joined by a parallel tick. LifecycleState.lock only serializes per-ticker
+    # stop processing — broker.health, equity fetch, killswitch evaluation, and
+    # telemetry recording would all race. We early-return when a tick is
+    # already in flight; the next interval will catch up.
+    _tick_in_progress: bool = False
 
     async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
+        # R9.1: propagate YAML stops settings into the lifecycle state so the
+        # paper/live stop evaluation uses the same thresholds the operator
+        # configures in YAML. Trailing values are stored negative in YAML;
+        # evaluate_stops expects positive magnitudes — convert with abs().
+        self.lifecycle_state.hard_stop = self.settings.stops.hard_stop
+        self.lifecycle_state.time_stop_bars = self.settings.stops.time_stop_days
+        self.lifecycle_state.signal_decay_halve = self.settings.stops.signal_decay_halve
+        self.lifecycle_state.signal_decay_exit = self.settings.stops.signal_decay_exit
+        self.lifecycle_state.trailing_car = abs(self.settings.stops.trailing_car)
+        self.lifecycle_state.trailing_gme = abs(self.settings.stops.trailing_gme)
+        self.lifecycle_state.trailing_mixed = abs(self.settings.stops.trailing_mixed)
         if self.broker is None:
             if self.mode == "sim":
                 self.broker = cast(
@@ -295,6 +314,28 @@ class RuntimeContext:
             log.debug("tick_skipped_outside_session", now=now.isoformat())
             return
 
+        # R9.7: top-level mutex. If the prior tick is still running, skip this
+        # one — APScheduler will fire the next interval. We check-and-set
+        # synchronously (no await between read and write) so two simultaneous
+        # awaits don't both observe False. The flag is reset in `finally` so
+        # an exception in the body (re-raised to tick_safe) still releases it.
+        if self._tick_in_progress:
+            log.warning("tick_overlapped_skipped", now=now.isoformat())
+            return
+        self._tick_in_progress = True
+        try:
+            await self._tick_body(now=now)
+        finally:
+            self._tick_in_progress = False
+
+    async def _tick_body(self: RuntimeContext, now: datetime) -> None:
+        """The real work of one tick. Wrapped by `tick()` with the
+        `_tick_in_progress` mutex (R9.7). Tests can monkey-patch this to
+        observe whether the body actually ran when ticks overlap.
+        """
+        # broker / metrics_registry already validated by tick()'s entry guard.
+        assert self.broker is not None
+        assert self.metrics_registry is not None
         # R3.1: capture position keys BEFORE manage_positions so we can detect
         # which positions were exited this tick and clear their stale telemetry
         # marks. Without this, worst_position_gap_pct keeps reading the last
@@ -421,6 +462,11 @@ class RuntimeContext:
             # Conditions cleared — close the trip cycle so the next fresh trip
             # opens a new cooldown window.
             log.info("killswitch_cleared", prior_reason=self._kill_reason)
+            # R9.4: also reset the Prometheus gauge to 0.0 so Grafana reflects
+            # the current state. Without this, the gauge stuck at 1.0 forever
+            # after the first trip, eroding ops trust in the dashboard.
+            if self.metrics_registry is not None and self._kill_reason is not None:
+                self.metrics_registry.set_kill_switch_inactive(self._kill_reason)
             self._kill_first_tripped_at = None
 
     def reset_killswitch(self: RuntimeContext) -> None:
@@ -437,6 +483,10 @@ class RuntimeContext:
                 self._kill_first_tripped_at.isoformat() if self._kill_first_tripped_at else None
             ),
         )
+        # R9.4: also reset the Prometheus gauge so Grafana reflects the manual
+        # reset. Matches the auto-clear path above.
+        if self.metrics_registry is not None and self._kill_reason is not None:
+            self.metrics_registry.set_kill_switch_inactive(self._kill_reason)
         self._kill_first_tripped_at = None
         self.kill_switch_active = False
         self._kill_reason = None
@@ -464,6 +514,22 @@ class RuntimeContext:
         job (Phase 4); otherwise the scan operates on stale data and f5
         (call OI velocity) will be 0 for every ticker. We log this limitation
         explicitly when in paper/live so it shows up in structured logs.
+
+        R9.9 (Phase 4 entry-path checklist): Phase 3 publishes candidates to
+        self.last_candidates but does NOT auto-enter positions. When the
+        Phase 4 entry path is wired, the implementation MUST:
+          1. Apply evaluate_gates with the SAME args as
+             backtest/runner.py's call site (score_threshold,
+             max_new_per_day, max_positions, position_cap, max_gross_exposure,
+             plus a GateContext that suppresses on kill_switch_active). Any
+             divergence violates the "same code path" design rule.
+          2. Initialize ALL meta keys in lifecycle_state.positions[t]:
+             entry_price, peak_price=entry_price, entry_score, current_score,
+             bars_held=0, setup_type, qty, entry_commission. Missing any key
+             will KeyError in lifecycle._process_one_position the next tick.
+          3. Call self.telemetry.record_position(t, entry, entry) so
+             worst_position_gap_pct sees the new position; otherwise the
+             gap-through-stop killswitch arm is dead for that lot.
         """
         from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
         from squeeze_hunter.scan import run_scan

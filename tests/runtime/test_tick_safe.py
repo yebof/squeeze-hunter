@@ -162,3 +162,45 @@ async def test_nightly_scan_safe_returns_false_when_raises(tmp_path: Path) -> No
     rc.nightly_scan = AsyncMock(side_effect=RuntimeError("scan_boom"))  # type: ignore[method-assign]
     ok = await rc.nightly_scan_safe(now=datetime(2026, 5, 14, 22, 0, tzinfo=UTC))
     assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ticks_serialized(tmp_path: Path) -> None:
+    """R9.7 regression: when one tick is in flight, a second concurrent tick
+    must NOT execute the body — it should detect the in-progress flag and
+    return immediately. APScheduler dispatches via create_task, so the lambda
+    returns before the coroutine completes; without serialization, an interval
+    job firing every 60s while a slow tick (>60s) is running would parallelize
+    quote-fetches, killswitch evaluations, and equity records.
+    """
+    import asyncio
+
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    await rc.setup()
+
+    # Replace broker.health with a slow coroutine that yields, keeping the
+    # first tick busy long enough for the second to enter and (with the fix)
+    # short-circuit. health() is the first awaitable inside tick after the
+    # session check, so it's a clean serialization point.
+    health_calls = 0
+
+    real_health = rc.broker.health
+
+    async def slow_health():
+        nonlocal health_calls
+        health_calls += 1
+        await asyncio.sleep(0.05)
+        return await real_health()
+
+    rc.broker.health = slow_health  # type: ignore[method-assign]
+
+    now = datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+    await asyncio.gather(rc.tick(now=now), rc.tick(now=now))
+    # With serialization, the second tick early-returns and never reaches
+    # broker.health — so health_calls == 1. Without serialization, both
+    # ticks proceed concurrently and call health twice.
+    assert health_calls == 1, (
+        f"expected serialization (1 body run), got {health_calls} broker.health calls"
+    )

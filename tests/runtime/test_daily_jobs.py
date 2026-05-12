@@ -178,9 +178,9 @@ async def test_eod_close_skips_us_federal_holidays(tmp_path: Path) -> None:
     # The scheduler fires (day_of_week mon-fri), but eod_close must skip.
     christmas = datetime(2024, 12, 25, 21, 0, tzinfo=UTC)  # 16:00 ET on Christmas Day
     await rc.eod_close(now=christmas)
-    assert (
-        rc.lifecycle_state.positions["GME"]["bars_held"] == 5
-    ), "bars_held must not increment on US federal holidays"
+    assert rc.lifecycle_state.positions["GME"]["bars_held"] == 5, (
+        "bars_held must not increment on US federal holidays"
+    )
 
     # Sanity: a normal trading day DOES increment.
     normal_day = datetime(2024, 12, 26, 21, 0, tzinfo=UTC)  # Thursday after Christmas

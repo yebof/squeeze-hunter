@@ -94,8 +94,7 @@ def build_scheduler(
             # that silently fell through to IntervalTrigger and then
             # KeyError'd on spec["seconds"].
             raise ValueError(
-                f"build_scheduler: unknown trigger type {spec['trigger']!r} "
-                f"for job {spec['id']!r}"
+                f"build_scheduler: unknown trigger type {spec['trigger']!r} for job {spec['id']!r}"
             )
         sched.add_job(cb, trigger=trigger, id=spec["id"])
     return sched

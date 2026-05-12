@@ -84,7 +84,7 @@ async def test_walk_forward_rejects_holdout_overlap_with_empty_test_windows(
         )
     )
     cache = ParquetCache(root=tmp_path)
-    with pytest.raises(ValueError, match="holdout.*train"):
+    with pytest.raises(ValueError, match=r"holdout.*train"):
         await run_walk_forward(cfg, cache=cache, settings=Settings())
 
 

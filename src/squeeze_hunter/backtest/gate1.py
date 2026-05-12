@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from squeeze_hunter.backtest.deflated_sharpe import deflated_sharpe
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+# R9.2: setup-type buckets we expect to see in a fully-validated backtest. If
+# any are missing entirely from the trade log, the Gate 1 verdict only
+# validates the subset that DID trade, and we surface that as a warning so
+# operators don't mistake "PASSED" for "all setups validated."
+_EXPECTED_SETUPS = ("CAR", "GME", "Mixed")
 
 
 @dataclass
@@ -87,3 +96,32 @@ def evaluate_gate1(
     if ds < thresholds.deflated_sharpe_min:
         failures.append(f"deflated_sharpe {ds:.2f} < {thresholds.deflated_sharpe_min}")
     return Gate1Verdict(passed=not failures, failures=failures, deflated_sharpe_value=ds)
+
+
+def setup_type_coverage_warning(trades: pd.DataFrame) -> str | None:
+    """R9.2: surface setup-type concentration in the holdout trade log.
+
+    When f4 (Reddit baseline) and f5 (options OI velocity) are not yet wired,
+    z[f4] = z[f5] = 0 universally → B = 0 → classifier never produces GME or
+    Mixed labels. The "PASSED" verdict in that case validates the CAR setup
+    only; operators must be told explicitly so they don't extrapolate to
+    untested setups.
+
+    Returns a human-readable warning string (CLI prints it next to the verdict)
+    or None when all expected setups appear in the log.
+    """
+    if trades is None or trades.empty or "setup_type" not in trades.columns:
+        return None
+    seen = {str(s) for s in trades["setup_type"].dropna().unique()}
+    seen &= set(_EXPECTED_SETUPS)
+    missing = [s for s in _EXPECTED_SETUPS if s not in seen]
+    if not missing:
+        return None
+    return (
+        "Gate 1 trade log only covers setup_type ∈ {"
+        + ", ".join(sorted(seen))
+        + "}; missing: "
+        + ", ".join(missing)
+        + ". Verdict validates the covered setups only — see CLAUDE.md notes on "
+        "f4 (Reddit baseline) and f5 (options OI velocity) before generalizing."
+    )

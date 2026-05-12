@@ -90,5 +90,15 @@ class MetricsRegistry:
     def set_kill_switch_active(self: MetricsRegistry, reason: str) -> None:
         self.kill_switch.labels(reason=reason).set(1.0)
 
+    def set_kill_switch_inactive(self: MetricsRegistry, reason: str) -> None:
+        """R9.4: clear the killswitch gauge when the switch transitions back to
+        inactive. Without this, the previously-set 1.0 sticks forever even
+        after the underlying condition resolves, breaking Grafana state.
+
+        Pass the same `reason` label that was used on the active transition
+        so the same labeled time series is reset to 0.0.
+        """
+        self.kill_switch.labels(reason=reason).set(0.0)
+
     def render(self: MetricsRegistry) -> str:
         return generate_latest(self.registry).decode("utf-8")

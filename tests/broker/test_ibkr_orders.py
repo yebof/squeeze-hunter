@@ -97,6 +97,42 @@ async def test_get_equity_usd_returns_none_when_no_nav() -> None:
 
 
 @pytest.mark.asyncio
+async def test_contracts_carry_primary_exchange() -> None:
+    """R9.6 regression: Stock contracts must include primaryExchange in
+    addition to SMART routing. Without it, ambiguous tickers (e.g., BBBY,
+    SHLD — delisted-then-reused symbols) can route to the wrong venue.
+    """
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    fake_trade = MagicMock()
+    fake_trade.order.orderId = 99
+    fake_trade.orderStatus.status = "PreSubmitted"
+    fake_ib.placeOrder = MagicMock(return_value=fake_trade)
+    captured_contracts: list = []
+
+    async def _qualify(contract):
+        captured_contracts.append(contract)
+
+    fake_ib.qualifyContractsAsync = _qualify
+    fake_ib.reqMktData = MagicMock()
+    broker._ib = fake_ib
+
+    await broker.submit_buy(
+        ticker="BBBY", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+    )
+    await broker.submit_sell(
+        ticker="BBBY", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+    )
+
+    assert len(captured_contracts) >= 2
+    for c in captured_contracts:
+        # ib-async Stock stores the primaryExchange on the contract.
+        assert getattr(c, "primaryExchange", "") != "", (
+            f"Stock contract missing primaryExchange: {c!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_submit_sell_uses_limit_when_provided() -> None:
     broker = IBKRBroker(client_id=99)
     fake_ib = MagicMock()

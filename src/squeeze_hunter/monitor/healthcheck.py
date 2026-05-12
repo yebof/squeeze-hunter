@@ -25,8 +25,12 @@ class HealthSnapshot:
         )
 
     def _is_healthy(self: HealthSnapshot) -> bool:
+        # R9.4: a tripped killswitch means the system is intentionally halted —
+        # report unhealthy so monitoring/alerts surface the halt instead of
+        # silently rolling green while no orders flow.
         return (
             self.db_connected
             and self.broker_connected
             and self.last_data_ingest_age_seconds < 60 * 60 * 24
+            and not self.kill_switch_active
         )

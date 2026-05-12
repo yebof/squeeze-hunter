@@ -23,8 +23,12 @@ risk:
   max_gross_exposure: 0.90
 stops:
   hard_stop: -0.12
+  # R9.1: trailing magnitudes are stored as negative thresholds (-0.20 = exit
+  # when 20% below the peak). Code applies abs() before evaluate_stops; the
+  # YAML value is the source of truth for the "one config file" rule.
   trailing_car: -0.20
   trailing_gme: -0.25
+  trailing_mixed: -0.22
   time_stop_days: 21
 universe:
   min_market_cap: 200000000

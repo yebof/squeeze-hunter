@@ -102,8 +102,14 @@ class OrderManager:
                 if order.filled_qty
                 else (order.qty if order.status == "filled" else 0)
             )
-            if filled > 0:
+            # R9.5: only fully-filled slices advance `slices_filled`. The prior
+            # `if filled > 0: slices_filled += 1` counted partial fills as full,
+            # so a string of small partials looked like full success to
+            # escalate_aggression — TWAP never bumped to marketable bps and
+            # ended with most of the order unfilled at end-of-window.
+            if order.status == "filled":
                 slices_filled += 1
+            if filled > 0:
                 cumulative_qty += filled
                 if order.avg_fill_price:
                     cumulative_value += filled * order.avg_fill_price

@@ -50,6 +50,12 @@ class BrokerOrder:
     status: str  # "pending" | "filled" | "partial" | "cancelled" | "rejected"
     filled_qty: int = 0
     avg_fill_price: float | None = None
+    # R9.10: commission paid for THIS leg, in USD. Simulator populates this from
+    # the cost model so the backtest's trade_log can compute accurate net P&L
+    # for Kelly's avg_payoff. Live brokers (IBKR) leave at 0.0 today — IBKR
+    # commission events arrive on a separate channel; tracking them per-fill
+    # is a Phase 4 follow-up. The 0.0 default keeps live behavior unchanged.
+    commission_usd: float = 0.0
 
 
 @runtime_checkable

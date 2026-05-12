@@ -93,6 +93,11 @@ async def run_backtest(
     time_stop_bars = settings.stops.time_stop_days
     signal_decay_halve = settings.stops.signal_decay_halve
     signal_decay_exit = settings.stops.signal_decay_exit
+    # R9.1: YAML stores trailing as negative thresholds (e.g., -0.20). The
+    # evaluate_stops kwargs expect positive magnitudes; convert with abs().
+    trailing_car = abs(settings.stops.trailing_car)
+    trailing_gme = abs(settings.stops.trailing_gme)
+    trailing_mixed = abs(settings.stops.trailing_mixed)
 
     for cur_ts in trading_days:
         # Convert pd.Timestamp to datetime; hour/min/sec are already 0 from bdate_range.
@@ -140,13 +145,22 @@ async def run_backtest(
                 time_stop_bars=time_stop_bars,
                 signal_decay_halve=signal_decay_halve,
                 signal_decay_exit=signal_decay_exit,
+                trailing_car=trailing_car,
+                trailing_gme=trailing_gme,
+                trailing_mixed=trailing_mixed,
             )
             if sig.action == "exit":
                 qty = broker.position_qty(ticker)
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L so Kelly observed-trades counter works
-                    realized = (order.avg_fill_price - st["entry_price"]) * qty
+                    # R9.10: subtract round-trip commissions so trade_log reflects
+                    # net P&L. Buy commission was captured on entry into
+                    # `entry_commission`; sell commission is on this order. Without
+                    # this Kelly's avg_payoff is biased optimistic by ~1bp/leg,
+                    # tiny per trade but compounding over the backtest.
+                    gross = (order.avg_fill_price - st["entry_price"]) * qty
+                    realized = gross - st.get("entry_commission", 0.0) - order.commission_usd
                     # R7.C3+C4: record pct return for Kelly's b. Dollar PnL biases
                     # avg_payoff toward larger-cap trades; pct normalizes across
                     # position sizes and is invariant to equity growth.
@@ -173,7 +187,13 @@ async def run_backtest(
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L for the halved quantity
-                    realized = (order.avg_fill_price - st["entry_price"]) * qty
+                    # R9.10: subtract sell-side commission only — the buy
+                    # commission stays attributed to the remaining lot, which
+                    # will pay it on the eventual full exit. Otherwise we'd
+                    # double-charge the entry commission across two trade_log
+                    # rows for a single position.
+                    gross = (order.avg_fill_price - st["entry_price"]) * qty
+                    realized = gross - order.commission_usd
                     cost_basis = st["entry_price"] * qty
                     pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
@@ -354,6 +374,10 @@ async def run_backtest(
                     "entry_score": float(row["score"]),
                     "bars_held": 0,
                     "setup_type": setup,
+                    # R9.10: capture entry commission so the eventual full exit
+                    # subtracts both legs from realized P&L (Kelly avg_payoff
+                    # accuracy). Halve-sells subtract sell-side only.
+                    "entry_commission": order.commission_usd,
                 }
                 state.positions[row["ticker"]] = qty
                 state.opened_today += 1

@@ -1,4 +1,10 @@
-from squeeze_hunter.backtest.gate1 import evaluate_gate1, resolve_thresholds_for_n_trials
+import pandas as pd
+
+from squeeze_hunter.backtest.gate1 import (
+    evaluate_gate1,
+    resolve_thresholds_for_n_trials,
+    setup_type_coverage_warning,
+)
 
 
 def _holdout(**kw):
@@ -70,3 +76,42 @@ def test_gate1_n_trials_30_boundary_uses_strict() -> None:
 def test_gate1_n_trials_31_uses_lax() -> None:
     t = resolve_thresholds_for_n_trials(31)
     assert t.deflated_sharpe_min == 0.0
+
+
+def test_setup_type_coverage_warns_when_only_car_traded() -> None:
+    """R9.2 regression: when f4 (Reddit baseline) and f5 (options OI velocity)
+    are not yet wired, B = z[f4] + z[f5] = 0 universally. The classifier
+    therefore can never produce GME or Mixed labels — Gate 1 silently
+    validates the CAR strategy only. Operators must know this before
+    interpreting a "PASSED" verdict.
+    """
+    trades = pd.DataFrame(
+        [
+            {"side": "buy", "setup_type": "CAR"},
+            {"side": "buy", "setup_type": "CAR"},
+            {"side": "sell", "setup_type": "CAR"},
+        ]
+    )
+    warning = setup_type_coverage_warning(trades)
+    assert warning is not None
+    assert "CAR" in warning
+    # No GME / Mixed entries should be flagged
+    assert "GME" in warning or "Mixed" in warning
+
+
+def test_setup_type_coverage_silent_when_diverse() -> None:
+    """If trades cover all three setups, no warning should fire."""
+    trades = pd.DataFrame(
+        [
+            {"side": "buy", "setup_type": "CAR"},
+            {"side": "buy", "setup_type": "GME"},
+            {"side": "buy", "setup_type": "Mixed"},
+        ]
+    )
+    assert setup_type_coverage_warning(trades) is None
+
+
+def test_setup_type_coverage_silent_when_no_trades() -> None:
+    """Empty trade log: nothing to warn about (the run will already have an
+    empty-equity warning at the report level)."""
+    assert setup_type_coverage_warning(pd.DataFrame(columns=["side", "setup_type"])) is None
