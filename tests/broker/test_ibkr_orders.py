@@ -96,40 +96,93 @@ async def test_get_equity_usd_returns_none_when_no_nav() -> None:
     assert equity is None
 
 
-@pytest.mark.asyncio
-async def test_contracts_carry_primary_exchange() -> None:
-    """R9.6 regression: Stock contracts must include primaryExchange in
-    addition to SMART routing. Without it, ambiguous tickers (e.g., BBBY,
-    SHLD — delisted-then-reused symbols) can route to the wrong venue.
-    """
-    broker = IBKRBroker(client_id=99)
+def _capture_ib_with_qualify(captured: list) -> MagicMock:
+    """Helper: build a fake IB whose qualifyContractsAsync records the contract
+    and whose placeOrder returns a benign trade (so submit_buy/submit_sell run
+    end-to-end)."""
     fake_ib = MagicMock()
     fake_trade = MagicMock()
     fake_trade.order.orderId = 99
     fake_trade.orderStatus.status = "PreSubmitted"
     fake_ib.placeOrder = MagicMock(return_value=fake_trade)
-    captured_contracts: list = []
 
     async def _qualify(contract):
-        captured_contracts.append(contract)
+        captured.append(contract)
 
     fake_ib.qualifyContractsAsync = _qualify
     fake_ib.reqMktData = MagicMock()
-    broker._ib = fake_ib
+    return fake_ib
 
+
+@pytest.mark.asyncio
+async def test_known_nyse_ticker_carries_nyse_primary_exchange() -> None:
+    """R9.6 regression: tickers in _PRIMARY_EXCHANGE_DEFAULTS get the explicit
+    listing exchange so qualifyContractsAsync uniquely matches the contract
+    (avoids picking up a delisted-then-reused shadow contract)."""
+    broker = IBKRBroker(client_id=99)
+    captured: list = []
+    broker._ib = _capture_ib_with_qualify(captured)
     await broker.submit_buy(
-        ticker="BBBY", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+        ticker="GME", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
     )
+    assert len(captured) == 1
+    # GME is in the defaults map as NYSE — must NOT be NASDAQ or empty.
+    assert getattr(captured[0], "primaryExchange", "") == "NYSE", (
+        f"GME contract primaryExchange should be NYSE, got {captured[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_known_nasdaq_ticker_carries_nasdaq_primary_exchange() -> None:
+    """R10.1: tickers KNOWN to list on NASDAQ get the explicit hint so
+    delisted-then-reused symbols (BBBY, etc.) don't match the wrong contract.
+    """
+    broker = IBKRBroker(client_id=99)
+    captured: list = []
+    broker._ib = _capture_ib_with_qualify(captured)
     await broker.submit_sell(
         ticker="BBBY", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
     )
+    assert getattr(captured[0], "primaryExchange", "") == "NASDAQ"
 
-    assert len(captured_contracts) >= 2
-    for c in captured_contracts:
-        # ib-async Stock stores the primaryExchange on the contract.
-        assert getattr(c, "primaryExchange", "") != "", (
-            f"Stock contract missing primaryExchange: {c!r}"
-        )
+
+@pytest.mark.asyncio
+async def test_unknown_ticker_falls_back_to_smart_no_primary_exchange() -> None:
+    """R10.1 regression: tickers WITHOUT an explicit defaults entry must NOT
+    receive a hardcoded primaryExchange — supplying the wrong one (e.g.,
+    NASDAQ for an NYSE-listed F or BAC) makes qualifyContractsAsync return
+    zero matches and the order fails to submit. Plain Stock(t,"SMART","USD")
+    lets SMART auto-disambiguate the safe majority of unambiguous symbols.
+    """
+    broker = IBKRBroker(client_id=99)
+    captured: list = []
+    broker._ib = _capture_ib_with_qualify(captured)
+    await broker.submit_buy(
+        ticker="F", qty=10, limit_price=12.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+    )
+    # Empty / missing primaryExchange is the correct fallback.
+    assert getattr(captured[0], "primaryExchange", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_per_instance_override_wins_over_defaults_and_can_force_blank() -> None:
+    """R10.1: operator-supplied overrides take precedence. An explicit
+    empty-string override forces SMART auto-disambiguation, even for a
+    ticker that has a default entry (e.g., when the operator's account
+    routes differently)."""
+    # Override BBBY (NASDAQ default) to "" → SMART auto-disambiguate.
+    # Override AAPL (no default) to "ARCA" → explicit ARCA primary.
+    broker = IBKRBroker(client_id=99, primary_exchange_overrides={"BBBY": "", "AAPL": "ARCA"})
+    captured: list = []
+    broker._ib = _capture_ib_with_qualify(captured)
+    await broker.submit_buy(
+        ticker="BBBY", qty=10, limit_price=5.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+    )
+    await broker.submit_buy(
+        ticker="AAPL", qty=10, limit_price=200.0, ts=datetime(2026, 5, 14, tzinfo=UTC)
+    )
+    assert getattr(captured[0], "primaryExchange", "") == ""
+    assert getattr(captured[1], "primaryExchange", "") == "ARCA"
 
 
 @pytest.mark.asyncio

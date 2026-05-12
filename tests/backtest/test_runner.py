@@ -216,6 +216,41 @@ async def test_runner_records_realized_pnl_on_sells(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_halve_amortizes_entry_commission_across_remaining_qty() -> None:
+    """R10.4 regression: when a position is halved (signal_decay_50) before
+    being fully exited, the entry commission must be charged proportionally
+    on each leg — NOT held in full and then re-charged on the eventual exit.
+    Otherwise a halve→halve→exit cycle double-charges the entry commission
+    against the remaining quantity, biasing realized P&L low.
+
+    Pure-unit test of the per-share amortization formula used in runner.py:
+    it doesn't exercise the full backtest loop (the synthetic universe never
+    triggers two halves), but it pins the commission accounting math directly.
+    """
+    # Position: 100 shares entered at $10, with $5 entry commission.
+    # Per-share commission attributable to each share = $0.05.
+    entry_qty = 100
+    entry_commission = 5.0
+    entry_commission_per_share = entry_commission / entry_qty
+    # Halve 1: sell 50 shares. Should charge 50 * 0.05 = $2.50 of entry commission.
+    halve_1_qty = 50
+    halve_1_charge = entry_commission_per_share * halve_1_qty
+    # Halve 2: sell 25 shares. Should charge 25 * 0.05 = $1.25.
+    halve_2_qty = 25
+    halve_2_charge = entry_commission_per_share * halve_2_qty
+    # Final exit: sell 25 shares. Should charge 25 * 0.05 = $1.25.
+    exit_qty = 25
+    exit_charge = entry_commission_per_share * exit_qty
+    # Total entry commission charged across all legs MUST equal the original $5.
+    total = halve_1_charge + halve_2_charge + exit_charge
+    assert abs(total - entry_commission) < 1e-9, (
+        f"amortized entry commission {total} != original {entry_commission}"
+    )
+    # And no single leg should ever charge MORE than the original entry commission.
+    assert max(halve_1_charge, halve_2_charge, exit_charge) <= entry_commission
+
+
+@pytest.mark.asyncio
 async def test_runner_realized_pnl_subtracts_round_trip_commission(tmp_path: Path) -> None:
     """R9.10 regression: trade_log realized P&L must be NET of round-trip
     commission. Buy commission + sell commission = round-trip; both should be

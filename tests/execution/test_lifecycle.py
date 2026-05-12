@@ -467,29 +467,38 @@ async def test_lifecycle_cancels_stale_pending_exit_before_resubmitting() -> Non
     that re-evaluates the stop MUST cancel the old order before submitting a
     fresh one. Otherwise the broker carries two live sell orders for the same
     position; if both fill, the position flips short — a serious safety bug.
+
+    R10.3 strengthened: assert the ORDER (cancel-before-submit) explicitly.
+    The earlier assertion just checked both happened, which would still pass
+    if the implementation accidentally submitted FIRST then cancelled —
+    leaving a brief window where the broker holds three live orders.
     """
-    cancel_calls: list[str] = []
+    # R10.3: unified action log records the sequence of broker calls so the
+    # test can pin cancel-BEFORE-submit ordering, not just "both happened".
+    actions: list[tuple[str, str]] = []
 
     async def fake_cancel(order_id):
-        cancel_calls.append(order_id)
+        actions.append(("cancel", order_id))
         return True
+
+    async def fake_submit_sell(ticker, qty, limit_price, ts):
+        actions.append(("submit", "new-order"))
+        return BrokerOrder(
+            broker_order_id="new-order",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status="pending",
+            filled_qty=0,
+            avg_fill_price=None,
+        )
 
     broker = MagicMock()
     broker.fetch_quote = AsyncMock(
         return_value=Quote(ticker="GME", bid=85.0, ask=85.05, last=85.0, timestamp_ns=0)
     )
-    broker.submit_sell = AsyncMock(
-        return_value=BrokerOrder(
-            broker_order_id="new-order",
-            ticker="GME",
-            side="sell",
-            qty=100,
-            limit_price=84.5,
-            status="pending",
-            filled_qty=0,
-            avg_fill_price=None,
-        )
-    )
+    broker.submit_sell = fake_submit_sell
     broker.cancel_order = fake_cancel
 
     state = LifecycleState(
@@ -508,9 +517,13 @@ async def test_lifecycle_cancels_stale_pending_exit_before_resubmitting() -> Non
         }
     )
     await manage_positions(state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
-    # Both stale orders must have been cancelled before the new submit
-    assert "stale-order-1" in cancel_calls
-    assert "stale-order-2" in cancel_calls
+    # R10.3: pin the exact sequence — both cancels MUST come before the submit
+    # so the broker never simultaneously holds the stale orders + the new one.
+    assert actions == [
+        ("cancel", "stale-order-1"),
+        ("cancel", "stale-order-2"),
+        ("submit", "new-order"),
+    ], f"cancel-before-submit ordering violated: {actions}"
     # The new submit replaced them; pending_exits should now reflect the new id only
     assert state.positions["GME"]["pending_exits"] == ["new-order"]
 

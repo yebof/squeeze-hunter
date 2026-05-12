@@ -23,8 +23,13 @@ def deflated_sharpe(
     standard error.  A higher `n_trials` raises the E[SR*] benchmark and thus
     reduces the returned confidence value.
     """
+    # R10.7: with too few observations or no trials, the deflation formula has
+    # nothing meaningful to compute. Returning the raw observed_sr would let
+    # Gate 1 silently "PASS" a degenerate short-window run. Return 0.0 so the
+    # caller's threshold check (gate1.deflated_sharpe_min ≥ 0) trips it as
+    # "insufficient evidence."
     if n_obs < 20 or n_trials < 1:
-        return observed_sr
+        return 0.0
     # Clamp probabilities to (0, 1) so ppf never receives 0 or 1.
     p1 = max(1e-12, min(1 - 1e-12, 1 - 1 / n_trials))
     p2 = max(1e-12, min(1 - 1e-12, 1 - 1 / (n_trials * 2.71828)))

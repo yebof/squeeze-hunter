@@ -58,15 +58,37 @@ def _ibkr_default_account() -> str:
     return os.environ.get("IBKR_ACCOUNT", "")
 
 
-# R9.6: most short-squeeze targets in our universe list on NASDAQ; this is the
-# safe default for new tickers. Names known to list elsewhere are overridden
-# below. Operators trading additional NYSE/AMEX names should add them here
-# (or override at construction via `primary_exchange_overrides`).
-_DEFAULT_PRIMARY_EXCHANGE = "NASDAQ"
+# R9.6 / R10.1: per-ticker primaryExchange disambiguator. Stock("X","SMART","USD")
+# without primaryExchange is ambiguous when more than one contract on TWS shares
+# the symbol (e.g., a delisted-then-reused ticker like BBBY). When we KNOW the
+# listing exchange, supplying primaryExchange forces the right contract.
+#
+# IMPORTANT (R10.1): supplying the WRONG primaryExchange (e.g., "NASDAQ" for a
+# NYSE-listed name) makes qualifyContractsAsync return zero matches — orders
+# fail to submit. So we DO NOT set a hardcoded module-wide default. Tickers
+# not in the defaults map (or per-instance override map) fall back to plain
+# Stock(t,"SMART","USD") and rely on SMART's auto-disambiguation. That matches
+# the pre-R9 behavior for the vast majority of unambiguous symbols and only
+# adds explicit hints where we know the listing.
+#
+# Operators trading names with known ambiguity should populate
+# `primary_exchange_overrides` at IBKRBroker construction (or extend the
+# module-level map below) — including the explicit value "" to force SMART
+# auto-disambiguation when overriding a default would otherwise mis-route.
 _PRIMARY_EXCHANGE_DEFAULTS: dict[str, str] = {
+    # Known NYSE-listed squeeze candidates (per R9.6 universe survey).
     "GME": "NYSE",
     "AMC": "NYSE",
     "RBLX": "NYSE",
+    # Known NASDAQ-listed names with reused/recycled-symbol ambiguity history
+    # — explicit hint avoids matching a delisted shadow contract.
+    "BBBY": "NASDAQ",
+    "BYND": "NASDAQ",
+    "HTZ": "NASDAQ",
+    "KOSS": "NASDAQ",
+    "COIN": "NASDAQ",
+    "DJT": "NASDAQ",
+    "HOOD": "NASDAQ",
 }
 
 
@@ -77,31 +99,31 @@ class IBKRBroker:
     port: int = field(default_factory=_ibkr_default_port)
     client_id: int = field(default_factory=_ibkr_default_client_id)
     account: str = field(default_factory=_ibkr_default_account)
-    # R9.6: per-ticker primaryExchange. Stock("X","SMART","USD") without
-    # primaryExchange is ambiguous when more than one contract on TWS shares
-    # the symbol (e.g., a delisted-then-reused ticker like BBBY). qualifyContracts
-    # may then match the wrong contract or fail outright. We set primaryExchange
-    # on every Stock — SMART still does the routing, primaryExchange is just
-    # the disambiguator. Operators can extend the map per-deployment.
+    # R9.6 / R10.1: optional per-instance override map. Takes precedence over
+    # _PRIMARY_EXCHANGE_DEFAULTS. Set to "" to FORCE SMART auto-disambiguation
+    # for a ticker that would otherwise pick up a default value.
     primary_exchange_overrides: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self: IBKRBroker) -> None:
         self._ib = IB()
 
     def _make_stock(self: IBKRBroker, ticker: str) -> Stock:
-        """R9.6: build a Stock contract with a non-ambiguous primaryExchange.
+        """R9.6 / R10.1: build a Stock contract, attaching primaryExchange ONLY
+        when we have an explicit value for this ticker. Tickers without an
+        entry get plain `Stock(t,"SMART","USD")` so SMART can pick the right
+        listing — a wrong primaryExchange makes qualifyContractsAsync fail.
 
-        Lookup order: per-instance overrides > module-level defaults > NASDAQ.
-        Returning a `Stock(ticker, "SMART", "USD", primaryExchange=...)` keeps
-        SMART routing intact while ensuring TWS uniquely identifies the
-        contract during qualification.
+        Lookup order: per-instance overrides > module-level defaults > none.
+        An explicit empty-string override (e.g., `{"GME": ""}`) forces no
+        primaryExchange even if the ticker is in the defaults map.
         """
-        primary = (
-            self.primary_exchange_overrides.get(ticker)
-            or _PRIMARY_EXCHANGE_DEFAULTS.get(ticker)
-            or _DEFAULT_PRIMARY_EXCHANGE
-        )
-        return Stock(ticker, "SMART", "USD", primaryExchange=primary)
+        if ticker in self.primary_exchange_overrides:
+            primary = self.primary_exchange_overrides[ticker]
+        else:
+            primary = _PRIMARY_EXCHANGE_DEFAULTS.get(ticker, "")
+        if primary:
+            return Stock(ticker, "SMART", "USD", primaryExchange=primary)
+        return Stock(ticker, "SMART", "USD")
 
     async def connect(self: IBKRBroker) -> None:
         log.info("connecting", host=self.host, port=self.port)

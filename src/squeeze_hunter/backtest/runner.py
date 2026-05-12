@@ -154,13 +154,13 @@ async def run_backtest(
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L so Kelly observed-trades counter works
-                    # R9.10: subtract round-trip commissions so trade_log reflects
-                    # net P&L. Buy commission was captured on entry into
-                    # `entry_commission`; sell commission is on this order. Without
-                    # this Kelly's avg_payoff is biased optimistic by ~1bp/leg,
-                    # tiny per trade but compounding over the backtest.
+                    # R9.10 + R10.4: subtract per-share entry commission * qty
+                    # plus this leg's sell commission. The per-share form means a
+                    # halve-then-exit cycle charges the entry commission exactly
+                    # once across legs, not double-counted on the final exit.
                     gross = (order.avg_fill_price - st["entry_price"]) * qty
-                    realized = gross - st.get("entry_commission", 0.0) - order.commission_usd
+                    entry_comm_share = st.get("entry_commission_per_share", 0.0)
+                    realized = gross - entry_comm_share * qty - order.commission_usd
                     # R7.C3+C4: record pct return for Kelly's b. Dollar PnL biases
                     # avg_payoff toward larger-cap trades; pct normalizes across
                     # position sizes and is invariant to equity growth.
@@ -187,13 +187,14 @@ async def run_backtest(
                 if qty > 0:
                     order = await broker.submit_sell(ticker, qty, last.close, cur)
                     # C2: compute realized P&L for the halved quantity
-                    # R9.10: subtract sell-side commission only — the buy
-                    # commission stays attributed to the remaining lot, which
-                    # will pay it on the eventual full exit. Otherwise we'd
-                    # double-charge the entry commission across two trade_log
-                    # rows for a single position.
+                    # R9.10 + R10.4: charge proportional entry commission for THIS
+                    # leg's qty, plus this leg's sell commission. The remaining
+                    # qty still carries its share of the entry commission via
+                    # `entry_commission_per_share`, so the final exit charges
+                    # only the leftover portion.
                     gross = (order.avg_fill_price - st["entry_price"]) * qty
-                    realized = gross - order.commission_usd
+                    entry_comm_share = st.get("entry_commission_per_share", 0.0)
+                    realized = gross - entry_comm_share * qty - order.commission_usd
                     cost_basis = st["entry_price"] * qty
                     pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
@@ -367,6 +368,15 @@ async def run_backtest(
                         "setup_type": setup,
                     }
                 )
+                # R10.4: store per-share entry commission so each subsequent
+                # sell (halve OR full exit) can charge a proportional share.
+                # Storing the lump-sum entry commission and only deducting it
+                # on the final exit double-charged the commission on
+                # halve→halve→exit cycles (the lump kept getting re-charged
+                # against the shrinking remainder). qty>0 was already
+                # validated above (line 336: `qty = max(1, ...)`), so the
+                # division is safe.
+                entry_commission_per_share = order.commission_usd / qty
                 open_states[row["ticker"]] = {
                     "entry_price": order.avg_fill_price,
                     "peak": order.avg_fill_price,
@@ -374,10 +384,10 @@ async def run_backtest(
                     "entry_score": float(row["score"]),
                     "bars_held": 0,
                     "setup_type": setup,
-                    # R9.10: capture entry commission so the eventual full exit
-                    # subtracts both legs from realized P&L (Kelly avg_payoff
-                    # accuracy). Halve-sells subtract sell-side only.
-                    "entry_commission": order.commission_usd,
+                    # R9.10 + R10.4: per-share entry commission. Each sell
+                    # multiplies by sold-qty, so halve→halve→exit charges the
+                    # full entry commission exactly once across the legs.
+                    "entry_commission_per_share": entry_commission_per_share,
                 }
                 state.positions[row["ticker"]] = qty
                 state.opened_today += 1

@@ -212,6 +212,14 @@ class RuntimeContext:
     # tick the triggering input recovered.
     _kill_first_tripped_at: datetime | None = None
     _kill_cooldown_days: int = 7
+    # R10.2: track every distinct reason label that has been set on the
+    # killswitch Prometheus gauge during the current trip cycle. Prometheus
+    # gauges with labels are SEPARATE time series per label value, so when the
+    # trip reason transitions (e.g., monthly_drawdown → data_stale) we leave
+    # the prior label's gauge stuck at 1.0 unless we explicitly reset all of
+    # them on clear. Repopulated each cycle; cleared on auto-clear / manual
+    # reset together with the gauges themselves.
+    _active_kill_reasons: set[str] = field(default_factory=set)
     telemetry: PortfolioTelemetry = field(default_factory=PortfolioTelemetry)
     # Populated by nightly_scan; read by premarket_verify the next morning.
     last_candidates: pd.DataFrame | None = None
@@ -445,7 +453,10 @@ class RuntimeContext:
         if in_sticky_window:
             self.kill_switch_active = True
             if self.metrics_registry:
-                self.metrics_registry.set_kill_switch_active(self._kill_reason or "cooldown")
+                reason = self._kill_reason or "cooldown"
+                self.metrics_registry.set_kill_switch_active(reason)
+                # R10.2: track every reason label set during the cycle.
+                self._active_kill_reasons.add(reason)
             return
 
         was_active = self.kill_switch_active
@@ -457,16 +468,24 @@ class RuntimeContext:
                 self._kill_first_tripped_at = now
                 log.warning("killswitch_tripped", reason=ks.reason)
             if self.metrics_registry:
-                self.metrics_registry.set_kill_switch_active(ks.reason or "unknown")
+                reason = ks.reason or "unknown"
+                self.metrics_registry.set_kill_switch_active(reason)
+                # R10.2: remember every reason that was active in this cycle so
+                # the eventual clear resets ALL of them. The trip reason can
+                # transition mid-cycle (drawdown → data_stale) and Prometheus
+                # tracks each labeled time series separately.
+                self._active_kill_reasons.add(reason)
         elif self._kill_first_tripped_at is not None:
             # Conditions cleared — close the trip cycle so the next fresh trip
             # opens a new cooldown window.
             log.info("killswitch_cleared", prior_reason=self._kill_reason)
-            # R9.4: also reset the Prometheus gauge to 0.0 so Grafana reflects
-            # the current state. Without this, the gauge stuck at 1.0 forever
-            # after the first trip, eroding ops trust in the dashboard.
-            if self.metrics_registry is not None and self._kill_reason is not None:
-                self.metrics_registry.set_kill_switch_inactive(self._kill_reason)
+            # R9.4 + R10.2: reset every reason label that was active during the
+            # cycle so Grafana shows all gauges back at 0.0. Resetting only the
+            # most-recent reason left earlier reasons stuck at 1.0 forever.
+            if self.metrics_registry is not None:
+                for reason in self._active_kill_reasons:
+                    self.metrics_registry.set_kill_switch_inactive(reason)
+            self._active_kill_reasons.clear()
             self._kill_first_tripped_at = None
 
     def reset_killswitch(self: RuntimeContext) -> None:
@@ -483,10 +502,13 @@ class RuntimeContext:
                 self._kill_first_tripped_at.isoformat() if self._kill_first_tripped_at else None
             ),
         )
-        # R9.4: also reset the Prometheus gauge so Grafana reflects the manual
-        # reset. Matches the auto-clear path above.
-        if self.metrics_registry is not None and self._kill_reason is not None:
-            self.metrics_registry.set_kill_switch_inactive(self._kill_reason)
+        # R9.4 + R10.2: reset every reason label set during the cycle so Grafana
+        # reflects the manual reset. Resetting only `_kill_reason` would leave
+        # any earlier transition-reason stuck at 1.0.
+        if self.metrics_registry is not None:
+            for reason in self._active_kill_reasons:
+                self.metrics_registry.set_kill_switch_inactive(reason)
+        self._active_kill_reasons.clear()
         self._kill_first_tripped_at = None
         self.kill_switch_active = False
         self._kill_reason = None

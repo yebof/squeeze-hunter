@@ -46,6 +46,44 @@ def _seed(cache: ParquetCache) -> None:
 
 
 @pytest.mark.asyncio
+async def test_killswitch_clear_resets_all_active_reasons(tmp_path: Path) -> None:
+    """R10.2 regression: when the killswitch trips with reason 'A', then
+    underlying conditions transition so the trip reason becomes 'B', the
+    Prometheus gauge has TWO labeled time series at 1.0 (one per reason).
+    R9.4's clear path only reset the most-recent reason, leaving 'A' stuck
+    at 1.0 forever — defeating the whole point of the metric reset.
+    Track every reason that's been set during a trip cycle and reset all
+    of them on clear / manual reset.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    rc = RuntimeContext(cache=cache, settings=Settings(), tickers=["GME"], mode="sim")
+    await rc.setup()
+    assert rc.metrics_registry is not None
+
+    # Simulate two reasons being set during the same trip cycle.
+    rc.metrics_registry.set_kill_switch_active("monthly_drawdown")
+    rc._active_kill_reasons.add("monthly_drawdown")
+    rc.metrics_registry.set_kill_switch_active("data_stale")
+    rc._active_kill_reasons.add("data_stale")
+    rendered = rc.metrics_registry.render()
+    assert 'sh_kill_switch_active{reason="monthly_drawdown"} 1.0' in rendered
+    assert 'sh_kill_switch_active{reason="data_stale"} 1.0' in rendered
+
+    # Now clear via manual reset: BOTH reasons must drop to 0.0.
+    rc._kill_first_tripped_at = datetime(2026, 5, 11, tzinfo=UTC)
+    rc.kill_switch_active = True
+    rc._kill_reason = "data_stale"
+    rc.reset_killswitch()
+    rendered = rc.metrics_registry.render()
+    assert 'sh_kill_switch_active{reason="monthly_drawdown"} 0.0' in rendered, (
+        "earlier reason 'monthly_drawdown' still stuck at 1.0 — "
+        "clear path must reset ALL active reasons, not just the latest"
+    )
+    assert 'sh_kill_switch_active{reason="data_stale"} 0.0' in rendered
+
+
+@pytest.mark.asyncio
 async def test_setup_propagates_yaml_stops_into_lifecycle_state(tmp_path: Path) -> None:
     """R9.1 regression: YAML stops settings (hard_stop, trailing_*, time_stop_days,
     signal_decay_*) must reach LifecycleState so paper/live use the operator's

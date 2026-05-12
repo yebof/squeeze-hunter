@@ -84,6 +84,10 @@ def test_setup_type_coverage_warns_when_only_car_traded() -> None:
     therefore can never produce GME or Mixed labels — Gate 1 silently
     validates the CAR strategy only. Operators must know this before
     interpreting a "PASSED" verdict.
+
+    R10.8 strengthened: the warning text MUST surface BOTH missing setups
+    (GME and Mixed), not just one. The earlier `or` assertion would have
+    silently passed if a regression dropped one of them from the message.
     """
     trades = pd.DataFrame(
         [
@@ -94,9 +98,11 @@ def test_setup_type_coverage_warns_when_only_car_traded() -> None:
     )
     warning = setup_type_coverage_warning(trades)
     assert warning is not None
-    assert "CAR" in warning
-    # No GME / Mixed entries should be flagged
-    assert "GME" in warning or "Mixed" in warning
+    assert "CAR" in warning, "warning must reference the covered setup"
+    # R10.8: BOTH missing setups must appear in the warning text. A test that
+    # accepted "GME OR Mixed" would silently pass a regression that omitted one.
+    assert "GME" in warning, f"warning must flag missing GME: {warning!r}"
+    assert "Mixed" in warning, f"warning must flag missing Mixed: {warning!r}"
 
 
 def test_setup_type_coverage_silent_when_diverse() -> None:

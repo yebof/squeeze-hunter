@@ -15,10 +15,23 @@ def daily_returns(equity: pd.Series) -> pd.Series:
 def annualized_return(equity: pd.Series) -> float:
     if len(equity) < 2:
         return 0.0
-    total = equity.iloc[-1] / equity.iloc[0] - 1
+    start = float(equity.iloc[0])
+    # R10.5: a zero or negative starting equity makes the total-return ratio
+    # undefined (division by zero or sign-flipping). Bail to 0.0 — there's
+    # no meaningful annualized return to report from a degenerate series.
+    if start <= 0:
+        return 0.0
+    total = float(equity.iloc[-1]) / start - 1
     days = (equity.index[-1] - equity.index[0]).days
     if days <= 0:
         return 0.0
+    # R10.6: clamp to -1.0 when the period loss exceeds 100% (1+total <= 0).
+    # `(negative) ** fractional` returns NaN, which silently corrupts every
+    # downstream metric that compares to a threshold (NaN < x is False, so
+    # Gate 1 silently "passes" a blow-up). The financial convention is that
+    # losing 100%+ over a period == lost everything; report -1.0.
+    if 1 + total <= 0:
+        return -1.0
     return (1 + total) ** (365.25 / days) - 1
 
 

@@ -15,7 +15,20 @@ def build_universe(rows: pd.DataFrame, as_of: date, cfg: UniverseCfg) -> pd.Data
     reasons = []
     included = []
     for _, r in out.iterrows():
-        if r["market_cap"] < cfg.min_market_cap:
+        # R10.10: reject data-quality red flags (non-positive price or market
+        # cap) BEFORE the configured floor checks. The floor checks would
+        # already reject them by accident with realistic min_price /
+        # min_market_cap settings, but a custom cfg with a 0-floor would let
+        # delisted/halted rows through to the scan, where zero prices divide
+        # by zero in factor computation. A distinct reason also helps ops
+        # distinguish "bad data" from "below threshold."
+        if not (r["close"] > 0):
+            reasons.append("price_nonpositive")
+            included.append(False)
+        elif not (r["market_cap"] > 0):
+            reasons.append("market_cap_nonpositive")
+            included.append(False)
+        elif r["market_cap"] < cfg.min_market_cap:
             reasons.append("market_cap_below_floor")
             included.append(False)
         elif r["market_cap"] > cfg.max_market_cap:

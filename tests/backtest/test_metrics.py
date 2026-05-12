@@ -139,6 +139,42 @@ def test_sharpe_returns_zero_for_one_point_curve() -> None:
     assert sr == 0.0
 
 
+def test_annualized_return_safe_when_starting_equity_is_zero() -> None:
+    """R10.5 regression: dividing by `equity.iloc[0]` blows up when the first
+    value is 0 (e.g., a degenerate config that starts with zero cash, or a
+    crash-to-zero series fed in by a buggy upstream). Guard returns 0.0.
+    """
+    from squeeze_hunter.backtest.metrics import annualized_return
+
+    eq = pd.Series(
+        [0.0, 50_000.0, 60_000.0],
+        index=pd.date_range("2024-01-01", periods=3, freq="B"),
+    )
+    ar = annualized_return(eq)
+    assert ar == 0.0
+    assert np.isfinite(ar)
+
+
+def test_annualized_return_safe_when_total_return_below_neg_one() -> None:
+    """R10.6 regression: `(1 + total) ** (365.25/days)` produces NaN when
+    `1 + total <= 0` (loss exceeds 100%). Backtest can't normally produce
+    this in long-only mode, but a leveraged/options bug or a malformed
+    input series should not corrupt downstream metrics with NaN.
+    """
+    from squeeze_hunter.backtest.metrics import annualized_return
+
+    # Final value < 0 → total = -1.5; (1 + total) = -0.5; (-0.5)**fractional → NaN
+    eq = pd.Series(
+        [100_000.0, -50_000.0],
+        index=pd.date_range("2024-01-01", periods=2, freq="B"),
+    )
+    ar = annualized_return(eq)
+    assert np.isfinite(ar), f"annualized_return must be finite for total<=-1, got {ar!r}"
+    # Convention: a -100%-or-worse outcome over the period clamps to -1.0
+    # (lost everything; cannot be more negative for compounding-return purposes).
+    assert ar == pytest.approx(-1.0)
+
+
 def test_sortino_returns_zero_for_two_point_curve_one_downside() -> None:
     """R4.6 regression: same NaN-vs-zero gap on the downside std."""
     from squeeze_hunter.backtest.metrics import sortino
