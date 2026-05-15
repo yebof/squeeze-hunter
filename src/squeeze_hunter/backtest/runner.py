@@ -53,6 +53,11 @@ async def run_backtest(
     trade_log: list[dict] = []
     equity_series: list[tuple[datetime, float]] = []
     daily_rows: list[dict] = []
+    # CDX-P1-1: entries decided by day T's scan are NOT filled on day T (that
+    # would be same-day-close lookahead — the scan saw T's close+volume). They
+    # are queued here and executed at day T+1's OPEN, mirroring production:
+    # nightly scan after T close → premarket-verify T+1 morning → entry ≈ open.
+    pending_entries: list[dict] = []
     # R7.C2: per-day equity series for the killswitch input. We track daily
     # closes here and feed evaluate_killswitch each day so the backtest
     # discovers strategies that would have tripped the killswitch live.
@@ -104,6 +109,54 @@ async def run_backtest(
         cur: datetime = cur_ts.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
         clock.advance_to(cur)
 
+        # 0) CDX-P1-1: execute entries decided by the PREVIOUS day's scan, at
+        #    TODAY's OPEN. This mirrors production timing (nightly scan on the
+        #    prior close → premarket-verify this morning → fill near the open)
+        #    and removes the same-day-close lookahead. If the killswitch tripped
+        #    overnight, drop the queued entries — premarket would have
+        #    suppressed them too.
+        if pending_entries and not kill_active:
+            for entry in pending_entries:
+                t = str(entry["ticker"])
+                try:
+                    ebars = await provider.fetch_bars(t, cur - timedelta(days=2), cur)
+                except LookupError:
+                    continue
+                if not ebars:
+                    # No bar today (halt / delist) → the entry can't fill; drop it.
+                    continue
+                fill_px = ebars[-1].open
+                if fill_px <= 0:
+                    continue
+                eqty = max(1, int(entry["size_usd"] // fill_px))
+                eorder = await broker.submit_buy(t, eqty, fill_px, cur)
+                trade_log.append(
+                    {
+                        "ts": cur,
+                        "ticker": t,
+                        "side": "buy",
+                        "qty": eqty,
+                        "price": eorder.avg_fill_price,
+                        "reason": "entry",
+                        "score": entry["score"],
+                        "setup_type": entry["setup_type"],
+                    }
+                )
+                # R10.4: per-share entry commission so halve/exit legs each
+                # charge a proportional share exactly once.
+                open_states[t] = {
+                    "entry_price": eorder.avg_fill_price,
+                    "peak": eorder.avg_fill_price,
+                    "current_score": entry["score"],
+                    "entry_score": entry["score"],
+                    "bars_held": 0,
+                    "setup_type": entry["setup_type"],
+                    "entry_commission_per_share": eorder.commission_usd / eqty,
+                }
+        # Always clear — queued entries are good for exactly one next-day fill
+        # attempt; an unfilled (halted) name re-ranks on its own merits.
+        pending_entries = []
+
         # 1) Scan for today's ranked candidates (must happen BEFORE stop evaluation
         #    so we can refresh current_score — I9 fix)
         ranked = await run_scan(cfg.tickers, provider, cur, settings)
@@ -117,6 +170,11 @@ async def run_backtest(
 
         # 2) Manage open positions (evaluate stops with fresh current_score)
         marks: dict[str, float] = {}
+        # CDX-P1-2: per-position worst intraday gap (low vs entry) for EVERY
+        # ticker processed today — including same-day exits — so the
+        # killswitch gap-through-stop arm (step 4) sees the real intraday
+        # blowup, not the recovered close. Populated below; consumed in step 4.
+        intraday_gap_by_ticker: dict[str, float] = {}
         tickers_to_remove: list[str] = []
         for ticker in list(open_states):
             try:
@@ -126,21 +184,36 @@ async def run_backtest(
             if not bars:
                 continue
             last = bars[-1]
-            marks[ticker] = last.close
+            marks[ticker] = last.close  # surviving positions are marked at close
             st = open_states[ticker]
             st["bars_held"] += 1
+            # Peak tracks the running max of CLOSES (multi-day high-water mark).
+            # We deliberately do NOT fold today's intraday HIGH into the peak:
+            # combining today's high with today's low would manufacture a
+            # same-day round-trip the live daemon wouldn't necessarily see
+            # (price order within the day is unknown from a daily bar).
             st["peak"] = max(st["peak"], last.close)
+            entry_px = st["entry_price"]
+            if entry_px > 0:
+                intraday_gap_by_ticker[ticker] = (last.low - entry_px) / entry_px
             stop_state = StopState(
-                entry_price=st["entry_price"],
+                entry_price=entry_px,
                 peak_price=st["peak"],
                 current_score=st.get("current_score", st["entry_score"]),
                 entry_score=st["entry_score"],
                 bars_held=st["bars_held"],
                 setup_type=st["setup_type"],
             )
+            # CDX-P1-2: evaluate the PRICE arms (hard / trailing) against the
+            # day's LOW, not the close. The live 60s lifecycle daemon ticks
+            # intraday — a position that craters to -30% and recovers to a
+            # flat close WOULD have been stopped out live. Feeding only the
+            # close made Gate 1 blind to intraday blowups (optimistic). The
+            # time-stop and signal-decay arms are price-independent so the low
+            # doesn't distort them.
             sig = evaluate_stops(
                 stop_state,
-                current_price=last.close,
+                current_price=last.low,
                 hard_stop=hard_stop,
                 time_stop_bars=time_stop_bars,
                 signal_decay_halve=signal_decay_halve,
@@ -149,10 +222,16 @@ async def run_backtest(
                 trailing_gme=trailing_gme,
                 trailing_mixed=trailing_mixed,
             )
+            # CDX-P1-2: price-triggered exits filled at the conservative day
+            # LOW (you don't get the recovered close if you stopped out at the
+            # intraday plunge). Non-price exits (time stop / signal decay) are
+            # not tied to the plunge, so they fill at the close.
+            price_triggered = sig.reason in {"hard_stop", "trailing_stop"}
+            exit_fill_px = last.low if price_triggered else last.close
             if sig.action == "exit":
                 qty = broker.position_qty(ticker)
                 if qty > 0:
-                    order = await broker.submit_sell(ticker, qty, last.close, cur)
+                    order = await broker.submit_sell(ticker, qty, exit_fill_px, cur)
                     # C2: compute realized P&L so Kelly observed-trades counter works
                     # R9.10 + R10.4: subtract per-share entry commission * qty
                     # plus this leg's sell commission. The per-share form means a
@@ -185,7 +264,8 @@ async def run_backtest(
             elif sig.action == "halve":
                 qty = broker.position_qty(ticker) // 2
                 if qty > 0:
-                    order = await broker.submit_sell(ticker, qty, last.close, cur)
+                    # signal_decay_half is not price-triggered → fill at close.
+                    order = await broker.submit_sell(ticker, qty, exit_fill_px, cur)
                     # C2: compute realized P&L for the halved quantity
                     # R9.10 + R10.4: charge proportional entry commission for THIS
                     # leg's qty, plus this leg's sell commission. The remaining
@@ -350,51 +430,27 @@ async def run_backtest(
                 if not gate.accepted:
                     continue
                 size_usd = gate.adjusted_size_usd or target_size
-                bars = await provider.fetch_bars(row["ticker"], cur - timedelta(days=2), cur)
-                if not bars:
-                    continue
-                px = bars[-1].close
-                qty = max(1, int(size_usd // px))
-                order = await broker.submit_buy(row["ticker"], qty, px, cur)
-                trade_log.append(
+                # CDX-P1-1: do NOT fill here. The scan ran on TODAY's full bar
+                # (the production nightly scan likewise runs after the close).
+                # Filling at today's close on info that includes today's close
+                # is same-day lookahead and optimistically pollutes Gate 1.
+                # Queue the proposal; step 0 of the NEXT trading day fills it
+                # at that day's open (premarket-verify → open entry).
+                pending_entries.append(
                     {
-                        "ts": cur,
                         "ticker": row["ticker"],
-                        "side": "buy",
-                        "qty": qty,
-                        "price": order.avg_fill_price,
-                        "reason": "entry",
+                        "size_usd": size_usd,
                         "score": float(row["score"]),
                         "setup_type": setup,
                     }
                 )
-                # R10.4: store per-share entry commission so each subsequent
-                # sell (halve OR full exit) can charge a proportional share.
-                # Storing the lump-sum entry commission and only deducting it
-                # on the final exit double-charged the commission on
-                # halve→halve→exit cycles (the lump kept getting re-charged
-                # against the shrinking remainder). qty>0 was already
-                # validated above (line 336: `qty = max(1, ...)`), so the
-                # division is safe.
-                entry_commission_per_share = order.commission_usd / qty
-                open_states[row["ticker"]] = {
-                    "entry_price": order.avg_fill_price,
-                    "peak": order.avg_fill_price,
-                    "current_score": float(row["score"]),
-                    "entry_score": float(row["score"]),
-                    "bars_held": 0,
-                    "setup_type": setup,
-                    # R9.10 + R10.4: per-share entry commission. Each sell
-                    # multiplies by sold-qty, so halve→halve→exit charges the
-                    # full entry commission exactly once across the legs.
-                    "entry_commission_per_share": entry_commission_per_share,
-                }
-                state.positions[row["ticker"]] = qty
+                # Reserve the slot in the in-loop gate state so additional
+                # candidates from THIS SAME scan see the cumulative exposure
+                # (R6: 3 candidates must not each independently pass the 90%
+                # cap). qty is unknown until the open fill; 0 is enough to make
+                # `ticker in state.positions` reject a duplicate this scan.
+                state.positions[row["ticker"]] = 0
                 state.opened_today += 1
-                # R6: update gross_exposure_pct so the next gate evaluation in
-                # this same daily loop sees the cumulative exposure. Without
-                # this, three new entries can each pass the gate when they
-                # would collectively breach the 90% cap.
                 state.gross_exposure_pct += size_usd / state.equity_usd
 
         # 4) Mark-to-market end of day
@@ -405,19 +461,14 @@ async def run_backtest(
         # R7.C2: evaluate the killswitch against the per-day equity series.
         # Strategy realism: if a strategy would have tripped live, it must
         # also be locked-out in backtest so Gate 1 sees the same behavior.
-        # R8.Q-I7: compute worst per-position gap from today's intraday low
-        # vs entry so the gap-through-stop killswitch arm is actually
-        # exercised in backtest. Without this, a single-position blowup of
-        # -25%+ silently passes Gate 1.
+        # R8.Q-I7 / CDX-P1-2: the worst per-position gap is the INTRADAY LOW
+        # vs entry, computed in step 2 into `intraday_gap_by_ticker` for every
+        # ticker processed today (survivors AND same-day exits). The prior code
+        # read `marks` (today's CLOSE) here despite the comment claiming
+        # intraday low — a -30% intraday plunge that closed flat silently
+        # passed Gate 1's gap-through-stop arm.
         worst_gap = 0.0
-        for ticker, st in open_states.items():
-            entry = st["entry_price"]
-            if entry <= 0:
-                continue
-            low = marks.get(ticker)  # marks already holds today's close
-            if low is None or low <= 0:
-                continue
-            gap = (low - entry) / entry
+        for gap in intraday_gap_by_ticker.values():
             if gap < worst_gap:
                 worst_gap = gap
         kill_inputs = _build_killswitch_inputs(

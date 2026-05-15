@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# CDX-P2-6: domain + partition_key are concatenated into a filesystem path and
+# both can carry operator-edited / external strings (universe tickers flow
+# straight into partition keys). Restrict to a safe charset and explicitly
+# reject the parent-dir token so a key like "../../etc/foo" can't read or
+# write parquet outside the cache root. The allowed set covers everything the
+# codebase actually uses: tickers (incl. dotted BRK.B), ISO dates
+# (2024-05-13), and `{ticker}__{date}` composite keys.
+_SAFE_PARTITION_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_path_component(kind: str, value: str) -> None:
+    if not value or not _SAFE_PARTITION_RE.match(value) or ".." in value:
+        raise ValueError(
+            f"unsafe {kind} {value!r}: must match [A-Za-z0-9._-]+ and contain no '..' "
+            "(path-traversal guard)"
+        )
 
 
 @dataclass
@@ -16,6 +34,8 @@ class ParquetCache:
     dedup_keys: list[str] = field(default_factory=list)
 
     def _path(self: ParquetCache, domain: str, partition_key: str) -> Path:
+        _validate_path_component("domain", domain)
+        _validate_path_component("partition_key", partition_key)
         return self.root / domain / f"{partition_key}.parquet"
 
     def write_partition(

@@ -37,11 +37,25 @@ class FinraProvider:
         ticker: str,
         since: date | None = None,
     ) -> list[ShortInterest]:
-        """Fetch the most recent 4 reports (covers ~2 months)."""
+        """Fetch every biweekly report from `since` to today.
+
+        CDX-P2-5: this previously hardcoded the trailing ~3 months
+        (`range(0, 3)`), so a historical backfill that passes
+        `since=date(2018, 1, 1)` only ever got the last quarter of data and
+        f1/f2 were dead for years of any multi-year backtest. We now iterate
+        EVERY month from `since` to the current month. When `since` is None
+        (live/no-history use) we keep the lightweight trailing-3-month window.
+        """
         today = date.today()
+        # Inclusive month count from `since` to today. None → trailing 3.
+        if since is None:
+            n_months = 3
+        else:
+            n_months = (today.year - since.year) * 12 + (today.month - since.month) + 1
+            n_months = max(1, n_months)
         results: list[ShortInterest] = []
         candidates: list[tuple[str, str]] = []
-        for months_back in range(0, 3):
+        for months_back in range(0, n_months):
             year = today.year
             month = today.month - months_back
             while month <= 0:

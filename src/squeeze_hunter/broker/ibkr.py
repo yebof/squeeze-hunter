@@ -234,6 +234,22 @@ class IBKRBroker:
                 return True
         return False
 
+    async def get_position_qty(self: IBKRBroker, ticker: str) -> int:
+        """CDX-P1-3: authoritative broker-side held quantity for `ticker`.
+
+        ib-async maintains IB.positions() from TWS push events; right after
+        connect the snapshot may be empty, so callers that need a guaranteed
+        fresh view should reqPositionsAsync() first (lifecycle does that via
+        the reconcile path / emergency-flatten does it explicitly). We sum
+        across any position rows whose contract symbol matches (a ticker
+        normally has exactly one US-equity position row).
+        """
+        total = 0
+        for pos in self._ib.positions():
+            if getattr(pos.contract, "symbol", None) == ticker:
+                total += int(pos.position)
+        return total
+
     async def get_open_orders(self: IBKRBroker) -> list[BrokerOrder]:
         out = []
         for trade in self._ib.openTrades():

@@ -57,13 +57,23 @@ async def compute_all_factors(
     frames = []
     for (name, _fn), result in zip(factor_fns, results, strict=True):
         if isinstance(result, BaseException):
-            log.warning(
-                "factor_compute_failed",
-                factor=name,
-                err=str(result),
-                err_type=type(result).__name__,
-            )
-            continue
+            # CDX-P2-4: only TRANSIENT I/O failures degrade gracefully (log +
+            # skip the factor, the rest still contribute). Programming /
+            # contract errors (AttributeError, TypeError, NotImplementedError,
+            # KeyError, ValueError) and cancellation MUST propagate per
+            # CLAUDE.md — the prior blanket `isinstance(result, BaseException)`
+            # swallowed a renamed-attr / wrong-signature bug into a quietly
+            # smaller factor set and a wrong score. Re-raise everything that
+            # isn't a known transient.
+            if isinstance(result, ConnectionError | TimeoutError | OSError):
+                log.warning(
+                    "factor_compute_failed",
+                    factor=name,
+                    err=str(result),
+                    err_type=type(result).__name__,
+                )
+                continue
+            raise result
         f: Factor = result  # type: ignore[assignment]
         if f.values.empty:
             continue

@@ -120,10 +120,63 @@ async def _process_one_position(
     if sig.action == "hold":
         return
     if sig.action in {"halve", "exit"}:
+        stale_pending: list[str] = list(meta.get("pending_exits", []))
+        # CDX-P1-3: reconcile a stale pending exit against the broker's REAL
+        # position BEFORE cancelling/resubmitting. A stale order that filled
+        # between ticks is gone from open orders — cancel_order just returns
+        # False without error — and R9.3's blind full-qty resubmit would then
+        # SHORT an already-flat account. The broker's position is the
+        # authoritative truth; meta["qty"] is a local mirror that can lag.
+        if stale_pending:
+            try:
+                broker_qty = await broker.get_position_qty(ticker)
+            except _TRANSIENT_FETCH_ERRORS as e:
+                # Can't confirm broker state → conservative: do NOT resubmit
+                # a full-size sell this tick (shorting risk). Next tick retries.
+                log.warning(
+                    "lifecycle_reconcile_failed",
+                    ticker=ticker,
+                    err=str(e),
+                    err_type=type(e).__name__,
+                    note="pending exit not reconciled; skipping resubmit this tick",
+                )
+                return
+            if broker_qty <= 0:
+                # Prior exit fully filled — broker is flat. Close out locally;
+                # there is nothing to cancel (order is terminal) or resubmit.
+                log.info(
+                    "lifecycle_pending_exit_reconciled_flat",
+                    ticker=ticker,
+                    local_qty=meta["qty"],
+                )
+                meta["pending_exits"] = []
+                state.record_exit(
+                    {
+                        "ts": now,
+                        "ticker": ticker,
+                        "qty": meta["qty"],
+                        "reason": "reconciled_filled_exit",
+                    }
+                )
+                state.positions.pop(ticker, None)
+                return
+            if broker_qty < meta["qty"]:
+                # Stale exit partially filled — trust the broker's remaining
+                # quantity so the resubmit doesn't oversell into a short.
+                log.warning(
+                    "lifecycle_pending_exit_partial_reconciled",
+                    ticker=ticker,
+                    local_qty=meta["qty"],
+                    broker_qty=broker_qty,
+                )
+                meta["qty"] = broker_qty
+            # else broker_qty >= meta["qty"]: stale exit didn't fill — fall
+            # through to the R9.3 cancel-then-resubmit below.
+
         qty = meta["qty"] // 2 if sig.action == "halve" else meta["qty"]
         if qty <= 0:
             return
-        # R9.3: cancel any prior unfilled exit orders before resubmitting.
+        # R9.3: cancel any prior STILL-OPEN exit orders before resubmitting.
         # Without this, a stop that triggers two ticks in a row leaves TWO
         # live sell orders on the broker. If both fill the position flips
         # short — a serious safety bug. Transient cancel failures are logged
@@ -131,7 +184,6 @@ async def _process_one_position(
         # out the stale order or the next tick will retry the cancel).
         # Programming errors (AttributeError on a misconfigured broker) MUST
         # propagate per the same rule as fetch_quote above.
-        stale_pending: list[str] = list(meta.get("pending_exits", []))
         for stale_id in stale_pending:
             try:
                 await broker.cancel_order(stale_id)

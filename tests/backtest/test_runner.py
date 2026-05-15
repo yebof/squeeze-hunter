@@ -127,6 +127,212 @@ def _seed(cache: ParquetCache) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_enters_next_trading_day_after_scan(tmp_path: Path) -> None:
+    """CDX-P1-1 regression: the backtest must NOT scan on day T's full bar and
+    then fill an entry at day T's own close — that is same-day lookahead. In
+    production the scan runs after T's close (nightly), premarket-verify runs
+    the next morning, and the entry fills around T+1's open. So a candidate
+    surfaced by day T's scan must execute on T+1 at T+1's OPEN price.
+
+    We patch run_scan to deterministically rank GME every day (decoupling this
+    test from factor math) and seed bars where each day's open != close, so
+    the fill price uniquely identifies WHICH bar (and which day) filled.
+    """
+    from unittest.mock import patch
+
+    cache = ParquetCache(root=tmp_path)
+    # 6 trading days starting Tue 2024-05-14. open and close are distinct so
+    # the fill price pins the exact bar/day.
+    base = datetime(2024, 5, 14, tzinfo=UTC)
+    days = pd.bdate_range(base, periods=6, tz="UTC")
+    rows = []
+    for i, ts in enumerate(days):
+        rows.append(
+            {
+                "ticker": "GME",
+                "ts": ts.to_pydatetime(),
+                "open": 10.0 + i,  # 10, 11, 12, 13, 14, 15  (distinct per day)
+                "high": 20.0 + i,
+                "low": 9.0 + i,
+                "close": 18.0 + i,  # 18, 19, 20, 21, 22, 23  (≠ open)
+                "volume": 5_000_000,
+            }
+        )
+    cache.write_partition("bars", "GME", pd.DataFrame(rows))
+    cache.write_partition(
+        "short_interest",
+        "all",
+        pd.DataFrame(
+            columns=[
+                "ticker",
+                "settlement_date",
+                "si_shares",
+                "si_pct_float",
+                "avg_daily_volume_20d",
+            ]
+        ),
+    )
+    cache.write_partition(
+        "earnings",
+        "all",
+        pd.DataFrame(columns=["ticker", "report_at", "actual_eps", "estimate_eps"]),
+    )
+
+    settings = Settings()
+    settings.score.weights = {"f1_si_pct": 1.0}
+
+    async def fake_scan(tickers, provider, clock, settings):
+        return pd.DataFrame(
+            [{"ticker": "GME", "score": 99.0, "setup_type": "CAR", "rank": 1, "as_of": clock}]
+        )
+
+    cfg = BacktestConfig(
+        tickers=["GME"],
+        start=base,
+        end=days[-1].to_pydatetime(),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    with patch("squeeze_hunter.backtest.runner.run_scan", side_effect=fake_scan):
+        result = await run_backtest(cfg, cache=cache, settings=settings)
+
+    buys = result.trade_log[result.trade_log["side"] == "buy"].reset_index(drop=True)
+    assert len(buys) >= 1, "expected at least one entry over the run"
+    first_buy = buys.iloc[0]
+    # Day 0 (2024-05-14) is the first scan. Entry MUST be day 1 (2024-05-15),
+    # NOT day 0 — anything on day 0 is the same-day-close lookahead bug.
+    assert first_buy["ts"].date() == days[1].date(), (
+        f"entry filled on {first_buy['ts'].date()} — expected next trading day "
+        f"{days[1].date()} (same-day fill = lookahead)"
+    )
+    # And it must fill near day-1's OPEN (11.0) + cost-model buy slippage
+    # (~5 bps → ~11.0055), NEVER the scan day's close (18.0) or day-1 close
+    # (19.0). A tight band around the open uniquely identifies the correct bar.
+    assert first_buy["price"] == pytest.approx(11.0, rel=0.01), (
+        f"fill price {first_buy['price']} — expected ≈ day-1 open 11.0 "
+        f"(+slippage), not day-0 close 18.0 / day-1 close 19.0 (= lookahead)"
+    )
+    assert first_buy["price"] < 12.0, "fill drifted to a close price → lookahead"
+
+
+@pytest.mark.asyncio
+async def test_runner_gap_through_stop_uses_daily_low(tmp_path: Path) -> None:
+    """CDX-P1-2 regression: a position that craters intraday to -30% but
+    recovers to close ~flat must STILL trip the hard stop in the backtest —
+    the live 60s lifecycle daemon would have caught the -30% intraday and
+    stopped out. The old code only fed `last.close` into evaluate_stops and
+    into the killswitch gap calc, so an intraday blowup that closed flat was
+    invisible to Gate 1. Stops/gap must use the day's LOW; a price-triggered
+    exit must fill at that conservative low, not the recovered close.
+    """
+    from unittest.mock import patch
+
+    cache = ParquetCache(root=tmp_path)
+    base = datetime(2024, 5, 14, tzinfo=UTC)
+    days = pd.bdate_range(base, periods=4, tz="UTC")
+    # Day0: scan ranks GME. Day1: enter at open=100. Day2: intraday low=65
+    # (-35% from entry, well past the -12% hard stop) but CLOSE recovers to 99
+    # (only -1%, would NOT trip a close-based stop). Day3: filler.
+    bars = [
+        {
+            "ticker": "GME",
+            "ts": days[0].to_pydatetime(),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 5_000_000,
+        },
+        {
+            "ticker": "GME",
+            "ts": days[1].to_pydatetime(),
+            "open": 100.0,
+            "high": 102.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 5_000_000,
+        },
+        {
+            "ticker": "GME",
+            "ts": days[2].to_pydatetime(),
+            "open": 99.0,
+            "high": 100.0,
+            "low": 65.0,
+            "close": 99.0,
+            "volume": 9_000_000,
+        },  # intraday crater, close flat
+        {
+            "ticker": "GME",
+            "ts": days[3].to_pydatetime(),
+            "open": 99.0,
+            "high": 100.0,
+            "low": 98.0,
+            "close": 99.0,
+            "volume": 5_000_000,
+        },
+    ]
+    cache.write_partition("bars", "GME", pd.DataFrame(bars))
+    cache.write_partition(
+        "short_interest",
+        "all",
+        pd.DataFrame(
+            columns=[
+                "ticker",
+                "settlement_date",
+                "si_shares",
+                "si_pct_float",
+                "avg_daily_volume_20d",
+            ]
+        ),
+    )
+    cache.write_partition(
+        "earnings",
+        "all",
+        pd.DataFrame(columns=["ticker", "report_at", "actual_eps", "estimate_eps"]),
+    )
+
+    settings = Settings()
+    settings.score.weights = {"f1_si_pct": 1.0}
+
+    call = {"n": 0}
+
+    async def scan_day0_only(tickers, provider, clock, settings):
+        call["n"] += 1
+        # Rank GME only on the FIRST scan so exactly one entry is queued.
+        if call["n"] == 1:
+            return pd.DataFrame(
+                [{"ticker": "GME", "score": 99.0, "setup_type": "CAR", "rank": 1, "as_of": clock}]
+            )
+        return pd.DataFrame(columns=["ticker", "score", "setup_type"])
+
+    cfg = BacktestConfig(
+        tickers=["GME"],
+        start=base,
+        end=days[-1].to_pydatetime(),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    with patch("squeeze_hunter.backtest.runner.run_scan", side_effect=scan_day0_only):
+        result = await run_backtest(cfg, cache=cache, settings=settings)
+
+    sells = result.trade_log[result.trade_log["side"] == "sell"].reset_index(drop=True)
+    assert len(sells) >= 1, "intraday -35% low must trigger the hard stop"
+    hard = sells[sells["reason"] == "hard_stop"]
+    assert len(hard) >= 1, (
+        f"expected a hard_stop exit on the intraday-crater day; sells={sells.to_dict('records')}"
+    )
+    exit_row = hard.iloc[0]
+    # Exit on day 2 (the crater day), filled at the conservative LOW (~65),
+    # NOT the recovered close (99). Cost model applies sell slippage so it's
+    # slightly below 65; must be far under the close.
+    assert exit_row["ts"].date() == days[2].date()
+    assert exit_row["price"] < 80.0, (
+        f"hard-stop fill {exit_row['price']} should be near the day low ~65, "
+        f"not the recovered close 99 (close fill hides the blowup)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_takes_position_and_records_pnl(tmp_path: Path) -> None:
     cache = ParquetCache(root=tmp_path)
     _seed(cache)

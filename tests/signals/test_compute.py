@@ -55,3 +55,70 @@ async def test_compute_all_returns_one_row_per_factor_per_ticker() -> None:
     assert set(df.columns) >= {"ticker", "factor_name", "raw_value", "z_score"}
     assert set(df["factor_name"]) == set(FACTOR_NAMES)
     assert set(df["ticker"]) == {"GME", "AAPL"}
+
+
+@pytest.mark.asyncio
+async def test_compute_all_factors_propagates_programming_errors() -> None:
+    """CDX-P2-4 regression: gather(return_exceptions=True) + a blanket
+    `isinstance(result, BaseException)` skip swallowed AttributeError /
+    TypeError / NotImplementedError / CancelledError — exactly the
+    programming/contract errors CLAUDE.md says MUST propagate to tick_safe.
+    A real bug (renamed attr, wrong signature) would silently degrade to a
+    smaller factor set and a quietly-wrong score instead of failing loud.
+    """
+
+    async def ok_factor(_t, _p, _c):
+        return Factor(
+            name="f1_si_pct",
+            as_of=datetime(2024, 5, 13, tzinfo=UTC),
+            values=pd.DataFrame({"ticker": ["GME"], "raw_value": [1.0]}),
+        )
+
+    async def buggy_factor(_t, _p, _c):
+        raise AttributeError("provider has no attribute 'fetch_xyz' (real bug)")
+
+    provider = AsyncMock()
+    with (
+        patch("squeeze_hunter.signals.compute.compute_si_pct_float", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_days_to_cover", buggy_factor),
+        patch("squeeze_hunter.signals.compute.compute_earnings_reaction", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_wsb_sentiment", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_call_oi_velocity", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_bollinger_breakout", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_volume_spike", ok_factor),
+        pytest.raises(AttributeError, match="real bug"),
+    ):
+        await compute_all_factors(["GME"], provider, datetime(2024, 5, 13, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_compute_all_factors_still_skips_transient_errors() -> None:
+    """CDX-P2-4: transient I/O errors (ConnectionError/TimeoutError/OSError)
+    in ONE factor must still be logged-and-skipped — the scan degrades
+    gracefully on a flaky network rather than aborting the whole run.
+    """
+
+    async def ok_factor(_t, _p, _c):
+        return Factor(
+            name="f1_si_pct",
+            as_of=datetime(2024, 5, 13, tzinfo=UTC),
+            values=pd.DataFrame({"ticker": ["GME"], "raw_value": [1.0]}),
+        )
+
+    async def flaky_factor(_t, _p, _c):
+        raise ConnectionError("transient network blip")
+
+    provider = AsyncMock()
+    with (
+        patch("squeeze_hunter.signals.compute.compute_si_pct_float", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_days_to_cover", flaky_factor),
+        patch("squeeze_hunter.signals.compute.compute_earnings_reaction", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_wsb_sentiment", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_call_oi_velocity", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_bollinger_breakout", ok_factor),
+        patch("squeeze_hunter.signals.compute.compute_volume_spike", ok_factor),
+    ):
+        df = await compute_all_factors(["GME"], provider, datetime(2024, 5, 13, tzinfo=UTC))
+    # The flaky factor is dropped; the other 6 still produced rows.
+    assert "f2_days_to_cover" not in set(df["factor_name"])
+    assert "f1_si_pct" in set(df["factor_name"])

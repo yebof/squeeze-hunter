@@ -87,6 +87,18 @@ class IBroker(Protocol):
 
     async def get_open_orders(self: IBroker) -> list[BrokerOrder]: ...
 
+    async def get_position_qty(self: IBroker, ticker: str) -> int:
+        """Return the broker-side held quantity for `ticker` (0 if flat).
+
+        CDX-P1-3: lifecycle uses this to reconcile a stale pending exit before
+        resubmitting. If a prior exit order filled between ticks it is gone
+        from `get_open_orders()` / `openTrades()` and `cancel_order` returns
+        False without error — resubmitting the original qty into an
+        already-flat broker would drive the account SHORT. The authoritative
+        truth is the broker's actual position, not our local meta['qty'].
+        """
+        ...
+
     async def get_equity_usd(self: IBroker) -> float | None:
         """Return total account equity (NAV) in USD, or None if unavailable.
 

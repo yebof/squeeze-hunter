@@ -500,6 +500,9 @@ async def test_lifecycle_cancels_stale_pending_exit_before_resubmitting() -> Non
     )
     broker.submit_sell = fake_submit_sell
     broker.cancel_order = fake_cancel
+    # CDX-P1-3: broker still holds the full 100 → stale exit did NOT fill →
+    # preserve the original cancel-then-resubmit path this test pins.
+    broker.get_position_qty = AsyncMock(return_value=100)
 
     state = LifecycleState(
         positions={
@@ -558,6 +561,9 @@ async def test_lifecycle_pending_exit_cancel_failure_does_not_block_resubmit() -
     )
     broker.submit_sell = fake_submit
     broker.cancel_order = fake_cancel
+    # CDX-P1-3: broker still holds the full 100 → stale exit did NOT fill →
+    # this test still exercises the cancel-failure-then-resubmit path.
+    broker.get_position_qty = AsyncMock(return_value=100)
 
     state = LifecycleState(
         positions={
@@ -576,6 +582,118 @@ async def test_lifecycle_pending_exit_cancel_failure_does_not_block_resubmit() -
     # Should NOT raise; cancel failure logged, submit proceeds
     await manage_positions(state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     assert submitted == [100]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_reconciles_filled_pending_exit_before_resubmit() -> None:
+    """CDX-P1-3 regression: a stale pending exit that ALREADY FILLED between
+    ticks is gone from the broker's open orders, so cancel_order returns False
+    (no exception). The R9.3 fix then blindly resubmitted the FULL position
+    qty — but the broker is already flat, so the new sell drives the account
+    SHORT. Before resubmitting, reconcile against the broker's actual position:
+    if it's 0, the prior exit filled → record the exit, pop the position, and
+    do NOT submit anything.
+    """
+    submitted: list[int] = []
+
+    async def fake_submit(ticker, qty, limit_price, ts):
+        submitted.append(qty)
+        return BrokerOrder(
+            broker_order_id="should-not-happen",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status="filled",
+            filled_qty=qty,
+            avg_fill_price=85.0,
+        )
+
+    async def fake_cancel(order_id):
+        # Stale order already filled → not in open orders → broker says "no".
+        return False
+
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=70.0, ask=70.05, last=70.0, timestamp_ns=0)
+    )
+    broker.submit_sell = fake_submit
+    broker.cancel_order = fake_cancel
+    # Broker is FLAT — the stale pending exit already filled.
+    broker.get_position_qty = AsyncMock(return_value=0)
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+                "pending_exits": ["stale-filled-order"],
+            }
+        }
+    )
+    out = await manage_positions(
+        state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+    )
+    # CRITICAL: no new sell submitted — the broker is already flat.
+    assert submitted == [], f"resubmitted into a flat broker → would go short: {submitted}"
+    # Position reconciled away; exit recorded so telemetry/Kelly stay consistent.
+    assert "GME" not in out.positions
+    assert any(e["ticker"] == "GME" for e in out.exits)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_reconciles_partial_pending_exit_resubmits_only_remainder() -> None:
+    """CDX-P1-3: if the stale exit PARTIALLY filled (broker holds fewer shares
+    than meta['qty']), the resubmit must be sized to the broker's actual
+    remaining position, not the original full qty — else we oversell and go
+    short by the already-filled amount.
+    """
+    submitted: list[int] = []
+
+    async def fake_submit(ticker, qty, limit_price, ts):
+        submitted.append(qty)
+        return BrokerOrder(
+            broker_order_id="new",
+            ticker=ticker,
+            side="sell",
+            qty=qty,
+            limit_price=limit_price,
+            status="pending",
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(ticker="GME", bid=70.0, ask=70.05, last=70.0, timestamp_ns=0)
+    )
+    broker.submit_sell = fake_submit
+    broker.cancel_order = AsyncMock(return_value=False)
+    # Original qty was 100; stale exit filled 60 → broker holds 40.
+    broker.get_position_qty = AsyncMock(return_value=40)
+
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+                "pending_exits": ["stale-partial"],
+            }
+        }
+    )
+    await manage_positions(state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    # Resubmit must be the broker's actual remaining 40, never the stale 100.
+    assert submitted == [40], f"oversold: resubmitted {submitted} vs broker-held 40"
 
 
 def test_lifecycle_exits_list_trims_after_max() -> None:

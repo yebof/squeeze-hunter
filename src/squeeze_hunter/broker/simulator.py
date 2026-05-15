@@ -164,6 +164,11 @@ class SimulatorBroker:
         lot = self.positions.get(ticker)
         return lot.qty if lot else 0
 
+    async def get_position_qty(self: SimulatorBroker, ticker: str) -> int:
+        """CDX-P1-3: IBroker Protocol position query. The simulator fills
+        synchronously so its local lot IS the authoritative position."""
+        return self.position_qty(ticker)
+
     def realized_pnl(self: SimulatorBroker, ticker: str) -> float:
         return self.realized.get(ticker, 0.0)
 

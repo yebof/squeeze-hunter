@@ -114,3 +114,23 @@ async def test_scan_ranks_gme_above_aapl(tmp_path: Path) -> None:
     by_t = ranked.set_index("ticker")
     assert by_t.loc["GME", "score"] > by_t.loc["AAPL", "score"]
     assert "setup_type" in ranked.columns
+
+
+@pytest.mark.asyncio
+async def test_backtest_fails_loud_when_score_weights_empty(tmp_path: Path) -> None:
+    """CDX-P2-4 regression: an empty score.weights (missing YAML / typo'd
+    factor names) makes combine() raise ValueError. scan.py used to catch it
+    and return an EMPTY ranking — so a config error masqueraded as 'strategy
+    has no candidates / no edge' in both backtest and production. It must
+    fail loud (propagate) so the CLI's ValueError handler reports a clean
+    config error and Gate 1 is never run on a silently-broken config.
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed_cache(cache)
+    clock = Clock(now=datetime(2024, 5, 13, 23, 59, tzinfo=UTC))
+    provider = BacktestProvider(cache=cache, clock=clock)
+    settings = Settings()
+    settings.score.weights = {}  # operator deleted the block / typo'd every key
+
+    with pytest.raises(ValueError, match="no factor in the input has a weight"):
+        await run_scan(["GME", "AAPL"], provider, clock.now, settings)
