@@ -211,3 +211,61 @@ async def test_submit_sell_uses_limit_when_provided() -> None:
     )
     assert captured["limit"] == 20.0
     assert captured["action"] == "SELL"
+
+
+@pytest.mark.asyncio
+async def test_ibkr_get_position_qty_refreshes_positions_snapshot() -> None:
+    """CDX2-P1 regression: ib-async's IB.positions() is a cached snapshot fed
+    by TWS push events; right after a fill it can still show the OLD position.
+    get_position_qty MUST reqPositionsAsync() to force a fresh sync BEFORE
+    reading positions() — otherwise the lifecycle pending-exit reconcile
+    (CDX-P1-3) reads a stale qty, concludes "didn't fill", and resubmits the
+    full sell → the exact double-sell/short the reconcile was meant to stop.
+    """
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    order: list[str] = []
+
+    async def fake_req_positions():
+        order.append("reqPositionsAsync")
+
+    def fake_positions():
+        order.append("positions")
+        pos = MagicMock()
+        pos.contract.symbol = "GME"
+        pos.position = 40
+        return [pos]
+
+    fake_ib.reqPositionsAsync = fake_req_positions
+    fake_ib.positions = fake_positions
+    broker._ib = fake_ib
+
+    qty = await broker.get_position_qty("GME")
+    assert qty == 40
+    # The refresh MUST happen before the read.
+    assert order == ["reqPositionsAsync", "positions"], (
+        f"positions() read without a fresh reqPositionsAsync() sync: {order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ibkr_get_position_qty_timeout_is_transient() -> None:
+    """CDX2-P1: if reqPositionsAsync() hangs (wedged TWS), get_position_qty
+    must time out and raise a TRANSIENT error (TimeoutError) rather than block
+    the reconcile forever. lifecycle's reconcile catches transient errors and
+    conservatively skips the resubmit (no shorting).
+    """
+    import asyncio
+
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+
+    async def hang():
+        await asyncio.sleep(60)
+
+    fake_ib.reqPositionsAsync = hang
+    fake_ib.positions = MagicMock(return_value=[])
+    broker._ib = fake_ib
+
+    with pytest.raises(TimeoutError):
+        await broker.get_position_qty("GME", refresh_timeout_s=0.05)

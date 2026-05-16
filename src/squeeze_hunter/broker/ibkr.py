@@ -234,16 +234,26 @@ class IBKRBroker:
                 return True
         return False
 
-    async def get_position_qty(self: IBKRBroker, ticker: str) -> int:
-        """CDX-P1-3: authoritative broker-side held quantity for `ticker`.
+    async def get_position_qty(
+        self: IBKRBroker, ticker: str, *, refresh_timeout_s: float = 5.0
+    ) -> int:
+        """CDX-P1-3 / CDX2-P1: authoritative broker-side held quantity.
 
-        ib-async maintains IB.positions() from TWS push events; right after
-        connect the snapshot may be empty, so callers that need a guaranteed
-        fresh view should reqPositionsAsync() first (lifecycle does that via
-        the reconcile path / emergency-flatten does it explicitly). We sum
-        across any position rows whose contract symbol matches (a ticker
-        normally has exactly one US-equity position row).
+        ib-async's IB.positions() is a CACHED snapshot fed by TWS push
+        events; immediately after a fill it can still show the pre-fill
+        position. The lifecycle pending-exit reconcile depends on this value
+        to decide whether a stale exit already filled — a stale read there
+        re-introduces the double-sell/short bug CDX-P1-3 set out to kill. So
+        we force a fresh sync with reqPositionsAsync() BEFORE reading
+        positions(), bounded by `refresh_timeout_s` so a wedged TWS can't
+        block the reconcile forever. On timeout we raise TimeoutError, which
+        the lifecycle treats as a transient error and conservatively skips
+        the resubmit (no shorting).
+
+        We sum any position rows whose contract symbol matches (a US-equity
+        ticker normally has exactly one position row).
         """
+        await asyncio.wait_for(self._ib.reqPositionsAsync(), timeout=refresh_timeout_s)
         total = 0
         for pos in self._ib.positions():
             if getattr(pos.contract, "symbol", None) == ticker:

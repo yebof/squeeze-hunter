@@ -20,8 +20,13 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
     rows: list[dict] = []
     float_cache: dict[str, int | None] = {}
 
+    # CDX2-P2: ONE pass over the FINRA files for the whole universe, not one
+    # full re-download per ticker. fetch_short_interest_bulk GETs each monthly
+    # report exactly once and indexes the requested tickers.
+    si_by_ticker = await finra.fetch_short_interest_bulk(tickers, since=date(2018, 1, 1))
+
     for t in tickers:
-        si_list = await finra.fetch_short_interest(t, since=date(2018, 1, 1))
+        si_list = si_by_ticker.get(t, [])
         if not si_list:
             continue
         # Look up float once per ticker; cache to avoid duplicate Yahoo calls.

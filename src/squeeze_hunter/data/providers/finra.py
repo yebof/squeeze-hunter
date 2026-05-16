@@ -32,28 +32,20 @@ class FinraProvider:
     capabilities: frozenset[str] = frozenset({"si"})
     timeout_s: float = 30.0
 
-    async def fetch_short_interest(
-        self: FinraProvider,
-        ticker: str,
-        since: date | None = None,
-    ) -> list[ShortInterest]:
-        """Fetch every biweekly report from `since` to today.
+    @staticmethod
+    def _candidate_months(since: date | None) -> list[tuple[str, str]]:
+        """CDX-P2-5: the (YYYYMM, half) report files spanning `since`→today.
 
-        CDX-P2-5: this previously hardcoded the trailing ~3 months
-        (`range(0, 3)`), so a historical backfill that passes
-        `since=date(2018, 1, 1)` only ever got the last quarter of data and
-        f1/f2 were dead for years of any multi-year backtest. We now iterate
-        EVERY month from `since` to the current month. When `since` is None
-        (live/no-history use) we keep the lightweight trailing-3-month window.
+        `since=None` keeps the lightweight trailing-3-month window for live
+        use; a historical backfill passes an explicit `since` and gets every
+        month back to it.
         """
         today = date.today()
-        # Inclusive month count from `since` to today. None → trailing 3.
         if since is None:
             n_months = 3
         else:
             n_months = (today.year - since.year) * 12 + (today.month - since.month) + 1
             n_months = max(1, n_months)
-        results: list[ShortInterest] = []
         candidates: list[tuple[str, str]] = []
         for months_back in range(0, n_months):
             year = today.year
@@ -64,8 +56,25 @@ class FinraProvider:
             yyyymm = f"{year:04d}{month:02d}"
             for half in ("b", "a"):
                 candidates.append((yyyymm, half))
+        return candidates
+
+    async def fetch_short_interest(
+        self: FinraProvider,
+        ticker: str,
+        since: date | None = None,
+    ) -> list[ShortInterest]:
+        """Single-ticker fetch (DataProvider Protocol). Downloads every report
+        from `since` to today and filters to `ticker`.
+
+        NOTE: for a multi-ticker backfill use `fetch_short_interest_bulk` --
+        calling this once per ticker re-downloads the SAME ~N monthly files
+        for every ticker (CDX2-P2: tickers x months duplicate GETs, slow /
+        rate-limited). This single-ticker form is fine for occasional
+        one-off lookups.
+        """
+        results: list[ShortInterest] = []
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            for yyyymm, half in candidates:
+            for yyyymm, half in self._candidate_months(since):
                 url = FINRA_URL_TEMPLATE.format(yyyymm=yyyymm, half=half)
                 try:
                     r = await client.get(url)
@@ -76,6 +85,36 @@ class FinraProvider:
                     if row.ticker == ticker and (since is None or row.settlement_date >= since):
                         results.append(row)
         return results
+
+    async def fetch_short_interest_bulk(
+        self: FinraProvider,
+        tickers: list[str],
+        since: date | None = None,
+    ) -> dict[str, list[ShortInterest]]:
+        """CDX2-P2: download each monthly report file EXACTLY ONCE and index
+        the requested tickers from it.
+
+        The prior backfill called the single-ticker `fetch_short_interest`
+        per ticker, so a ~1500-name universe over ~7 years re-downloaded the
+        same ~180 FINRA files ~1500 times (~270k GETs of identical files) --
+        slow and a near-certain rate-limit/ban. This streams each file once
+        and filters by the requested universe, bounding both HTTP volume
+        (~one GET per file) and memory (only `tickers` are retained).
+        """
+        wanted = set(tickers)
+        out: dict[str, list[ShortInterest]] = {t: [] for t in tickers}
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            for yyyymm, half in self._candidate_months(since):
+                url = FINRA_URL_TEMPLATE.format(yyyymm=yyyymm, half=half)
+                try:
+                    r = await client.get(url)
+                    r.raise_for_status()
+                except httpx.HTTPError:
+                    continue
+                for row in self._parse_finra_pipe_text(StringIO(r.text)):
+                    if row.ticker in wanted and (since is None or row.settlement_date >= since):
+                        out[row.ticker].append(row)
+        return out
 
     @staticmethod
     def _parse_finra_pipe_text(stream: IO[str]) -> Iterator[ShortInterest]:
