@@ -71,11 +71,22 @@ async def run_backtest(
     kill_first_tripped_at: datetime | None = None
     kill_cooldown_days = 7  # mirrors RuntimeContext._kill_cooldown_days
 
-    # C7: iterate over trading (business) days only — skips weekends.
-    # US holidays are not filtered here (minor inaccuracy, acceptable for now).
+    # C7 + R11: iterate over trading days only — skip weekends AND US federal
+    # holidays, using the SAME _us_business_holidays() calendar the live path
+    # uses in RuntimeContext.eod_close. Previously holidays were counted as bars
+    # ("acceptable for now"), so bars_held — the 21-trading-day time stop —
+    # advanced faster in backtest than live, firing the time stop ~1-2 days
+    # early over a holiday-spanning hold (same-code-path divergence, principle
+    # #4). Filtering here keeps bars_held, the equity-curve cadence, and stop
+    # evaluation all on one trading-day definition matching live.
     # Iterate as pd.Timestamp objects (list() avoids the .to_pydatetime() method
     # that the type checker cannot resolve on DatetimeIndex).
-    trading_days: list[pd.Timestamp] = list(pd.bdate_range(cfg.start, cfg.end, tz="UTC"))
+    from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+
+    _holidays = set(_us_business_holidays())
+    trading_days: list[pd.Timestamp] = [
+        d for d in pd.bdate_range(cfg.start, cfg.end, tz="UTC") if d.date() not in _holidays
+    ]
     if not trading_days:
         # R8.M16: warn loudly when the date range contains zero trading days —
         # otherwise the run silently produces an empty equity_curve and Gate 1
