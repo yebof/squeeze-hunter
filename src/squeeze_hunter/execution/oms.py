@@ -111,8 +111,16 @@ class OrderManager:
                 slices_filled += 1
             if filled > 0:
                 cumulative_qty += filled
-                if order.avg_fill_price:
-                    cumulative_value += filled * order.avg_fill_price
+                # R11: a live broker can return status="filled" with
+                # avg_fill_price=None (orderStatus not yet synced when placeOrder
+                # returns an immediate fill). Fall back to the slice limit so
+                # qty and value advance together — otherwise the fill enters the
+                # denominator but not the numerator and the reported
+                # avg_fill_price is dragged toward 0 (exactly 0.0 if every slice
+                # is priceless), corrupting cost basis / P&L / stop math.
+                fill_px = order.avg_fill_price if order.avg_fill_price else limit_price
+                if fill_px:
+                    cumulative_value += filled * fill_px
             log.info(
                 "slice_submitted",
                 ticker=plan.ticker,

@@ -266,6 +266,56 @@ async def test_oms_partial_fills_still_escalate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oms_avg_fill_price_when_broker_returns_filled_without_price() -> None:
+    """Round-11 regression: live IBKRBroker.submit_* returns a BrokerOrder with
+    status='filled' but filled_qty=0 / avg_fill_price=None (orderStatus not yet
+    populated when placeOrder returns an immediate fill). The OMS counted such
+    fills toward cumulative_qty (filled falls back to order.qty) but skipped
+    cumulative_value, so result.avg_fill_price was dragged toward 0 — exactly 0.0
+    when every slice was priceless — corrupting cost basis / P&L / stop math.
+    With no broker price, fall back to the slice limit so qty and value stay
+    consistent.
+    """
+
+    async def fake_quote(ticker):
+        return _make_quote(ticker)  # bid 20.0 / ask 20.10
+
+    async def fake_submit_buy(ticker, qty, limit_price, ts):
+        return BrokerOrder(
+            broker_order_id="id-1",
+            ticker=ticker,
+            side="buy",
+            qty=qty,
+            limit_price=limit_price,
+            status="filled",
+            filled_qty=0,  # IBKR-shaped: immediate fill, orderStatus not yet synced
+            avg_fill_price=None,
+        )
+
+    broker = MagicMock()
+    broker.fetch_quote = fake_quote
+    broker.submit_buy = fake_submit_buy
+
+    open_at = datetime(2026, 5, 14, 13, 30, tzinfo=UTC)
+    plan = build_twap_plan(
+        total_qty=300,
+        reference_price=20.0,
+        market_open=open_at,
+        ticker="GME",
+        side="buy",
+        n_slices=3,
+        window_minutes=10,
+        slice_offset_minutes=0,
+    )
+    oms = OrderManager(broker=broker, clock=lambda: open_at + timedelta(minutes=15))
+    result = await oms.execute(plan, max_wall_seconds=0)
+    assert result.filled_qty == 300
+    # avg_fill_price must be a real near-market price (~20), NEVER 0.0.
+    assert result.avg_fill_price > 0.0
+    assert 19.0 < result.avg_fill_price < 21.5
+
+
+@pytest.mark.asyncio
 async def test_oms_marketable_for_sell_uses_negative_aggression() -> None:
     """For sell side, aggression bps means below mid (lower price = more
     aggressive sell)."""

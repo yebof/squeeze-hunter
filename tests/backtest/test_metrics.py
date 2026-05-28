@@ -6,6 +6,7 @@ import pytest
 
 from squeeze_hunter.backtest.metrics import (
     captured_events,
+    hit_rate_and_payoff,
     max_drawdown,
     sharpe,
 )
@@ -173,6 +174,33 @@ def test_annualized_return_safe_when_total_return_below_neg_one() -> None:
     # Convention: a -100%-or-worse outcome over the period clamps to -1.0
     # (lost everything; cannot be more negative for compounding-return purposes).
     assert ar == pytest.approx(-1.0)
+
+
+def test_hit_rate_and_payoff_all_wins_is_scale_invariant() -> None:
+    """Round-11 regression: in the no-loss branch the old code computed
+    `avg_win$ / 1.0` — returning a raw DOLLAR magnitude instead of a
+    dimensionless ratio, so Gate 1's avg_payoff check became dependent on share
+    price / lot size (a penny-gain all-win holdout would FAIL avg_payoff_min=1.5
+    while the same strategy in larger lots would pass). An all-winning holdout
+    must report a scale-invariant payoff (treated as "no downside observed").
+    """
+
+    def _trade_log(scale: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"ticker": "GME", "side": "buy", "qty": 100, "price": 10.0 * scale},
+                {"ticker": "GME", "side": "sell", "qty": 100, "price": 10.2 * scale},
+            ]
+        )
+
+    hit_small, payoff_small = hit_rate_and_payoff(_trade_log(1.0))
+    hit_big, payoff_big = hit_rate_and_payoff(_trade_log(100.0))
+    assert hit_small == 1.0
+    assert hit_big == 1.0
+    # The bug made payoff scale-dependent (20.0 vs 2000.0); it must be invariant.
+    assert payoff_small == payoff_big
+    # 100% win rate with no losses must clear a sane avg_payoff gate.
+    assert payoff_small >= 1.5
 
 
 def test_sortino_returns_zero_for_two_point_curve_one_downside() -> None:

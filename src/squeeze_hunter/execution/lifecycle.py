@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -82,9 +83,12 @@ async def _process_one_position(
     # them as "transient" hid real bugs in earlier reviews.
 
     price = q.last or q.bid or q.ask
-    if price <= 0.0:
-        # Stale snapshot or halt — all three fields are zero. Don't
-        # evaluate stops with a bogus price; come back next tick.
+    if not math.isfinite(price) or price <= 0.0:
+        # Stale snapshot, halt, or a non-finite (NaN) quote. Don't evaluate stops
+        # with a bogus price; come back next tick. R11 defense-in-depth: `nan`
+        # is truthy and `nan <= 0.0` is False, so without the isfinite check a
+        # NaN price slips past this guard and the hard/trailing stops silently
+        # never fire (every comparison against nan is False).
         log.warning(
             "quote_zero_price",
             ticker=ticker,
