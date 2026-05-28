@@ -578,7 +578,11 @@ class RuntimeContext:
             return
 
         clock = Clock(now=now)
-        provider = BacktestProvider(cache=self.cache, clock=clock)
+        provider = BacktestProvider(
+            cache=self.cache,
+            clock=clock,
+            finra_publication_lag_bdays=self.settings.data.finra_publication_lag_bdays,
+        )
         ranked = await run_scan(self.tickers, provider, now, self.settings)
         self.last_candidates = ranked
 

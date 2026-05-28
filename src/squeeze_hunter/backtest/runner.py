@@ -45,7 +45,11 @@ async def run_backtest(
     settings: Settings,
 ) -> BacktestResult:
     clock = Clock(now=cfg.start)
-    provider = BacktestProvider(cache=cache, clock=clock)
+    provider = BacktestProvider(
+        cache=cache,
+        clock=clock,
+        finra_publication_lag_bdays=settings.data.finra_publication_lag_bdays,
+    )
     broker = SimulatorBroker(initial_cash=cfg.initial_cash, cost_model=StockCostModel())
     open_states: dict[
         str, dict
