@@ -97,7 +97,11 @@ def scan(
     cache = ParquetCache(root=parquet_root)
     clock_dt = datetime.fromisoformat(date_str).replace(tzinfo=UTC, hour=23, minute=59)
     clock = Clock(now=clock_dt)
-    provider = BacktestProvider(cache=cache, clock=clock)
+    provider = BacktestProvider(
+        cache=cache,
+        clock=clock,
+        finra_publication_lag_bdays=settings.data.finra_publication_lag_bdays,
+    )
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
     # R5.M5: surface an empty tickers file rather than silently doing nothing.
     if not tickers:

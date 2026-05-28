@@ -37,6 +37,79 @@ async def test_backtest_only_returns_rows_at_or_before_clock(tmp_path: Path) -> 
     assert max(b.ts for b in bars) == datetime(2024, 5, 13, tzinfo=UTC)
 
 
+def _seed_si(cache: ParquetCache) -> None:
+    cache.write_partition(
+        "short_interest",
+        "all",
+        pd.DataFrame(
+            [
+                {
+                    "ticker": "GME",
+                    "settlement_date": date(2024, 4, 30),
+                    "si_shares": 5_000_000,
+                    "si_pct_float": 0.30,
+                    "avg_daily_volume_20d": 1_000_000,
+                }
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_interest_not_visible_before_finra_publication(tmp_path: Path) -> None:
+    """Round-11 regression: FINRA disseminates a settlement-date short-interest
+    report ~8 US business days LATER. The backtest must reveal each record on
+    its availability date (settlement + lag), NOT its settlement date — else it
+    acts on short interest before it was public (lookahead → inflated Gate 1).
+    f1_si_pct and f2_days_to_cover are the two highest-weighted squeeze factors,
+    so revealing SI ~8 trading days early materially distorts entry timing.
+    Settlement Tue 2024-04-30 → published ~2024-05-10 (8 business days later).
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed_si(cache)
+
+    # On the settlement date itself: not yet public → masked out.
+    p_settle = BacktestProvider(
+        cache=cache,
+        clock=Clock(now=datetime(2024, 4, 30, 23, 59, tzinfo=UTC)),
+        finra_publication_lag_bdays=8,
+    )
+    assert await p_settle.fetch_short_interest("GME") == []
+
+    # 3 business days in (2024-05-03): still inside the publication lag.
+    p_mid = BacktestProvider(
+        cache=cache,
+        clock=Clock(now=datetime(2024, 5, 3, 23, 59, tzinfo=UTC)),
+        finra_publication_lag_bdays=8,
+    )
+    assert await p_mid.fetch_short_interest("GME") == []
+
+    # On the availability date (2024-05-10): now visible.
+    p_avail = BacktestProvider(
+        cache=cache,
+        clock=Clock(now=datetime(2024, 5, 10, 23, 59, tzinfo=UTC)),
+        finra_publication_lag_bdays=8,
+    )
+    got = await p_avail.fetch_short_interest("GME")
+    assert len(got) == 1
+    assert got[0].si_pct_float == 0.30
+
+
+@pytest.mark.asyncio
+async def test_short_interest_lag_zero_reveals_on_settlement_date(tmp_path: Path) -> None:
+    """Escape hatch: finra_publication_lag_bdays=0 restores the legacy
+    reveal-on-settlement-date behavior."""
+    cache = ParquetCache(root=tmp_path)
+    _seed_si(cache)
+    p = BacktestProvider(
+        cache=cache,
+        clock=Clock(now=datetime(2024, 4, 30, 23, 59, tzinfo=UTC)),
+        finra_publication_lag_bdays=0,
+    )
+    got = await p.fetch_short_interest("GME")
+    assert len(got) == 1
+
+
 @pytest.mark.asyncio
 async def test_backtest_provider_fetch_option_chain_at(tmp_path: Path) -> None:
     """C6: BacktestProvider must serve historical option chains by date for the

@@ -249,7 +249,7 @@ Postgres (state + slow-changing reference)
 | --- | --- | --- |
 | `IBKRProvider` | Real-time bars + quotes (L1), option chain + greeks, recent historical bars | ~50 ticker concurrent streams; Gateway must be local or Docker; uses `ib-async` |
 | `Yahoo` (yfinance) | EOD bars (deep history), float / shares outstanding, earnings calendar fallback | No official API; ~1 req/s; occasionally rate-blocked → retry with backoff; used for backfill and as redundancy |
-| `FINRA` | Biweekly SI %, SI shares; days-to-cover derived | Lag ≈ 2 weeks (accepted — SI is a slow variable); FTP bulk dump, no per-request limit |
+| `FINRA` | Biweekly SI %, SI shares; days-to-cover derived | Settlement dates are the 15th & last business day, but a report is not *published* until ~8 business days later. The backtest reveals each record on `settlement_date + data.finra_publication_lag_bdays` (default 8) so it never acts on SI before it was public. Trading on data up to ~2 weeks stale is accepted (SI is a slow variable); revealing it *early* is not (that is lookahead). FTP/CDN bulk dump, no per-request limit |
 | `Reddit (PRAW)` | r/wallstreetbets mention counts, hot/new/top samples | 60 req/min OAuth; per-ticker hourly aggregation |
 | `Finnhub free` | Earnings calendar + actual / estimate EPS | 60 req/min; US only |
 
@@ -261,9 +261,9 @@ Postgres (state + slow-changing reference)
 ### Critical Design Decisions
 
 - **Replay is itself a `DataProvider`.** `BacktestProvider` reads parquet history; the rest of the system cannot tell whether it is live or replaying. Backtest and live therefore share **one** signal-computation code path.
-- **Time machine.** `BacktestProvider` holds a `clock`; every read implicitly applies `WHERE ts ≤ clock`, eliminating lookahead bias by construction.
+- **Time machine.** `BacktestProvider` holds a `clock`; every read implicitly applies `WHERE ts ≤ clock`, eliminating lookahead bias by construction. The cutoff is the time the data became *knowable*, which is not always the event timestamp: short interest is gated on its FINRA *publication* date (`settlement_date + data.finra_publication_lag_bdays`), not its settlement date, because the report is not public until ~8 business days after settlement.
 - **Idempotent ingestion.** Every ingest job is rerunnable; primary-key dedup + parquet append-with-dedup. Crash recovery is "rerun the job."
-- **Cache invalidation rules:** bars are immutable once closed (append-only); quotes are not cached; options chain expires after 60s; short interest invalidates on FINRA release dates (15th & last business day); earnings invalidates when `actual` is published; sentiment expires after 1h.
+- **Cache invalidation rules:** bars are immutable once closed (append-only); quotes are not cached; options chain expires after 60s; short interest is keyed to settlement dates (15th & last business day) but only becomes visible on its FINRA publication date ~8 business days later; earnings invalidates when `actual` is published; sentiment expires after 1h.
 
 ### Paid-Source Upgrade Path (no business-code changes)
 

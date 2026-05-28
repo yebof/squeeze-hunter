@@ -37,6 +37,11 @@ class BacktestProvider:
     cache: ParquetCache
     clock: Clock
     name: str = "backtest"
+    # R11: FINRA disseminates a settlement-date short-interest report ~8 US
+    # business days later. fetch_short_interest reveals each record on
+    # settlement_date + this many business days so the backtest can't act on SI
+    # before it was public (lookahead). Wired from settings.data in production.
+    finra_publication_lag_bdays: int = 8
     capabilities: frozenset[str] = field(
         default_factory=lambda: frozenset({"bars", "options", "si", "earnings", "sentiment"})
     )
@@ -167,7 +172,21 @@ class BacktestProvider:
             return []
         df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
         clock_d = self.clock.now.date()
-        mask = (df["ticker"] == ticker) & (df["settlement_date"] <= clock_d)
+        # R11: gate visibility on the AVAILABILITY date (settlement + FINRA
+        # publication lag), not the settlement date. FINRA publishes a
+        # settlement-date report ~8 business days later, so revealing it on the
+        # settlement date lets the backtest act on short interest the live
+        # system could not yet have known — lookahead that inflates Gate 1.
+        lag = self.finra_publication_lag_bdays
+        if lag > 0:
+            available = (
+                pd.to_datetime(df["settlement_date"]) + pd.offsets.BusinessDay(lag)
+            ).dt.date
+        else:
+            available = df["settlement_date"]
+        mask = (df["ticker"] == ticker) & (available <= clock_d)
+        # `since` filters by settlement date (it selects how far back to look,
+        # which is a property of the report period, not its availability).
         if since is not None:
             mask = mask & (df["settlement_date"] >= since)
         return [

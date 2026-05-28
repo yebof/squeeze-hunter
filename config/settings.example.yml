@@ -35,3 +35,9 @@ universe:
   max_market_cap: 10000000000
   min_price: 5.0
   min_days_listed: 30
+data:
+  # R11: FINRA disseminates a settlement-date short-interest report ~8 US
+  # business days later. The backtest reveals each SI record this many business
+  # days after its settlement date so it can't act on short interest before it
+  # was public (look-ahead bias). 0 = reveal on the settlement date (legacy).
+  finra_publication_lag_bdays: 8

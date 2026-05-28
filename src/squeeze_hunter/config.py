@@ -59,6 +59,16 @@ class UniverseCfg(BaseModel):
     min_days_listed: int = 30
 
 
+class DataCfg(BaseModel):
+    # R11: FINRA disseminates a settlement-date short-interest report ~8 US
+    # business days LATER (settlement dates are the 15th & last business day;
+    # the bulk file is published ~T+8). The backtest reveals each SI record on
+    # settlement_date + this many business days so it cannot act on short
+    # interest before it was public (lookahead → inflated Gate 1). Set 0 to
+    # reveal on the settlement date (legacy behavior).
+    finra_publication_lag_bdays: int = 8
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SH_",
@@ -69,6 +79,7 @@ class Settings(BaseSettings):
     risk: RiskCfg = Field(default_factory=RiskCfg)
     stops: StopsCfg = Field(default_factory=StopsCfg)
     universe: UniverseCfg = Field(default_factory=UniverseCfg)
+    data: DataCfg = Field(default_factory=DataCfg)
 
     @classmethod
     def settings_customise_sources(
