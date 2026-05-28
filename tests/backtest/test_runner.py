@@ -318,9 +318,9 @@ async def test_runner_gap_through_stop_uses_daily_low(tmp_path: Path) -> None:
     sells = result.trade_log[result.trade_log["side"] == "sell"].reset_index(drop=True)
     assert len(sells) >= 1, "intraday -35% low must trigger the hard stop"
     hard = sells[sells["reason"] == "hard_stop"]
-    assert len(hard) >= 1, (
-        f"expected a hard_stop exit on the intraday-crater day; sells={sells.to_dict('records')}"
-    )
+    assert (
+        len(hard) >= 1
+    ), f"expected a hard_stop exit on the intraday-crater day; sells={sells.to_dict('records')}"
     exit_row = hard.iloc[0]
     # Exit on day 2 (the crater day), filled at the conservative LOW (~65),
     # NOT the recovered close (99). Cost model applies sell slippage so it's
@@ -391,6 +391,43 @@ async def test_runner_skips_weekend_days(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_skips_us_federal_holidays(tmp_path: Path) -> None:
+    """Round-11 regression: the backtest must count TRADING days (weekends AND
+    US federal holidays excluded), not just weekdays, so bars_held — the
+    21-trading-day time stop — advances identically to the live
+    RuntimeContext.eod_close (which skips holidays via the same
+    _us_business_holidays() calendar). Span Thu 2024-05-23 → Wed 2024-05-29
+    contains Memorial Day (Mon 2024-05-27): 5 weekdays but only 4 trading days.
+    The old code counted the holiday as a bar, so the backtest time-stop fired
+    ~1 day earlier than live over a holiday-spanning hold (same-code-path
+    divergence per design principle #4).
+    """
+    cache = ParquetCache(root=tmp_path)
+    _seed(cache)
+    settings = Settings()
+    settings.score.weights = {
+        "f1_si_pct": 2.0,
+        "f2_days_to_cover": 1.0,
+        "f3_earnings_reaction": 2.0,
+        "f4_wsb_mention": 1.5,
+        "f5_call_oi_velocity": 1.5,
+        "f6_bollinger_breakout": 1.0,
+        "f7_volume_spike": 1.0,
+    }
+    cfg = BacktestConfig(
+        tickers=_ALL_TICKERS,
+        start=datetime(2024, 5, 23, tzinfo=UTC),
+        end=datetime(2024, 5, 29, tzinfo=UTC),
+        initial_cash=100_000.0,
+        score_threshold=3.0,
+    )
+    result = await run_backtest(cfg, cache=cache, settings=settings)
+    # Thu 23, Fri 24, [Mon 27 = Memorial Day → SKIPPED], Tue 28, Wed 29
+    # = 4 trading days, NOT 5 weekdays.
+    assert len(result.equity_curve) == 4
+
+
+@pytest.mark.asyncio
 async def test_runner_records_realized_pnl_on_sells(tmp_path: Path) -> None:
     """C2: trade_log sell entries must include `realized` so Kelly counter works."""
     cache = ParquetCache(root=tmp_path)
@@ -449,9 +486,9 @@ async def test_runner_halve_amortizes_entry_commission_across_remaining_qty() ->
     exit_charge = entry_commission_per_share * exit_qty
     # Total entry commission charged across all legs MUST equal the original $5.
     total = halve_1_charge + halve_2_charge + exit_charge
-    assert abs(total - entry_commission) < 1e-9, (
-        f"amortized entry commission {total} != original {entry_commission}"
-    )
+    assert (
+        abs(total - entry_commission) < 1e-9
+    ), f"amortized entry commission {total} != original {entry_commission}"
     # And no single leg should ever charge MORE than the original entry commission.
     assert max(halve_1_charge, halve_2_charge, exit_charge) <= entry_commission
 
@@ -513,13 +550,13 @@ async def test_runner_realized_pnl_subtracts_round_trip_commission(tmp_path: Pat
         # round-trip commission at $0.50/share = qty * 1.0
         expected_commission = qty * 0.50 * 2  # buy + sell
         # Realized must be lower than gross by approximately round-trip commission
-        assert sell["realized"] < gross, (
-            f"realized {sell['realized']} >= gross {gross} for {ticker} — commissions not deducted"
-        )
+        assert (
+            sell["realized"] < gross
+        ), f"realized {sell['realized']} >= gross {gross} for {ticker} — commissions not deducted"
         diff = gross - sell["realized"]
-        assert abs(diff - expected_commission) < 0.01, (
-            f"expected commission deduction ≈ {expected_commission}, got {diff} for {ticker}"
-        )
+        assert (
+            abs(diff - expected_commission) < 0.01
+        ), f"expected commission deduction ≈ {expected_commission}, got {diff} for {ticker}"
 
 
 @pytest.mark.asyncio
@@ -559,9 +596,9 @@ async def test_runner_gross_exposure_invariant(tmp_path: Path) -> None:
     if len(buys) > 0:
         for day, day_buys in buys.groupby("ts"):
             notional = (day_buys["qty"] * day_buys["price"]).sum()
-            assert notional <= 100_000.0 * 0.90 + 1.0, (
-                f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
-            )
+            assert (
+                notional <= 100_000.0 * 0.90 + 1.0
+            ), f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
 
 
 def test_runner_gross_exposure_updates_state() -> None:
@@ -575,6 +612,6 @@ def test_runner_gross_exposure_updates_state() -> None:
 
     src = inspect.getsource(runner_mod)
     # The R6 fix line must be present in the daily loop
-    assert "state.gross_exposure_pct += size_usd / state.equity_usd" in src, (
-        "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
-    )
+    assert (
+        "state.gross_exposure_pct += size_usd / state.equity_usd" in src
+    ), "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
