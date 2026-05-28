@@ -100,8 +100,16 @@ def hit_rate_and_payoff(trade_log: pd.DataFrame) -> tuple[float, float]:
     wins = [p for p in pnls if p > 0]
     losses = [-p for p in pnls if p < 0]
     hit = len(wins) / len(pnls)
+    # R11: when there are wins but NO losing trades the payoff ratio has no
+    # denominator. The old code divided avg_win by a literal $1.00, returning a
+    # raw DOLLAR magnitude (scale-dependent on price/lot size) instead of a
+    # dimensionless ratio — so Gate 1's avg_payoff check flipped pass/fail on
+    # lot size. Treat "no downside observed" as an infinite payoff (which clears
+    # avg_payoff_min); 0.0 only when there are no winning trades either.
+    if not losses:
+        return hit, (float("inf") if wins else 0.0)
     avg_win = float(np.mean(wins)) if wins else 0.0
-    avg_loss = float(np.mean(losses)) if losses else 1.0
+    avg_loss = float(np.mean(losses))
     payoff = avg_win / avg_loss if avg_loss > 0 else 0.0
     return hit, payoff
 

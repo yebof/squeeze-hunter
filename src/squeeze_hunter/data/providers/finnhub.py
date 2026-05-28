@@ -43,7 +43,22 @@ class FinnhubProvider:
         for ev in raw.get("earningsCalendar", []):
             d = date.fromisoformat(ev["date"])
             hour = (ev.get("hour") or "").lower()
-            ts = datetime(d.year, d.month, d.day, 20 if hour == "amc" else 12, 30, tzinfo=UTC)
+            # R11: yfinance daily bars are indexed at ET-midnight → 04:00-05:00
+            # UTC. Stamp report_at relative to the report-day bar so the signal
+            # (compute_earnings_reaction splits bars on b.ts < report_at) puts
+            # the reaction in the right place:
+            #   amc (after close)        → 20:30 UTC: report-day bar stays
+            #                              PRE-event, the reaction is next day.
+            #   bmo (before open) / dmh  → 00:00 UTC: the reaction IS the
+            #   (during hours) / unknown   report-day close, so that bar must be
+            #                              the first POST-event bar.
+            # The prior code defaulted every non-amc value to 12:30 UTC — AFTER
+            # the bar — so before-open reactions were misclassified as pre-event
+            # and f3 measured the wrong (next) day.
+            if hour == "amc":
+                ts = datetime(d.year, d.month, d.day, 20, 30, tzinfo=UTC)
+            else:
+                ts = datetime(d.year, d.month, d.day, 0, 0, tzinfo=UTC)
             out.append(
                 EarningsEvent(
                     ticker=ticker,

@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -29,6 +29,63 @@ async def test_submit_buy_returns_pending_order() -> None:
     assert order.status == "pending"
     assert order.side == "buy"
     assert order.qty == 100
+
+
+@pytest.mark.asyncio
+async def test_fetch_quote_coalesces_nan_to_zero_when_no_data() -> None:
+    """Round-11 regression: ib-async's Ticker initializes bid/ask/last/close to
+    float('nan'), NOT None. Because nan is truthy, `float(ticker_data.bid or 0.0)`
+    returned nan whenever market data had not arrived (halt / after-hours /
+    unsubscribed / slow snapshot) — the intended coalescing to 0.0 never happened.
+    NaN then slips past the lifecycle's `price <= 0.0` stop guard (nan <= 0.0 is
+    False), silently disabling the hard/trailing stops. fetch_quote must coalesce
+    non-finite values to 0.0 so the documented zero-price guard fires.
+    """
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    fake_ib.qualifyContractsAsync = AsyncMock()
+    nan = float("nan")
+    ticker_data = MagicMock()
+    ticker_data.bid = nan
+    ticker_data.ask = nan
+    ticker_data.last = nan
+    ticker_data.close = nan
+    fake_ib.reqMktData = MagicMock(return_value=ticker_data)
+    broker._ib = fake_ib
+
+    # Patch sleep so the (now correctly-waiting) snapshot loop doesn't take 10s.
+    with patch("squeeze_hunter.broker.ibkr.asyncio.sleep", new=AsyncMock()):
+        q = await broker.fetch_quote("GME")
+
+    assert q.bid == 0.0
+    assert q.ask == 0.0
+    assert q.last == 0.0
+    # The lifecycle zero-price guard (`price <= 0.0`) must now fire.
+    price = q.last or q.bid or q.ask
+    assert price <= 0.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_quote_falls_back_to_close_when_last_is_nan() -> None:
+    """Round-11: when `last` and bid/ask are nan (no live trade yet) but the
+    prior `close` is valid, fetch_quote should report the close — not 0.0 and
+    not nan."""
+    broker = IBKRBroker(client_id=99)
+    fake_ib = MagicMock()
+    fake_ib.qualifyContractsAsync = AsyncMock()
+    nan = float("nan")
+    ticker_data = MagicMock()
+    ticker_data.bid = nan
+    ticker_data.ask = nan
+    ticker_data.last = nan
+    ticker_data.close = 21.5
+    fake_ib.reqMktData = MagicMock(return_value=ticker_data)
+    broker._ib = fake_ib
+
+    with patch("squeeze_hunter.broker.ibkr.asyncio.sleep", new=AsyncMock()):
+        q = await broker.fetch_quote("GME")
+
+    assert q.last == 21.5
 
 
 @pytest.mark.asyncio
@@ -127,9 +184,9 @@ async def test_known_nyse_ticker_carries_nyse_primary_exchange() -> None:
     )
     assert len(captured) == 1
     # GME is in the defaults map as NYSE — must NOT be NASDAQ or empty.
-    assert getattr(captured[0], "primaryExchange", "") == "NYSE", (
-        f"GME contract primaryExchange should be NYSE, got {captured[0]!r}"
-    )
+    assert (
+        getattr(captured[0], "primaryExchange", "") == "NYSE"
+    ), f"GME contract primaryExchange should be NYSE, got {captured[0]!r}"
 
 
 @pytest.mark.asyncio
@@ -243,9 +300,10 @@ async def test_ibkr_get_position_qty_refreshes_positions_snapshot() -> None:
     qty = await broker.get_position_qty("GME")
     assert qty == 40
     # The refresh MUST happen before the read.
-    assert order == ["reqPositionsAsync", "positions"], (
-        f"positions() read without a fresh reqPositionsAsync() sync: {order}"
-    )
+    assert order == [
+        "reqPositionsAsync",
+        "positions",
+    ], f"positions() read without a fresh reqPositionsAsync() sync: {order}"
 
 
 @pytest.mark.asyncio

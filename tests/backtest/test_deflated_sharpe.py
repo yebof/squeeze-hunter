@@ -27,3 +27,33 @@ def test_deflated_sharpe_at_n_obs_floor() -> None:
     # The deflated value is a probability in [0, 1]; for a strong observed SR
     # it should be > 0 but well below 1.
     assert 0.0 < val < 1.0
+
+
+def test_deflated_sharpe_units_realistic_annualized_sharpe() -> None:
+    """Round-11 regression: observed_sr is the ANNUALIZED Sharpe (metrics.sharpe
+    multiplies by sqrt(252)), but the DSR standard error and expected-max
+    benchmark are in PER-PERIOD SR units. The shipped code fed the annualized SR
+    straight in AND dropped the `e_max * sr_std` scaling, so Gate 1's pass/fail
+    boundary became a units artifact: deflated ≈ 0 for annualized 1.0-1.5 (which
+    clear sharpe_min=1.0) and jumped to ≈ 1 only near annualized 2.0. A realistic
+    annualized Sharpe of 1.2 over 250 obs with 10 trials must yield a SANE
+    probability, not a near-zero cliff.
+    """
+    val = deflated_sharpe(observed_sr=1.2, n_trials=10, n_obs=250)
+    assert 0.15 < val < 0.6, f"expected a sane deflated probability, got {val}"
+
+
+def test_deflated_sharpe_no_penalty_at_single_trial() -> None:
+    """With n_trials=1 there is no multiple-testing penalty, so a positive
+    annualized Sharpe should deflate to ~1.0 (the CLI default n_trials=1 keeps
+    the gate effectively inert, as designed)."""
+    val = deflated_sharpe(observed_sr=1.0, n_trials=1, n_obs=250)
+    assert val > 0.95
+
+
+def test_deflated_sharpe_monotonic_in_observed_sharpe() -> None:
+    """Higher annualized Sharpe → higher deflated probability at fixed
+    trials/obs."""
+    lo = deflated_sharpe(observed_sr=1.0, n_trials=20, n_obs=250)
+    hi = deflated_sharpe(observed_sr=2.5, n_trials=20, n_obs=250)
+    assert hi > lo

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,20 @@ _STATUS_MAP = {
 
 def _translate_status(ibkr_status: str) -> str:
     return _STATUS_MAP.get(ibkr_status, "pending")
+
+
+def _finite_or_zero(x: object) -> float:
+    """Coalesce None / NaN / Inf to 0.0.
+
+    R11: ib-async's Ticker initializes bid/ask/last/close to ``float("nan")``,
+    not None. Because nan is truthy, the naive ``float(x or 0.0)`` returned nan
+    unchanged whenever market data had not arrived — and nan then slips past the
+    lifecycle's ``price <= 0.0`` stop guard (``nan <= 0.0`` is False), silently
+    disabling the hard/trailing stops. Coalesce explicitly on finiteness.
+    """
+    if isinstance(x, int | float) and math.isfinite(x):
+        return float(x)
+    return 0.0
 
 
 def _ibkr_default_host() -> str:
@@ -151,16 +166,23 @@ class IBKRBroker:
         contract = self._make_stock(ticker)
         await self._ib.qualifyContractsAsync(contract)
         ticker_data = self._ib.reqMktData(contract, "", snapshot=True, regulatorySnapshot=False)
-        # Wait for snapshot — ib-async populates fields as updates arrive
+        # Wait for snapshot — ib-async populates fields as updates arrive.
+        # R11: a fresh Ticker's fields are float("nan"), not None, so the old
+        # `is not None` break was True on the very first iteration and we
+        # returned a premature NaN. Break only once a FINITE bid or last has
+        # actually arrived.
         for _ in range(40):
             await asyncio.sleep(0.25)
-            if ticker_data.last is not None or ticker_data.bid is not None:
+            if math.isfinite(ticker_data.last) or math.isfinite(ticker_data.bid):
                 break
+        # R11: coalesce non-finite values to 0.0 (see _finite_or_zero) so a
+        # missing quote becomes 0.0 — caught by the lifecycle zero-price guard —
+        # instead of NaN, which slips past it.
         return Quote(
             ticker=ticker,
-            bid=float(ticker_data.bid or 0.0),
-            ask=float(ticker_data.ask or 0.0),
-            last=float(ticker_data.last or ticker_data.close or 0.0),
+            bid=_finite_or_zero(ticker_data.bid),
+            ask=_finite_or_zero(ticker_data.ask),
+            last=_finite_or_zero(ticker_data.last) or _finite_or_zero(ticker_data.close),
             timestamp_ns=time.time_ns(),
         )
 

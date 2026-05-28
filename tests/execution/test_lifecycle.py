@@ -1,6 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -54,6 +54,55 @@ async def test_manage_keeps_position_when_exit_order_pending() -> None:
     assert not out.exits
     # The pending order id should be tracked on the meta.
     assert "pending-1" in out.positions["GME"].get("pending_exits", [])
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_skips_position_when_quote_is_nan() -> None:
+    """Round-11 regression: a NaN quote (ib-async Ticker fields init to nan, or a
+    stale/halted snapshot) must NOT slip past the zero-price guard. `nan <= 0.0`
+    is False, so the old `if price <= 0.0` let NaN through → peak_price poisoned
+    and evaluate_stops compared nan (so the hard/trailing stops silently never
+    fired — exactly the catastrophic gap-down-in-a-halt case). Treat NaN like
+    zero: skip this tick, keep the position, take no action.
+    """
+    broker = MagicMock()
+    broker.fetch_quote = AsyncMock(
+        return_value=Quote(
+            ticker="GME",
+            bid=float("nan"),
+            ask=float("nan"),
+            last=float("nan"),
+            timestamp_ns=0,
+        )
+    )
+    broker.submit_sell = AsyncMock()
+    state = LifecycleState(
+        positions={
+            "GME": {
+                "qty": 100,
+                "entry_price": 100.0,
+                "peak_price": 110.0,
+                "entry_score": 10.0,
+                "current_score": 9.0,
+                "bars_held": 2,
+                "setup_type": "CAR",
+            }
+        }
+    )
+    # Patch evaluate_stops so we can prove the NaN price short-circuits BEFORE any
+    # stop math runs. The old `if price <= 0.0` guard did NOT catch nan (nan<=0.0
+    # is False), so evaluate_stops ran on a nan price — every comparison was False
+    # and the stops silently failed to fire. The fix must skip the tick entirely.
+    with patch("squeeze_hunter.execution.lifecycle.evaluate_stops") as eval_mock:
+        out = await manage_positions(
+            state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+        )
+    eval_mock.assert_not_called()
+    # peak_price must not be poisoned, position kept (retry next tick), no sell.
+    assert out.positions["GME"]["peak_price"] == 110.0
+    assert "GME" in out.positions
+    assert not out.exits
+    broker.submit_sell.assert_not_called()
 
 
 @pytest.mark.asyncio
