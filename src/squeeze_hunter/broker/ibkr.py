@@ -278,8 +278,16 @@ class IBKRBroker:
         await asyncio.wait_for(self._ib.reqPositionsAsync(), timeout=refresh_timeout_s)
         total = 0
         for pos in self._ib.positions():
-            if getattr(pos.contract, "symbol", None) == ticker:
-                total += int(pos.position)
+            if getattr(pos.contract, "symbol", None) != ticker:
+                continue
+            # Round-12: on a multi-account login (FA / linked accounts) rows
+            # from other accounts inflated the qty, so the pending-exit
+            # reconcile concluded "didn't fill" and resubmitted a full-size
+            # sell. Filter by the configured account when one is set.
+            pos_account = getattr(pos, "account", None)
+            if self.account and pos_account and pos_account != self.account:
+                continue
+            total += int(pos.position)
         return total
 
     async def get_open_orders(self: IBKRBroker) -> list[BrokerOrder]:

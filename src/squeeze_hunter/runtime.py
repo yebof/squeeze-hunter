@@ -44,6 +44,12 @@ def _is_us_regular_session(now: datetime) -> bool:
     return _SESSION_OPEN <= et.time() < _SESSION_CLOSE
 
 
+def _session_open_utc(now: datetime) -> datetime:
+    """Today's 09:30 ET (for `now`'s ET calendar day) expressed in UTC."""
+    et = now.astimezone(_NY)
+    return datetime.combine(et.date(), _SESSION_OPEN, tzinfo=_NY).astimezone(UTC)
+
+
 @dataclass
 class PortfolioTelemetry:
     """Tracks the inputs that feed evaluate_killswitch.
@@ -160,6 +166,20 @@ class PortfolioTelemetry:
             if gap < worst:
                 worst = gap
         return worst
+
+    def clamp_freshness_to(self: PortfolioTelemetry, floor: datetime) -> None:
+        """Raise heartbeat / data-freshness stamps older than `floor` up to it.
+
+        Round-12: the outage arms must measure IN-SESSION time. Ticks outside
+        09:30-16:00 ET return before touching telemetry, so both stamps froze
+        at ~15:59 ET; a single transient health() failure at the next open
+        then read as a 17 h (65 h over a weekend) outage → 7-day lockout.
+        """
+        if self.last_broker_heartbeat is not None and self.last_broker_heartbeat < floor:
+            self.last_broker_heartbeat = floor
+        for src, ts in list(self.data_freshness.items()):
+            if ts < floor:
+                self.data_freshness[src] = floor
 
     def broker_disconnected_for_seconds(self: PortfolioTelemetry, as_of: datetime) -> int:
         if self.last_broker_heartbeat is None:
@@ -344,6 +364,9 @@ class RuntimeContext:
         # broker / metrics_registry already validated by tick()'s entry guard.
         assert self.broker is not None
         assert self.metrics_registry is not None
+        # Round-12: outage timers count from today's open, not from the last
+        # in-session tick of the previous day (see clamp_freshness_to).
+        self.telemetry.clamp_freshness_to(_session_open_utc(now))
         # R3.1: capture position keys BEFORE manage_positions so we can detect
         # which positions were exited this tick and clear their stale telemetry
         # marks. Without this, worst_position_gap_pct keeps reading the last
@@ -569,14 +592,6 @@ class RuntimeContext:
         # backtest runner has no equivalent in Phase 3's manual review
         # workflow). Existing positions still run through their stops in
         # tick() — that's the spec's "no panic-flatten" behavior.
-        if self.kill_switch_active:
-            log.warning(
-                "nightly_scan_suppressed_killswitch_active",
-                reason=self._kill_reason,
-            )
-            self.last_candidates = pd.DataFrame()
-            return
-
         clock = Clock(now=now)
         provider = BacktestProvider(
             cache=self.cache,
@@ -584,7 +599,19 @@ class RuntimeContext:
             finra_publication_lag_bdays=self.settings.data.finra_publication_lag_bdays,
         )
         ranked = await run_scan(self.tickers, provider, now, self.settings)
-        self.last_candidates = ranked
+        if self.kill_switch_active:
+            # Round-12: the scan still runs so HELD positions get their
+            # current_score refreshed below — the signal-decay stops read it,
+            # and freezing it for the whole cooldown made them dead exactly
+            # when a tripped portfolio needs them. Only candidate emission is
+            # suppressed.
+            log.warning(
+                "nightly_scan_suppressed_killswitch_active",
+                reason=self._kill_reason,
+            )
+            self.last_candidates = pd.DataFrame()
+        else:
+            self.last_candidates = ranked
 
         if not ranked.empty:
             ranked_by_ticker = ranked.set_index("ticker")["score"].to_dict()
