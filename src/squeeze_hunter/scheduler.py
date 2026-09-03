@@ -96,5 +96,8 @@ def build_scheduler(
             raise ValueError(
                 f"build_scheduler: unknown trigger type {spec['trigger']!r} for job {spec['id']!r}"
             )
-        sched.add_job(cb, trigger=trigger, id=spec["id"])
+        # Round-12: APScheduler's default misfire_grace_time is 1 s — a cron
+        # fire (eod_close, nightly_scan) coinciding with a >1 s event-loop stall
+        # was silently dropped. 60 s grace + coalesce keeps one late run.
+        sched.add_job(cb, trigger=trigger, id=spec["id"], misfire_grace_time=60, coalesce=True)
     return sched

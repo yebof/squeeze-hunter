@@ -24,6 +24,32 @@ app = typer.Typer(no_args_is_help=True)
 log = get_logger("cli")
 
 
+def _load_dotenv(start: Path | None = None) -> Path | None:
+    """Load the nearest `.env` at or above `start` (default: cwd), never
+    overriding variables already present in the real environment.
+
+    Round-12: README told operators to `cp .env.example .env`, but nothing
+    ever read the file — Settings drops the dotenv source and IBKR_* /
+    FINNHUB_KEY are plain os.environ lookups — so credentials silently
+    resolved to the paper-account defaults.
+    """
+    from dotenv import load_dotenv
+
+    here = (start or Path.cwd()).resolve()
+    for candidate in (here, *here.parents):
+        env_file = candidate / ".env"
+        if env_file.is_file():
+            load_dotenv(env_file, override=False)
+            return env_file
+    return None
+
+
+@app.callback()
+def _root() -> None:
+    """Squeeze-hunter CLI."""
+    _load_dotenv()
+
+
 def _build_runtime_callbacks(
     rc: RuntimeContext,
     pending_tasks: set[asyncio.Task[Any]] | None = None,
@@ -51,17 +77,29 @@ def _build_runtime_callbacks(
         task.add_done_callback(tracker.discard)
         return task
 
+    def _job(make_coro: Callable[[datetime], Any]) -> Callable[[], Any]:
+        # Round-12: APScheduler's AsyncIOExecutor runs *sync* job functions in
+        # a worker thread (loop.run_in_executor), where asyncio.create_task
+        # raises "no running event loop" — so the previous sync lambdas never
+        # ran a single tick in paper/live. A coroutine job is scheduled on the
+        # loop itself; it spawns the tracked task and returns immediately, so
+        # R6.C2's shutdown handling (await pending_tasks) still applies.
+        async def _run() -> None:
+            _spawn(make_coro(datetime.now(UTC)))
+
+        return _run
+
     return {
         # Phase 4: integrate live EOD data ingest (yfinance → parquet backfill)
         "ingest_eod": None,
-        "nightly_scan": lambda: _spawn(rc.nightly_scan_safe(now=datetime.now(UTC))),
+        "nightly_scan": _job(lambda now: rc.nightly_scan_safe(now=now)),
         # Phase 4: overnight news + halt-list ingest
         "premarket_data": None,
-        "premarket_verify": lambda: _spawn(rc.premarket_verify_safe(now=datetime.now(UTC))),
-        "intraday_loop": lambda: _spawn(rc.tick_safe(now=datetime.now(UTC))),
+        "premarket_verify": _job(lambda now: rc.premarket_verify_safe(now=now)),
+        "intraday_loop": _job(lambda now: rc.tick_safe(now=now)),
         # Phase 4: MoC / EOL flatten logic
         "moc_decision": None,
-        "eod_close": lambda: _spawn(rc.eod_close_safe(now=datetime.now(UTC))),
+        "eod_close": _job(lambda now: rc.eod_close_safe(now=now)),
     }
 
 
@@ -196,7 +234,12 @@ def ingest_earnings(
     configure_logging()
     cache = ParquetCache(root=parquet_root)
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
-    asyncio.run(backfill_earnings(tickers, cache))
+    try:
+        asyncio.run(backfill_earnings(tickers, cache))
+    except ValueError as e:
+        # Round-12: a missing FINNHUB_KEY used to exit 0 having written nothing.
+        typer.echo(f"ERROR: {e}", err=True)
+        raise typer.Exit(code=2) from e
 
 
 @app.command()
