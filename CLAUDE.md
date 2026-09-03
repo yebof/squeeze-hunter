@@ -38,8 +38,9 @@ codebase. They override Claude's defaults when they conflict.
   loops over **trading days** (`pd.bdate_range`), not calendar days.
 - **Async:** never block the event loop with synchronous I/O. Wrap PRAW /
   yfinance / `_ib.disconnect()` etc. in `asyncio.to_thread`.
-- **Pre-commit hooks must pass without `--no-verify`.** ruff, ruff-format, ty,
-  and pytest run on every commit. Fix the underlying issue rather than skipping.
+- **Pre-commit hooks must pass without `--no-verify`.** ruff, ruff-format, and
+  ty run on every commit; pytest runs on pre-push. Fix the underlying issue
+  rather than skipping.
 
 ## Areas with known subtleties
 
@@ -59,14 +60,14 @@ codebase. They override Claude's defaults when they conflict.
   lookup at INGEST time (see `ingest/backfill_finra.py`). The signal returns 0
   for tickers with `si_pct_float <= 0`, so old parquet data without the merge
   produces a dead factor. Re-run ingest after pulling the C5 fix.
-- **`f5_call_oi_velocity`** — reads the 7-day-prior chain via
+- **`f5_call_oi_velocity`** — reads the 5-trading-day-prior chain via
   `provider.fetch_option_chain_at`. If you don't have an options-chain ingest
   job (Phase 4), the signal returns 0 in backtest. That's accepted.
 
 ## Phase status
 
 - ✅ Phase 0–3 complete and tagged.
-- 218 tests passing.
+- 308 tests passing.
 - Two review rounds + 30+ bug fixes have hardened the codebase.
 - Next user-side step: end-to-end backtest + Gate 1 evaluation. Then paper
   trading for 30 days. Phase 4 (small live) only after Gate 2 passes.
