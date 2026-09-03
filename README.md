@@ -68,8 +68,10 @@ uv run squeeze-hunter scan --date 2025-04-21
 # HTZ should rank in the top 3 with setup_type=CAR
 
 # 3) walk-forward backtest with Gate 1
+# train_end must be <= the first test window's start (2021-01-01) or the
+# walk-forward validator rejects the run as train/test leakage.
 uv run squeeze-hunter backtest \
-  --train-start 2018-01-01 --train-end 2024-12-31 \
+  --train-start 2018-01-01 --train-end 2020-12-31 \
   --test-window 2021-01-01:2021-12-31 \
   --test-window 2022-01-01:2022-12-31 \
   --test-window 2023-01-01:2023-12-31 \
@@ -97,13 +99,13 @@ Postgres stores state and reference; parquet stores time-series history.
 
 ```
 src/squeeze_hunter/
-├── data/        # schemas, Protocol, parquet cache, 6 providers
+├── data/        # schemas, Protocol, parquet cache, 5 providers
 ├── universe.py  # filter & rebuild universe
 ├── signals/     # 7 factors + cross-sectional z-score + orchestrator
 ├── score/       # weighted combiner + setup classifier
 ├── risk/        # Kelly + 14 gates + stops + killswitch
 ├── execution/   # OMS + TWAP slicer + lifecycle daemon
-├── broker/      # IBroker Protocol + 4 implementations
+├── broker/      # IBroker Protocol + 3 implementations
 ├── backtest/    # bar-based runner + walk-forward + metrics + Gate 1
 ├── monitor/     # Prometheus exporter + health + Telegram/Slack alerts
 ├── store/       # Postgres ORM + Alembic
@@ -115,8 +117,9 @@ src/squeeze_hunter/
 ## Engineering
 
 - **Tooling:** `uv` (deps + lockfile), `ruff` (format + lint), `ty` (type check),
-  `pytest`, `structlog`. Pre-commit hooks enforce all of these on every commit.
-- **Tests:** 218 unit + integration tests (run with `uv run pytest`). Each
+  `pytest`, `structlog`. Pre-commit hooks run ruff, ruff-format, and ty on every
+  commit; pytest runs on pre-push.
+- **Tests:** 308 unit + integration tests (run with `uv run pytest`). Each
   reviewed bug fix has a regression test that would have caught the original
   bug. Aim for ≥ 90% line coverage on `signals/`, `risk/`, `score/`, `execution/`.
 - **Config:** all magic numbers live in `config/settings.example.yml`. Override
