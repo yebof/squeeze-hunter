@@ -179,9 +179,13 @@ class BacktestProvider:
         # system could not yet have known — lookahead that inflates Gate 1.
         lag = self.finra_publication_lag_bdays
         if lag > 0:
-            available = (
-                pd.to_datetime(df["settlement_date"]) + pd.offsets.BusinessDay(lag)
-            ).dt.date
+            # Round-12: count US federal holidays like the rest of the codebase
+            # (time stop, f3 window). Plain BusinessDay revealed the record one
+            # business day early whenever a holiday fell inside the lag window.
+            from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+
+            bday = pd.offsets.CustomBusinessDay(n=lag, holidays=_us_business_holidays())
+            available = (pd.to_datetime(df["settlement_date"]) + bday).dt.date
         else:
             available = df["settlement_date"]
         mask = (df["ticker"] == ticker) & (available <= clock_d)
