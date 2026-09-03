@@ -120,8 +120,18 @@ async def run_backtest(
     trailing_mixed = abs(settings.stops.trailing_mixed)
 
     for cur_ts in trading_days:
-        # Convert pd.Timestamp to datetime; hour/min/sec are already 0 from bdate_range.
-        cur: datetime = cur_ts.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+        # `day_label` (00:00 UTC) stamps the trade log / equity curve.
+        day_label: datetime = cur_ts.to_pydatetime().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # Round-12: the provider clock sits at the END of the UTC day. Ingested
+        # bars are stamped at exchange midnight in UTC (04:00/05:00, yahoo.py);
+        # with the old 00:00 clock every `[cur-2d, cur]` window ended BEFORE
+        # today's bar, so each label processed yesterday's session, Monday
+        # labels saw nothing and Friday sessions were never evaluated at all.
+        # The live nightly scan runs after the close (22:00 ET ≈ 02:00 UTC next
+        # day), so anything stamped ≤ 23:59:59 UTC is information live had too.
+        cur: datetime = day_label.replace(hour=23, minute=59, second=59, microsecond=999999)
         clock.advance_to(cur)
 
         # 0) CDX-P1-1: execute entries decided by the PREVIOUS day's scan, at
@@ -137,17 +147,21 @@ async def run_backtest(
                     ebars = await provider.fetch_bars(t, cur - timedelta(days=2), cur)
                 except LookupError:
                     continue
-                if not ebars:
-                    # No bar today (halt / delist) → the entry can't fill; drop it.
+                if not ebars or ebars[-1].ts.date() != cur.date():
+                    # No bar TODAY (halt / delist) → the entry can't fill; drop it.
+                    # Round-12: the window may still hold a stale prior bar —
+                    # filling at its open would trade at the open of the very
+                    # bar whose close the scan already consumed.
                     continue
                 fill_px = ebars[-1].open
                 if fill_px <= 0:
                     continue
                 eqty = max(1, int(entry["size_usd"] // fill_px))
-                eorder = await broker.submit_buy(t, eqty, fill_px, cur)
+                # Round-12: entries fill at the 09:30 print → open-window slippage.
+                eorder = await broker.submit_buy(t, eqty, fill_px, cur, is_open_5min=True)
                 trade_log.append(
                     {
-                        "ts": cur,
+                        "ts": day_label,
                         "ticker": t,
                         "side": "buy",
                         "qty": eqty,
@@ -196,7 +210,9 @@ async def run_backtest(
                 bars = await provider.fetch_bars(ticker, cur - timedelta(days=2), cur)
             except LookupError:
                 continue
-            if not bars:
+            if not bars or bars[-1].ts.date() != cur.date():
+                # Round-12: no bar TODAY (halt / delist) — don't re-run stops or
+                # advance bars_held on a stale prior bar; keep the last mark.
                 continue
             last = bars[-1]
             marks[ticker] = last.close  # surviving positions are marked at close
@@ -207,7 +223,11 @@ async def run_backtest(
             # combining today's high with today's low would manufacture a
             # same-day round-trip the live daemon wouldn't necessarily see
             # (price order within the day is unknown from a daily bar).
-            st["peak"] = max(st["peak"], last.close)
+            # Round-12: today's LOW is evaluated against the peak as of
+            # YESTERDAY's close; folding today's close in first assumed the
+            # close preceded the low and manufactured trailing-stop exits at
+            # the low of wide-range UP days. Today's close is folded in below,
+            # after evaluate_stops.
             entry_px = st["entry_price"]
             if entry_px > 0:
                 intraday_gap_by_ticker[ticker] = (last.low - entry_px) / entry_px
@@ -218,6 +238,7 @@ async def run_backtest(
                 entry_score=st["entry_score"],
                 bars_held=st["bars_held"],
                 setup_type=st["setup_type"],
+                halved=bool(st.get("halved", False)),
             )
             # CDX-P1-2: evaluate the PRICE arms (hard / trailing) against the
             # day's LOW, not the close. The live 60s lifecycle daemon ticks
@@ -237,6 +258,7 @@ async def run_backtest(
                 trailing_gme=trailing_gme,
                 trailing_mixed=trailing_mixed,
             )
+            st["peak"] = max(st["peak"], last.close)
             # CDX-P1-2: price-triggered exits filled at the conservative day
             # LOW (you don't get the recovered close if you stopped out at the
             # intraday plunge). Non-price exits (time stop / signal decay) are
@@ -262,7 +284,7 @@ async def run_backtest(
                     pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
                         {
-                            "ts": cur,
+                            "ts": day_label,
                             "ticker": ticker,
                             "side": "sell",
                             "qty": qty,
@@ -277,6 +299,10 @@ async def run_backtest(
                     )
                 tickers_to_remove.append(ticker)
             elif sig.action == "halve":
+                # Round-12: one-shot — evaluate_stops is stateless, the flag is
+                # what stops the halve from re-firing every day (mirrors the
+                # live daemon's meta["halved"]).
+                st["halved"] = True
                 qty = broker.position_qty(ticker) // 2
                 if qty > 0:
                     # signal_decay_half is not price-triggered → fill at close.
@@ -294,7 +320,7 @@ async def run_backtest(
                     pct_return = realized / cost_basis if cost_basis > 0 else 0.0
                     trade_log.append(
                         {
-                            "ts": cur,
+                            "ts": day_label,
                             "ticker": ticker,
                             "side": "sell",
                             "qty": qty,
@@ -470,7 +496,7 @@ async def run_backtest(
 
         # 4) Mark-to-market end of day
         broker.mark_to_market(marks, ts=cur)
-        equity_series.append((cur, broker.equity))
+        equity_series.append((day_label, broker.equity))
         daily_rows.append({"date": cur.date(), "equity": broker.equity, "cash": broker.cash})
 
         # R7.C2: evaluate the killswitch against the per-day equity series.
