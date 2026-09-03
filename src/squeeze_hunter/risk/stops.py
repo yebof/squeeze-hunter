@@ -14,6 +14,11 @@ class StopState:
     entry_score: float
     bars_held: int
     setup_type: str  # CAR, GME, Mixed
+    # Round-12: the signal-decay halve is a ONE-SHOT per position. This
+    # function is stateless, so callers record the halve on their position
+    # meta and pass it back; otherwise the live daemon re-halved every 60 s
+    # while decay sat in [halve, exit) (backtest: once per day).
+    halved: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,7 +73,7 @@ def evaluate_stops(
         decay = (state.entry_score - state.current_score) / state.entry_score
         if decay >= signal_decay_exit:
             return StopSignal("exit", "signal_decay_75")
-        if decay >= signal_decay_halve:
+        if decay >= signal_decay_halve and not state.halved:
             return StopSignal("halve", "signal_decay_50")
 
     return StopSignal("hold")
