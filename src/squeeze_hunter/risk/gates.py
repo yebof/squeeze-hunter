@@ -80,7 +80,10 @@ def evaluate_gates(
     if ctx.earnings_within_3_days.get(p.ticker, False):
         size = size * 0.5
 
-    if size / state.equity_usd > position_cap:
+    # Round-12: 1e-9 relative tolerance — Kelly returns exactly `cap`, and
+    # (equity*cap)/equity rounds to 0.08000000000000002 for ~2% of equities,
+    # spuriously rejecting a correctly capped proposal.
+    if size / state.equity_usd > position_cap * (1 + 1e-9):
         return GateResult(False, "position_cap_exceeded")
     if (state.gross_exposure_pct + size / state.equity_usd) > max_gross_exposure:
         return GateResult(False, "gross_exposure_exceeded")
