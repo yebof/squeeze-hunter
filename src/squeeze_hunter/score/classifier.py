@@ -19,7 +19,15 @@ from __future__ import annotations
 import pandas as pd
 
 
-def classify_setups(df: pd.DataFrame) -> pd.DataFrame:
+def classify_setups(
+    df: pd.DataFrame, *, strong: float = 4.0, mixed_floor: float = 3.0
+) -> pd.DataFrame:
+    """Label rows CAR / GME / Mixed / Weak.
+
+    Round-12: cutoffs are parameters (fed from settings.score.setup_thresholds
+    by scan.run_scan) instead of hardcoded 4.0 / 3.0 — the YAML key existed but
+    was never read, violating the one-config-file rule.
+    """
     out = df.copy()
 
     # Use .get() pattern to handle missing factor columns gracefully (e.g., when
@@ -35,11 +43,11 @@ def classify_setups(df: pd.DataFrame) -> pd.DataFrame:
     def label(row_a: float, row_b: float) -> str:
         # R9.8: cutoff matches Mixed's floor (3.0). Strong CAR with moderate
         # GME signal still classifies as CAR rather than the prior Weak.
-        if row_a >= 4.0 and row_b < 3.0:
+        if row_a >= strong and row_b < mixed_floor:
             return "CAR"
-        if row_b >= 4.0 and row_a < 3.0:
+        if row_b >= strong and row_a < mixed_floor:
             return "GME"
-        if row_a >= 3.0 and row_b >= 3.0:
+        if row_a >= mixed_floor and row_b >= mixed_floor:
             return "Mixed"
         return "Weak"
 

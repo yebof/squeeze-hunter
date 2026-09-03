@@ -32,7 +32,12 @@ async def run_scan(
     # error + exits non-zero, and the live path's nightly_scan_safe logs it
     # loudly every cycle (visible, not silent). Fail loud > silent no-trade.
     scored = combine(factors, weights=settings.score.weights)
-    classified = classify_setups(scored)
+    thresholds = settings.score.setup_thresholds
+    classified = classify_setups(
+        scored,
+        strong=float(thresholds.get("strong", 4.0)),
+        mixed_floor=float(thresholds.get("mixed_floor", 3.0)),
+    )
     classified = classified.sort_values("score", ascending=False).reset_index(drop=True)
     classified["rank"] = classified.index + 1
     classified["as_of"] = clock
