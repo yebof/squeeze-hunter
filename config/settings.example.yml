@@ -1,5 +1,10 @@
 score:
   threshold: 8.0
+  # Classifier cutoffs (score/classifier.py). A = z[f1]+z[f3], B = z[f4]+z[f5].
+  # CAR: A >= strong and B < mixed_floor (GME mirrors); Mixed: both >= mixed_floor.
+  setup_thresholds:
+    strong: 4.0
+    mixed_floor: 3.0
   weights:
     f1_si_pct: 2.0
     f2_days_to_cover: 1.0
@@ -21,6 +26,11 @@ risk:
   max_positions: 6
   max_new_per_day: 3
   max_gross_exposure: 0.90
+  # Killswitch: rolling-30d max drawdown magnitude that halts new entries
+  # (positive here; code negates it). The other four arms are code constants.
+  monthly_drawdown_kill: 0.10
+  # Kelly shrinkage: observed stats get weight n / (n + bayes_prior_n).
+  bayes_prior_n: 30
 stops:
   hard_stop: -0.12
   # R9.1: trailing magnitudes are stored as negative thresholds (-0.20 = exit
@@ -30,6 +40,10 @@ stops:
   trailing_gme: -0.25
   trailing_mixed: -0.22
   time_stop_days: 21
+  # Signal decay = (entry_score - current_score) / entry_score. Halve once at
+  # >= signal_decay_halve, exit at >= signal_decay_exit.
+  signal_decay_halve: 0.50
+  signal_decay_exit: 0.75
 universe:
   min_market_cap: 200000000
   max_market_cap: 10000000000

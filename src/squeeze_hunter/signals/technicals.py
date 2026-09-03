@@ -20,9 +20,16 @@ async def compute_bollinger_breakout(
     """
     rows = []
     for t in tickers:
-        bars = await provider.fetch_bars(t, clock - timedelta(days=120), clock)
+        # Round-12: sort like f7/f3 do — BacktestProvider returns parquet storage
+        # order, which a non-chronological re-ingest scrambles. Missing-data
+        # tickers emit NaN, not 0.0: a finite zero enters the cross-sectional
+        # mean/std and shifts every other ticker's z (same policy as f1/f4).
+        bars = sorted(
+            await provider.fetch_bars(t, clock - timedelta(days=120), clock),
+            key=lambda b: b.ts,
+        )
         if len(bars) < 25:
-            rows.append({"ticker": t, "raw_value": 0.0})
+            rows.append({"ticker": t, "raw_value": float("nan")})
             continue
         df = pd.DataFrame({"close": [b.close for b in bars]}).iloc[-60:]
         # Compute bands using PRE-TODAY data only, so today's gap-up doesn't
@@ -57,14 +64,14 @@ async def compute_volume_spike(
     for t in tickers:
         bars = await provider.fetch_bars(t, clock - timedelta(days=40), clock)
         if len(bars) < 21:
-            rows.append({"ticker": t, "raw_value": 0.0})
+            rows.append({"ticker": t, "raw_value": float("nan")})
             continue
         bars = sorted(bars, key=lambda b: b.ts)
         last20 = bars[-21:-1]
         today = bars[-1]
         adv = sum(b.volume for b in last20) / 20
         if adv <= 0:
-            rows.append({"ticker": t, "raw_value": 0.0})
+            rows.append({"ticker": t, "raw_value": float("nan")})
             continue
         rows.append({"ticker": t, "raw_value": today.volume / adv})
     return Factor(name="f7_volume_spike", as_of=clock, values=pd.DataFrame(rows))

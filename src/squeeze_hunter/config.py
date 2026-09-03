@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -21,15 +21,25 @@ from squeeze_hunter.logging_setup import get_logger
 _log = get_logger("config")
 
 
-class ScoreCfg(BaseModel):
+class _StrictSection(BaseModel):
+    # Round-12: Settings itself forbids unknown top-level keys, but the nested
+    # sections silently ignored typos (`monthly_drawdown_kil`, `hard_stop_pct`)
+    # — the operator believed a risk knob was tuned when it wasn't.
+    model_config = ConfigDict(extra="forbid")
+
+
+class ScoreCfg(_StrictSection):
     threshold: float = 8.0
     weights: dict[str, float] = Field(default_factory=dict)
+    # Classifier cutoffs (score/classifier.py): CAR needs A >= strong and
+    # B < mixed_floor (GME mirrors); Mixed needs both >= mixed_floor. Round-12:
+    # previously dead config — the classifier hardcoded 4.0 / 3.0.
     setup_thresholds: dict[str, float] = Field(
-        default_factory=lambda: {"strong": 4.0, "weak_floor": 2.0, "mixed_floor": 3.0}
+        default_factory=lambda: {"strong": 4.0, "mixed_floor": 3.0}
     )
 
 
-class RiskCfg(BaseModel):
+class RiskCfg(_StrictSection):
     kelly_fraction: float = 0.20
     position_cap: float = 0.08
     max_positions: int = 6
@@ -39,7 +49,7 @@ class RiskCfg(BaseModel):
     bayes_prior_n: int = 30
 
 
-class StopsCfg(BaseModel):
+class StopsCfg(_StrictSection):
     hard_stop: float = -0.12
     # R9.1: trailing stops are stored as the negative threshold (e.g., -0.20 =
     # exit when 20% below the peak). evaluate_stops takes a positive magnitude;
@@ -52,14 +62,14 @@ class StopsCfg(BaseModel):
     signal_decay_exit: float = 0.75
 
 
-class UniverseCfg(BaseModel):
+class UniverseCfg(_StrictSection):
     min_market_cap: float = 200_000_000
     max_market_cap: float = 10_000_000_000
     min_price: float = 5.0
     min_days_listed: int = 30
 
 
-class DataCfg(BaseModel):
+class DataCfg(_StrictSection):
     # R11: FINRA disseminates a settlement-date short-interest report ~8 US
     # business days LATER (settlement dates are the 15th & last business day;
     # the bulk file is published ~T+8). The backtest reveals each SI record on
