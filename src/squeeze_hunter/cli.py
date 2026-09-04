@@ -220,7 +220,12 @@ def ingest_finra(
     configure_logging()
     cache = ParquetCache(root=parquet_root)
     tickers = [line.strip() for line in tickers_file.read_text().splitlines() if line.strip()]
-    asyncio.run(backfill_finra(tickers, cache))
+    try:
+        asyncio.run(backfill_finra(tickers, cache))
+    except RuntimeError as e:
+        # Round-12: a fully failed FINRA download used to exit 0 silently.
+        typer.echo(f"ERROR: {e}", err=True)
+        raise typer.Exit(code=2) from e
 
 
 @ingest_app.command("earnings")
@@ -283,6 +288,12 @@ def backtest(
         # in WalkForwardConfig regardless of YAML override → backtests
         # were inconsistent with live trading.
         score_threshold=settings.score.threshold,
+        # Round-12: the spec's 8-event case set was never passed through, so
+        # the ">= 5/8 captured" Gate 1 condition was silently skipped.
+        validation_events=[
+            (e.ticker, datetime(e.date.year, e.date.month, e.date.day, tzinfo=UTC))
+            for e in settings.backtest.validation_events
+        ],
     )
     try:
         report = asyncio.run(run_walk_forward(cfg, cache=cache, settings=settings))
@@ -320,6 +331,11 @@ def _format_report(report: dict, verdict: Any, coverage_warning: str | None = No
             f"MaxDD={m['max_drawdown']:.2%}  Hit={m['hit_rate']:.2f}  "
             f"Payoff={m['avg_payoff']:.2f}  Captured={m['captured_events']}  "
             f"ShuffleP={m['shuffle_pvalue']:.3f}  Trades={m['n_trades']}"
+        )
+    if report.get("n_validation_events"):
+        lines.append(
+            f"Captured events (all out-of-sample windows): "
+            f"{report['captured_events_total']} / {report['n_validation_events']}"
         )
     lines.append("")
     lines.append("=== Gate 1 verdict ===")

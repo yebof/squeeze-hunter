@@ -55,3 +55,27 @@ data:
   # days after its settlement date so it can't act on short interest before it
   # was public (look-ahead bias). 0 = reveal on the settlement date (legacy).
   finra_publication_lag_bdays: 8
+backtest:
+  # Gate 1 "captured-the-event" case set (design spec §5, exactly 8 events).
+  # A buy within [date - 5 calendar days, date + 1 day] captures the event;
+  # >= 5 of 8 must be captured across ALL out-of-sample windows (test windows
+  # + holdout), so leave no gaps between windows. Dates are the largest
+  # close-to-close move in the month the spec names, read from the cached
+  # bars. TUP has no bars (delisted) and can never be captured — kept so the
+  # denominator stays 8. The CAR anchor is 2021-11-02 (+108%); the spec's
+  # "Aug 2022" has no event in the data (max +5.4% that month).
+  validation_events:
+    - { ticker: GME, date: 2021-01-27 }   # GME-type anchor
+    - { ticker: CAR, date: 2021-11-02 }   # CAR-type anchor
+    - { ticker: BBBY, date: 2022-08-16 }  # Mixed anchor (Ryan Cohen)
+    - { ticker: GME, date: 2024-05-13 }   # Roaring Kitty return
+    - { ticker: TUP, date: 2024-05-14 }   # meme rally (no bars on disk)
+    - { ticker: OKLO, date: 2025-01-03 }  # Mixed
+    - { ticker: HTZ, date: 2025-04-16 }   # CAR-type
+    - { ticker: CAR, date: 2026-04-13 }   # CAR-type, freshest
+monitor:
+  # /metrics (Prometheus text) and /health (JSON, 503 while unhealthy or the
+  # killswitch is active). 0 disables. docker/prometheus.yml scrapes
+  # host.docker.internal:8080, which needs a non-loopback bind.
+  http_port: 8080
+  http_host: 0.0.0.0

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+import pandas as pd
+
 from squeeze_hunter.backtest.metrics import (
     captured_events,
     hit_rate_and_payoff,
@@ -126,10 +128,24 @@ async def run_walk_forward(
     train_res = await _bt(cfg.train_start, cfg.train_end)
     test_results = [await _bt(s, e) for s, e in cfg.test_windows]
     holdout_res = await _bt(*cfg.holdout)
+    holdout_summary = _summarize(holdout_res, cfg.validation_events)
+    captured_total: int | None = None
+    if cfg.validation_events:
+        # Round-12: the case set spans 2021-2026 while the holdout is one year,
+        # so Gate 1's ">= 5 of 8" is counted over the UNION of every
+        # out-of-sample window (test windows + holdout). Train is in-sample
+        # and never counts. The holdout summary carries the union count
+        # because evaluate_gate1 reads captured_events from there.
+        oos_logs = [r.trade_log for r in [*test_results, holdout_res] if not r.trade_log.empty]
+        oos_trades = pd.concat(oos_logs, ignore_index=True) if oos_logs else pd.DataFrame()
+        captured_total = captured_events(oos_trades, cfg.validation_events)
+        holdout_summary["captured_events"] = captured_total
     return {
         "train": _summarize(train_res, cfg.validation_events),
         "test_windows": [_summarize(r, cfg.validation_events) for r in test_results],
-        "holdout": _summarize(holdout_res, cfg.validation_events),
+        "holdout": holdout_summary,
+        "captured_events_total": captured_total,
+        "n_validation_events": len(cfg.validation_events),
         "raw": {
             "train_equity": train_res.equity_curve,
             "test_equities": [r.equity_curve for r in test_results],
