@@ -103,17 +103,33 @@ class FinraProvider:
         """
         wanted = set(tickers)
         out: dict[str, list[ShortInterest]] = {t: [] for t in tickers}
+        candidates = self._candidate_months(since)
+        n_ok = 0
+        last_error = ""
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            for yyyymm, half in self._candidate_months(since):
+            for yyyymm, half in candidates:
                 url = FINRA_URL_TEMPLATE.format(yyyymm=yyyymm, half=half)
                 try:
                     r = await client.get(url)
                     r.raise_for_status()
-                except httpx.HTTPError:
+                except httpx.HTTPError as e:
+                    # Individual months can legitimately be missing (the
+                    # current half-month, a not-yet-published file); keep going.
+                    last_error = f"{url}: {type(e).__name__} {e}"
                     continue
+                n_ok += 1
                 for row in self._parse_finra_pipe_text(StringIO(r.text)):
                     if row.ticker in wanted and (since is None or row.settlement_date >= since):
                         out[row.ticker].append(row)
+        if candidates and n_ok == 0:
+            # Round-12: every file failed (observed: cdn.finra.org → 403 for all
+            # 210 months). Swallowing that produced an exit-0 backfill that
+            # wrote nothing, leaving f1/f2 silently dead. Fail loud instead.
+            raise RuntimeError(
+                f"0 of {len(candidates)} FINRA monthly files downloaded; last error: "
+                f"{last_error}. Check network access to cdn.finra.org (403 = blocked "
+                "or the URL scheme changed) before trusting any backtest."
+            )
         return out
 
     @staticmethod
