@@ -76,8 +76,12 @@ uv run squeeze-hunter backtest \
   --test-window 2022-01-01:2022-12-31 \
   --test-window 2023-01-01:2023-12-31 \
   --test-window 2024-01-01:2024-12-31 \
+  --test-window 2025-01-01:2025-04-30 \
   --holdout 2025-05-01:2026-05-01 \
   --n-trials 1
+# The Gate 1 "captured >= 5 of 8 events" check counts entries across ALL test
+# windows + holdout (events are listed in config/settings.example.yml under
+# backtest.validation_events), so leave no gaps between windows.
 
 # 4) read data/backtests/gate1_report.txt
 ```

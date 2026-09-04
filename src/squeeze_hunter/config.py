@@ -5,6 +5,7 @@ Layered config: yaml file → env overrides via SH_*__* (double underscore = nes
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,28 @@ class DataCfg(_StrictSection):
     finra_publication_lag_bdays: int = 8
 
 
+class ValidationEvent(_StrictSection):
+    """One Gate 1 'captured-the-event' case: a buy within [date-5d, date+1d] counts."""
+
+    ticker: str
+    date: date
+
+
+class BacktestCfg(_StrictSection):
+    # Round-12: the spec's 8-event case set lives here so the CLI can feed it
+    # to walk_forward (it was never populated before; the >= 5/8 check was
+    # silently skipped). Counted across ALL out-of-sample windows.
+    validation_events: list[ValidationEvent] = Field(default_factory=list)
+
+
+class MonitorCfg(_StrictSection):
+    # Round-12: /metrics + /health endpoint. Code default is OFF (0) so tests
+    # and ad-hoc RuntimeContexts never bind a port; the example YAML turns it
+    # on at 8080 to match docker/prometheus.yml.
+    http_port: int = 0
+    http_host: str = "127.0.0.1"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SH_",
@@ -90,6 +113,8 @@ class Settings(BaseSettings):
     stops: StopsCfg = Field(default_factory=StopsCfg)
     universe: UniverseCfg = Field(default_factory=UniverseCfg)
     data: DataCfg = Field(default_factory=DataCfg)
+    backtest: BacktestCfg = Field(default_factory=BacktestCfg)
+    monitor: MonitorCfg = Field(default_factory=MonitorCfg)
 
     @classmethod
     def settings_customise_sources(

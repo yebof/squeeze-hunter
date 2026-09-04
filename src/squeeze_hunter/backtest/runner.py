@@ -368,17 +368,36 @@ async def run_backtest(
                             break
                 earnings_within_3_days_map[t] = flag
 
+            # Round-12: feed REAL liquidity / price inputs so the liquidity and
+            # universe gates can actually fire in a backtest (they used to get
+            # ADV20 = 1e9 and the full ticker list). ADV20$ is the mean
+            # close*volume of the 20 bars BEFORE today (today's spike excluded);
+            # the price floor is settings.universe.min_price on today's close.
+            # Still placeholders (no data source yet): days_listed (365 — a
+            # partition's first bar is not the listing date), halts and
+            # pairwise correlations. Market cap has no source either.
+            adv20_by_ticker: dict[str, float] = {}
+            universe_today: set[str] = set()
+            for t in cfg.tickers:
+                try:
+                    tb = await provider.fetch_bars(t, cur - timedelta(days=40), cur)
+                except LookupError:
+                    continue
+                if not tb or tb[-1].ts.date() != cur.date():
+                    continue  # no session today → not tradeable at tomorrow's open
+                prior = tb[:-1][-20:] or tb[-1:]
+                adv20_by_ticker[t] = sum(b.close * b.volume for b in prior) / len(prior)
+                if tb[-1].close >= settings.universe.min_price:
+                    universe_today.add(t)
             ctx = GateContext(
                 as_of=cur,
                 # R7.C2: pass the live killswitch state into the gate context
                 # so evaluate_gates can also reject entries when tripped.
                 kill_switch_active=kill_active,
-                adv20_dollar_volume_by_ticker={
-                    t: 1e9 for t in cfg.tickers
-                },  # placeholder large enough for backtest universe
+                adv20_dollar_volume_by_ticker=adv20_by_ticker,
                 days_listed_by_ticker={t: 365 for t in cfg.tickers},
                 halted_tickers=frozenset(),
-                universe_tickers=frozenset(cfg.tickers),
+                universe_tickers=frozenset(universe_today),
                 earnings_within_3_days=earnings_within_3_days_map,
                 portfolio_correlations={t: 0.0 for t in cfg.tickers},
             )
@@ -467,6 +486,7 @@ async def run_backtest(
                     max_positions=max_positions,
                     position_cap=position_cap,
                     max_gross_exposure=max_gross,
+                    min_days_listed=settings.universe.min_days_listed,
                 )
                 if not gate.accepted:
                     continue
