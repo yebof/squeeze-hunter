@@ -67,7 +67,7 @@ codebase. They override Codex's defaults when they conflict.
 ## Phase status
 
 - ✅ Phase 0–3 complete and tagged.
-- 308 tests passing.
+- 355 tests passing.
 - Two review rounds + 30+ bug fixes have hardened the codebase.
 - Next user-side step: end-to-end backtest + Gate 1 evaluation. Then paper
   trading for 30 days. Phase 4 (small live) only after Gate 2 passes.
