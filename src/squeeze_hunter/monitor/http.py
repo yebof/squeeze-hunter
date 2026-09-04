@@ -47,7 +47,7 @@ class MonitorServer:
         runtime = rc
 
         class _Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
+            def do_GET(self: _Handler) -> None:
                 if self.path == "/metrics":
                     registry = runtime.metrics_registry
                     if registry is None:
@@ -61,7 +61,7 @@ class MonitorServer:
                 else:
                     self._reply(404, "text/plain", "not found\n")
 
-            def _reply(self, status: int, content_type: str, body: str) -> None:
+            def _reply(self: _Handler, status: int, content_type: str, body: str) -> None:
                 raw = body.encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
@@ -69,7 +69,7 @@ class MonitorServer:
                 self.end_headers()
                 self.wfile.write(raw)
 
-            def log_message(self, format: str, *args: object) -> None:
+            def log_message(self: _Handler, format: str, *args: object) -> None:
                 # Keep the stdlib's per-request stderr chatter out of the
                 # structured log stream.
                 return
