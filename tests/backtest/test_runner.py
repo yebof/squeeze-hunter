@@ -318,9 +318,9 @@ async def test_runner_gap_through_stop_uses_daily_low(tmp_path: Path) -> None:
     sells = result.trade_log[result.trade_log["side"] == "sell"].reset_index(drop=True)
     assert len(sells) >= 1, "intraday -35% low must trigger the hard stop"
     hard = sells[sells["reason"] == "hard_stop"]
-    assert (
-        len(hard) >= 1
-    ), f"expected a hard_stop exit on the intraday-crater day; sells={sells.to_dict('records')}"
+    assert len(hard) >= 1, (
+        f"expected a hard_stop exit on the intraday-crater day; sells={sells.to_dict('records')}"
+    )
     exit_row = hard.iloc[0]
     # Exit on day 2 (the crater day), filled at the conservative LOW (~65),
     # NOT the recovered close (99). Cost model applies sell slippage so it's
@@ -486,9 +486,9 @@ async def test_runner_halve_amortizes_entry_commission_across_remaining_qty() ->
     exit_charge = entry_commission_per_share * exit_qty
     # Total entry commission charged across all legs MUST equal the original $5.
     total = halve_1_charge + halve_2_charge + exit_charge
-    assert (
-        abs(total - entry_commission) < 1e-9
-    ), f"amortized entry commission {total} != original {entry_commission}"
+    assert abs(total - entry_commission) < 1e-9, (
+        f"amortized entry commission {total} != original {entry_commission}"
+    )
     # And no single leg should ever charge MORE than the original entry commission.
     assert max(halve_1_charge, halve_2_charge, exit_charge) <= entry_commission
 
@@ -550,13 +550,13 @@ async def test_runner_realized_pnl_subtracts_round_trip_commission(tmp_path: Pat
         # round-trip commission at $0.50/share = qty * 1.0
         expected_commission = qty * 0.50 * 2  # buy + sell
         # Realized must be lower than gross by approximately round-trip commission
-        assert (
-            sell["realized"] < gross
-        ), f"realized {sell['realized']} >= gross {gross} for {ticker} — commissions not deducted"
+        assert sell["realized"] < gross, (
+            f"realized {sell['realized']} >= gross {gross} for {ticker} — commissions not deducted"
+        )
         diff = gross - sell["realized"]
-        assert (
-            abs(diff - expected_commission) < 0.01
-        ), f"expected commission deduction ≈ {expected_commission}, got {diff} for {ticker}"
+        assert abs(diff - expected_commission) < 0.01, (
+            f"expected commission deduction ≈ {expected_commission}, got {diff} for {ticker}"
+        )
 
 
 @pytest.mark.asyncio
@@ -596,9 +596,9 @@ async def test_runner_gross_exposure_invariant(tmp_path: Path) -> None:
     if len(buys) > 0:
         for day, day_buys in buys.groupby("ts"):
             notional = (day_buys["qty"] * day_buys["price"]).sum()
-            assert (
-                notional <= 100_000.0 * 0.90 + 1.0
-            ), f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
+            assert notional <= 100_000.0 * 0.90 + 1.0, (
+                f"day {day} buys exceeded 90% gross cap: ${notional:.0f}"
+            )
 
 
 def test_runner_gross_exposure_updates_state() -> None:
@@ -612,6 +612,6 @@ def test_runner_gross_exposure_updates_state() -> None:
 
     src = inspect.getsource(runner_mod)
     # The R6 fix line must be present in the daily loop
-    assert (
-        "state.gross_exposure_pct += size_usd / state.equity_usd" in src
-    ), "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
+    assert "state.gross_exposure_pct += size_usd / state.equity_usd" in src, (
+        "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
+    )
