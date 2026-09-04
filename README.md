@@ -331,6 +331,15 @@ run the Gate 1 backtest → 30 days of paper trading → only then discuss live.
 | `phase-4-live-ramp`       | (after first round-trip on small live capital)               |
 | `phase-5-scale`           | (after first equity-tier promotion)                          |
 
+## Contributing and security
+
+Pull requests are welcome; CI runs ruff, ty and the full test suite. Report
+anything that could move money, leak credentials or bypass the risk controls
+through GitHub's private vulnerability reporting (see `SECURITY.md`), not a
+public issue.
+
 ## License
 
-Private. All rights reserved. For personal education and research only.
+Apache License 2.0 — see `LICENSE`. The license's warranty disclaimer and
+limitation of liability (sections 7 and 8) apply to everything in this
+repository, in addition to the disclaimer above.

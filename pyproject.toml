@@ -4,6 +4,17 @@ version = "0.1.0"
 description = "Quantitative trading system for short-squeeze events"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "yebof" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
@@ -71,4 +82,4 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedE
 fail_under = 70
 
 [tool.ty]
-src.root = "src"
+environment.root = ["./src"]

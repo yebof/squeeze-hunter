@@ -1,3 +1,6 @@
+# Local development stack. The credentials below are throwaway defaults for a
+# laptop that only listens on localhost; change them (and stop exposing the
+# ports) before running this on any host reachable from the internet.
 services:
   postgres:
     image: postgres:14
