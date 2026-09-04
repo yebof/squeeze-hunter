@@ -184,9 +184,9 @@ async def test_known_nyse_ticker_carries_nyse_primary_exchange() -> None:
     )
     assert len(captured) == 1
     # GME is in the defaults map as NYSE — must NOT be NASDAQ or empty.
-    assert (
-        getattr(captured[0], "primaryExchange", "") == "NYSE"
-    ), f"GME contract primaryExchange should be NYSE, got {captured[0]!r}"
+    assert getattr(captured[0], "primaryExchange", "") == "NYSE", (
+        f"GME contract primaryExchange should be NYSE, got {captured[0]!r}"
+    )
 
 
 @pytest.mark.asyncio
