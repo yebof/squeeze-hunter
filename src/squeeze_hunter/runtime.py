@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo
 
+import httpx
 import pandas as pd
 
 from squeeze_hunter.backtest.cost_model import StockCostModel
@@ -18,6 +19,8 @@ from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
 from squeeze_hunter.logging_setup import get_logger
+from squeeze_hunter.monitor.alerts import AlertSender, Severity
+from squeeze_hunter.monitor.http import MonitorServer, start_monitor_server
 from squeeze_hunter.monitor.metrics import MetricsRegistry
 from squeeze_hunter.risk.killswitch import evaluate_killswitch
 
@@ -25,6 +28,21 @@ if TYPE_CHECKING:
     from squeeze_hunter.risk.killswitch import KillSwitchInputs
 
 log = get_logger("runtime")
+
+# Alert delivery is best-effort: transport errors are logged, never raised.
+_ALERT_ERRORS = (httpx.HTTPError, OSError, TimeoutError)
+
+
+def _alert_sender_from_env() -> AlertSender | None:
+    """Build the alert channel from TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and
+    SLACK_WEBHOOK_URL; None when nothing is configured (logged on first use)."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or None
+    chat = os.environ.get("TELEGRAM_CHAT_ID") or None
+    slack = os.environ.get("SLACK_WEBHOOK_URL") or None
+    if not ((token and chat) or slack):
+        return None
+    return AlertSender(telegram_bot_token=token, telegram_chat_id=chat, slack_webhook_url=slack)
+
 
 # R3.2: US regular session for the intraday loop. 09:30-16:00 ET, Mon-Fri.
 # We do NOT filter US federal holidays here — the cost of trading on a
@@ -251,6 +269,11 @@ class RuntimeContext:
     # telemetry recording would all race. We early-return when a tick is
     # already in flight; the next interval will catch up.
     _tick_in_progress: bool = False
+    # Round-12: last known broker health (served by /health), the alert
+    # channel (from env) and the /metrics + /health server — wired in setup().
+    last_broker_healthy: bool = False
+    alerts: AlertSender | None = None
+    monitor_server: MonitorServer | None = None
 
     async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
         # R9.1: propagate YAML stops settings into the lifecycle state so the
@@ -320,6 +343,26 @@ class RuntimeContext:
             # Seed heartbeat anyway so disconnect timer measures from now.
             # If still down at next tick, broker_disconnected_for_seconds grows.
             self.telemetry.record_broker_heartbeat(datetime.now(UTC))
+        # Round-12: alert channel (AlertSender had no caller — killswitch trips
+        # only logged) and the /metrics + /health endpoint (Prometheus scraped
+        # an empty port). Both were promised by spec §7.
+        self.alerts = _alert_sender_from_env()
+        if self.settings.monitor.http_port > 0 and self.monitor_server is None:
+            self.monitor_server = start_monitor_server(
+                self,
+                port=self.settings.monitor.http_port,
+                host=self.settings.monitor.http_host,
+            )
+
+    async def _notify(self: RuntimeContext, text: str) -> None:
+        """Push a HIGH-severity alert; delivery failure must never break a tick."""
+        if self.alerts is None:
+            log.warning("alert_channel_not_configured", text=text)
+            return
+        try:
+            await self.alerts.send(text, severity=Severity.HIGH)
+        except _ALERT_ERRORS as e:
+            log.warning("alert_send_failed", err=str(e), err_type=type(e).__name__)
 
     async def tick(self: RuntimeContext, now: datetime) -> None:
         """One intraday tick: manage positions + check killswitch.
@@ -397,6 +440,7 @@ class RuntimeContext:
         # Now: any successful broker.health() round-trip refreshes the source.
         if broker_healthy:
             self.telemetry.record_data_freshness("ibkr_quotes", now)
+        self.last_broker_healthy = broker_healthy
 
         # Mark to market: fetch quotes, record position marks, collect prices.
         # R7.Q-I2: skip the loop entirely when the broker is unhealthy — every
@@ -490,6 +534,10 @@ class RuntimeContext:
             if not was_active:
                 self._kill_first_tripped_at = now
                 log.warning("killswitch_tripped", reason=ks.reason)
+                await self._notify(
+                    f"squeeze-hunter killswitch tripped: {ks.reason} "
+                    f"(mode={self.mode}, at={now.isoformat()})"
+                )
             if self.metrics_registry:
                 reason = ks.reason or "unknown"
                 self.metrics_registry.set_kill_switch_active(reason)
@@ -725,5 +773,8 @@ class RuntimeContext:
             self.broker = None
 
     async def shutdown(self: RuntimeContext) -> None:
+        if self.monitor_server is not None:
+            await asyncio.to_thread(self.monitor_server.stop)
+            self.monitor_server = None
         if self.broker is not None and hasattr(self.broker, "disconnect"):
             await self.broker.disconnect()
