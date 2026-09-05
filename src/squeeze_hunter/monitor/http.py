@@ -87,7 +87,10 @@ class MonitorServer:
         log.info("monitor_http_started", host=self.host, port=self.port)
 
     def stop(self: MonitorServer) -> None:
-        self._httpd.shutdown()
+        # Round-13: BaseServer.shutdown() blocks until serve_forever() exits —
+        # forever if serve_forever never started. Guard on the thread.
+        if self._thread.is_alive():
+            self._httpd.shutdown()
         self._httpd.server_close()
         log.info("monitor_http_stopped", port=self.port)
 

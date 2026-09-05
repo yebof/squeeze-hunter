@@ -312,8 +312,10 @@ class RuntimeContext:
                     await self._try_cleanup_partial_broker()
                     raise
             elif self.mode == "live":
-                from squeeze_hunter.broker.ibkr import IBKRBroker
+                from squeeze_hunter.broker.ibkr import IBKRBroker, require_live_port
 
+                # Round-13: refuse the paper-port default in live mode.
+                require_live_port()
                 self.broker = IBKRBroker(client_id=int(os.environ.get("IBKR_CLIENT_ID", "42")))
                 try:
                     await asyncio.wait_for(self.broker.connect(), timeout=connect_timeout_s)
@@ -332,6 +334,10 @@ class RuntimeContext:
             health = await self.broker.health()
             if health.connected:
                 self.telemetry.record_broker_heartbeat(datetime.now(UTC))
+                # Round-13: seed quote freshness too, so the data_stale arm
+                # measures from startup instead of reading 0 ("no sources")
+                # until the first fresh quote ever arrives.
+                self.telemetry.record_data_freshness("ibkr_quotes", datetime.now(UTC))
         except _TRANSIENT_IO_ERRORS as e:
             # R7.I3: narrow to transient errors at setup. Programming bugs
             # (AttributeError etc.) should propagate so setup() callers see them.
@@ -343,6 +349,7 @@ class RuntimeContext:
             # Seed heartbeat anyway so disconnect timer measures from now.
             # If still down at next tick, broker_disconnected_for_seconds grows.
             self.telemetry.record_broker_heartbeat(datetime.now(UTC))
+            self.telemetry.record_data_freshness("ibkr_quotes", datetime.now(UTC))
         # Round-12: alert channel (AlertSender had no caller — killswitch trips
         # only logged) and the /metrics + /health endpoint (Prometheus scraped
         # an empty port). Both were promised by spec §7.
@@ -438,7 +445,12 @@ class RuntimeContext:
         # portfolio meant ibkr_quotes never updated, so after 2 hours of flat
         # portfolio the data_stale killswitch arm tripped on a healthy broker.
         # Now: any successful broker.health() round-trip refreshes the source.
-        if broker_healthy:
+        # Round-13: a healthy socket refreshes quote freshness only when there
+        # is nothing to quote (flat portfolio). With positions, freshness comes
+        # from an actually-delivered quote in the mark loop below —
+        # IB.isConnected() is pure socket state, so the data_stale arm could
+        # never trip while the socket was up even with frozen market data.
+        if broker_healthy and not self.lifecycle_state.positions:
             self.telemetry.record_data_freshness("ibkr_quotes", now)
         self.last_broker_healthy = broker_healthy
 
@@ -490,8 +502,12 @@ class RuntimeContext:
             # so Grafana dashboards would have shown all zeros.
             if self.metrics_registry is not None:
                 self.metrics_registry.set_equity(equity_usd)
-                self.metrics_registry.position_count.set(len(self.lifecycle_state.positions))
-                self.metrics_registry.broker_connected.set(1.0 if broker_healthy else 0.0)
+        # Round-13: these two gauges do not depend on NAV; nesting them under
+        # the equity check left sh_broker_connected at 0 on a healthy broker
+        # whenever NetLiquidation was unavailable.
+        if self.metrics_registry is not None:
+            self.metrics_registry.position_count.set(len(self.lifecycle_state.positions))
+            self.metrics_registry.broker_connected.set(1.0 if broker_healthy else 0.0)
 
         # Build killswitch inputs from real telemetry and evaluate.
         # R8.S-I2: pass YAML monthly_drawdown_kill so the YAML knob is wired.

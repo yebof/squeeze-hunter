@@ -101,16 +101,22 @@ async def test_connect_subscribes_to_account_updates() -> None:
     fake_ib = MagicMock()
     fake_ib.connectAsync = AsyncMock()
     fake_ib.client.serverVersion = MagicMock(return_value=176)
-    fake_ib.reqAccountUpdates = MagicMock()
+    # Round-13: the sync reqAccountUpdates() is ib_async's BLOCKING variant
+    # (loop.run_until_complete) and raises inside the running loop; connect()
+    # must await reqAccountUpdatesAsync instead.
+    fake_ib.reqAccountUpdates = MagicMock(
+        side_effect=RuntimeError("This event loop is already running")
+    )
+    fake_ib.reqAccountUpdatesAsync = AsyncMock()
+    fake_ib.managedAccounts = MagicMock(return_value=[])
     broker._ib = fake_ib
 
     await broker.connect()
 
     # R6.I2: assert the exact argument, not just that the method was called.
-    # ib-async's reqAccountUpdates(account: str) — calling it IS the
-    # subscribe call. The default account is "" (IBKR uses primary account).
-    assert fake_ib.reqAccountUpdates.called
-    fake_ib.reqAccountUpdates.assert_called_with("")
+    # The default account is "" (IBKR uses the primary account).
+    fake_ib.reqAccountUpdatesAsync.assert_awaited_once_with("")
+    fake_ib.reqAccountUpdates.assert_not_called()
 
 
 @pytest.mark.asyncio

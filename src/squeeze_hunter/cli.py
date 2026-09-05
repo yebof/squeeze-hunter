@@ -467,6 +467,12 @@ def emergency_flatten(
     # R5.C5: client_id is configurable so an operator using IBKR_CLIENT_ID=199
     # (or whatever) for the main loop can pick a different one for the flatten
     # connection. IBKR rejects duplicate client IDs.
+    if mode == "live":
+        # Round-13: with IBKR_PORT unset the live broker defaulted to the TWS
+        # paper port and this flatten "succeeded" against the wrong account.
+        from squeeze_hunter.broker.ibkr import require_live_port
+
+        require_live_port()
     broker: IBKRBroker | PaperBroker = (
         PaperBroker(client_id=client_id) if mode == "paper" else IBKRBroker(client_id=client_id)
     )

@@ -28,6 +28,11 @@ class AlertSender:
         if severity == Severity.HIGH:
             if self.telegram_bot_token and self.telegram_chat_id:
                 await self._send_telegram(text)
+            elif self.slack_webhook_url:
+                # Round-13: a Slack-only operator used to lose every HIGH alert
+                # (killswitch trips) to a WARNING log line. Degrade to Slack.
+                log.warning("telegram_not_configured_falling_back_to_slack")
+                await self._send_slack(text)
             else:
                 log.warning("telegram_not_configured", text=text)
         else:

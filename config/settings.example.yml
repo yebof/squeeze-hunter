@@ -75,7 +75,10 @@ backtest:
     - { ticker: CAR, date: 2026-04-13 }   # CAR-type, freshest
 monitor:
   # /metrics (Prometheus text) and /health (JSON, 503 while unhealthy or the
-  # killswitch is active). 0 disables. docker/prometheus.yml scrapes
-  # host.docker.internal:8080, which needs a non-loopback bind.
+  # killswitch is active). 0 disables. The endpoint has NO authentication and
+  # exposes equity, position count and killswitch state, so it binds to
+  # loopback. Set http_host to 0.0.0.0 only when the Prometheus container
+  # (docker/prometheus.yml scrapes host.docker.internal:8080) must reach it
+  # and the host firewall blocks the port from the outside.
   http_port: 8080
-  http_host: 0.0.0.0
+  http_host: 127.0.0.1

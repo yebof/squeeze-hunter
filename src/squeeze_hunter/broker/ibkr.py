@@ -7,7 +7,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock
 
@@ -26,7 +26,39 @@ _STATUS_MAP = {
     "Cancelled": "cancelled",
     "ApiCancelled": "cancelled",
     "Inactive": "rejected",
+    # Round-13: set by ib_async for warning codes 105/110/165/321…; it is not
+    # a DoneState, so an order in this state sits in openTrades() forever.
+    # Treating it as "pending" kept a dead exit as the tracked pending order.
+    "ValidationError": "rejected",
 }
+
+# Round-13: a quote whose Ticker has not been updated for longer than this is
+# reported as zeros (halt, market-data farm outage, lost subscription).
+_QUOTE_MAX_AGE_S = 120.0
+
+
+def _age_seconds(ts: datetime) -> float:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - ts).total_seconds()
+
+
+def require_live_port() -> None:
+    """Refuse to construct a LIVE broker on the paper port.
+
+    Round-13: `_ibkr_default_port` falls back to 7497 (TWS paper), so
+    `live --confirm-real-money` and `emergency-flatten --mode live` with
+    IBKR_PORT unset quietly talked to the paper account while reporting
+    success. Live must name its port explicitly.
+    """
+    raw = os.environ.get("IBKR_PORT", "").strip()
+    if not raw:
+        raise ValueError(
+            "live mode requires IBKR_PORT to be set explicitly "
+            "(7496 for TWS live, 4001 for IB Gateway live)"
+        )
+    if raw == "7497":
+        raise ValueError("live mode refuses IBKR_PORT=7497: that is the TWS paper port")
 
 
 def _translate_status(ibkr_status: str) -> str:
@@ -145,10 +177,21 @@ class IBKRBroker:
         await self._ib.connectAsync(self.host, self.port, clientId=self.client_id)
         # R5.C1: subscribe to account-value push updates so accountValues()
         # is populated. Without this, get_equity_usd always returns None and
-        # the drawdown/3-day-loss killswitch arms are dead. In ib-async,
-        # calling reqAccountUpdates(account) IS the subscribe call (no
-        # explicit subscribe kwarg; "" means default account).
-        self._ib.reqAccountUpdates(self.account or "")
+        # the drawdown/3-day-loss killswitch arms are dead.
+        # Round-13: use the ASYNC variant. ib_async's reqAccountUpdates() is
+        # the blocking one (loop.run_until_complete) and raised "This event
+        # loop is already running" right here — paper/live never started.
+        await self._ib.reqAccountUpdatesAsync(self.account or "")
+        managed = [str(a) for a in (self._ib.managedAccounts() or [])]
+        if self.account and managed and self.account not in managed:
+            # Round-13: IBKR_ACCOUNT=DU0000000 copied from .env.example plus
+            # the account filter in get_position_qty made every position read
+            # as flat, and the lifecycle reconcile popped real exposure.
+            self._ib.disconnect()
+            raise ValueError(
+                f"IBKR_ACCOUNT={self.account!r} is not managed by this login "
+                f"(managed accounts: {managed}); set it to one of them or leave it empty"
+            )
         log.info(
             "connected",
             server_version=self._ib.client.serverVersion(),
@@ -175,6 +218,18 @@ class IBKRBroker:
             await asyncio.sleep(0.25)
             if math.isfinite(ticker_data.last) or math.isfinite(ticker_data.bid):
                 break
+        # Round-13: ib_async caches one Ticker per contract and hands the SAME
+        # object back on every reqMktData, so yesterday's finite values pass
+        # the isfinite check on the first iteration. Reject a quote whose last
+        # update is older than the freshness budget (halt, farm outage, lost
+        # subscription): zeros are caught by the lifecycle guard and starve
+        # the data_stale killswitch arm instead of freezing the stops.
+        last_update = getattr(ticker_data, "time", None)
+        if last_update is None or (
+            isinstance(last_update, datetime) and _age_seconds(last_update) > _QUOTE_MAX_AGE_S
+        ):
+            log.warning("quote_stale", ticker=ticker, last_update=str(last_update))
+            return Quote(ticker=ticker, bid=0.0, ask=0.0, last=0.0, timestamp_ns=time.time_ns())
         # R11: coalesce non-finite values to 0.0 (see _finite_or_zero) so a
         # missing quote becomes 0.0 — caught by the lifecycle zero-price guard —
         # instead of NaN, which slips past it.
@@ -322,20 +377,20 @@ class IBKRBroker:
         this tick' so the killswitch doesn't trip on a zero.
         """
         try:
-            # Idempotent re-subscribe in case connect() was bypassed (e.g.,
-            # the broker was passed pre-constructed). Calling
-            # reqAccountUpdates is the subscribe call in ib-async.
-            self._ib.reqAccountUpdates(self.account or "")
             # R6.C4: ib-async maintains the accountValues list via push events
             # on the asyncio event loop. Reading it from a thread (via
             # to_thread) races with those updates and can produce an
             # inconsistent partial view. accountValues() is a cheap in-memory
             # snapshot read, so call it directly on the event loop.
+            # Round-13: the per-tick "idempotent re-subscribe" that lived here
+            # was the BLOCKING reqAccountUpdates(); its RuntimeError was
+            # swallowed below and this returned None on every tick, so the
+            # drawdown and 3-day-loss killswitch arms were dead on IBKR. The
+            # subscription is made once, in connect().
             values = self._ib.accountValues()
-        except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
-            # R8.Q-I3: narrow per CLAUDE.md. RuntimeError covers ib-async
-            # "not connected" raises. AttributeError must propagate so a
-            # broker-impl typo (renamed attr) surfaces as a real bug.
+        except (ConnectionError, TimeoutError, OSError) as e:
+            # R8.Q-I3: narrow per CLAUDE.md. AttributeError / RuntimeError
+            # must propagate so a broker-impl bug surfaces as a real bug.
             log.warning(
                 "ibkr_account_values_failed",
                 err=str(e),
