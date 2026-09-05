@@ -12,40 +12,19 @@ Only earnings within the past 5 trading days contribute; older ones decay to 0.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from math import log
 
 import numpy as np
 import pandas as pd
-import pandas_market_calendars as mcal
 
 from squeeze_hunter.data.protocol import DataProvider
 from squeeze_hunter.signals.base import Factor
+from squeeze_hunter.trading_calendar import nyse_holidays
 
-# R8: cache the trading holidays once. np.busday_count without a holidays
-# argument counts Mon-Fri only and treats Christmas / Thanksgiving / etc. as
-# trading days.
-# Round-13: the calendar is the real NYSE one (pandas_market_calendars), not
-# the US federal calendar. The federal approximation iterated Good Friday
-# (NYSE closed → an equity point with no marks every year) and skipped
-# Columbus Day and Veterans Day (NYSE open → never scanned, never
-# stop-checked, missing from the equity curve). Every consumer — the
-# backtest day loop, the live time-stop counter, the f3 / f5 windows, the
-# FINRA publication lag and captured-events — shares this list.
-_US_HOLIDAYS_CACHE: list[date] | None = None
-
-
-def _us_business_holidays() -> list[date]:
-    """Weekday NYSE closures 2018-2030 (name kept for the existing callers)."""
-    global _US_HOLIDAYS_CACHE
-    if _US_HOLIDAYS_CACHE is None:
-        nyse = mcal.get_calendar("NYSE")
-        # Weekdays that are NOT sessions on the exchange schedule: regular
-        # holidays plus special closures (days of mourning, etc.).
-        sessions = {ts.date() for ts in nyse.schedule("2018-01-01", "2030-12-31").index}
-        weekdays = pd.bdate_range("2018-01-01", "2030-12-31")
-        _US_HOLIDAYS_CACHE = [ts.date() for ts in weekdays if ts.date() not in sessions]
-    return _US_HOLIDAYS_CACHE
+# R8 / Round-13 / P5: the holiday calendar is the real NYSE schedule and
+# lives in trading_calendar. This alias keeps the existing callers working.
+_us_business_holidays = nyse_holidays
 
 
 def _trading_days_between(d1: datetime, d2: datetime) -> int:

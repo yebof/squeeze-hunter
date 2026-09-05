@@ -143,18 +143,14 @@ def captured_events(
     """
     if trade_log.empty:
         return 0
-    from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+    from squeeze_hunter.trading_calendar import next_session
 
-    holidays_dt64 = np.array(_us_business_holidays(), dtype="datetime64[D]")
     hits = 0
     buys = trade_log[trade_log["side"] == "buy"]
     for ticker, event_ts in events:
-        next_session = np.busday_offset(
-            np.datetime64(event_ts.date()), 1, roll="forward", holidays=holidays_dt64
+        forward_end = datetime.combine(next_session(event_ts.date()), datetime.max.time()).replace(
+            tzinfo=event_ts.tzinfo
         )
-        forward_end = datetime.combine(
-            next_session.astype("datetime64[D]").astype(object), datetime.max.time()
-        ).replace(tzinfo=event_ts.tzinfo)
         match = buys[
             (buys["ticker"] == ticker)
             & (buys["ts"] >= event_ts - timedelta(days=window_days))

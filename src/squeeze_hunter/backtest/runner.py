@@ -18,6 +18,7 @@ from squeeze_hunter.risk.killswitch import KillSwitchInputs, evaluate_killswitch
 from squeeze_hunter.risk.stops import StopState, evaluate_stops
 from squeeze_hunter.scan import run_scan
 from squeeze_hunter.signals.earnings_reaction import _trading_days_between
+from squeeze_hunter.trading_calendar import trading_sessions
 
 
 @dataclass
@@ -69,7 +70,7 @@ async def run_backtest(
     # drawdown exceeds the production -10% kill threshold.
     kill_active = False
     kill_first_tripped_at: datetime | None = None
-    kill_cooldown_days = 7  # mirrors RuntimeContext._kill_cooldown_days
+    kill_cooldown_days = settings.risk.killswitch.cooldown_days  # mirrors RuntimeContext
 
     # C7 + R11: iterate over trading days only — skip weekends AND US federal
     # holidays, using the SAME _us_business_holidays() calendar the live path
@@ -81,12 +82,7 @@ async def run_backtest(
     # evaluation all on one trading-day definition matching live.
     # Iterate as pd.Timestamp objects (list() avoids the .to_pydatetime() method
     # that the type checker cannot resolve on DatetimeIndex).
-    from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
-
-    _holidays = set(_us_business_holidays())
-    trading_days: list[pd.Timestamp] = [
-        d for d in pd.bdate_range(cfg.start, cfg.end, tz="UTC") if d.date() not in _holidays
-    ]
+    trading_days: list[pd.Timestamp] = trading_sessions(cfg.start, cfg.end)
     if not trading_days:
         # R8.M16: warn loudly when the date range contains zero trading days —
         # otherwise the run silently produces an empty equity_curve and Gate 1
@@ -118,6 +114,10 @@ async def run_backtest(
     trailing_car = abs(settings.stops.trailing_car)
     trailing_gme = abs(settings.stops.trailing_gme)
     trailing_mixed = abs(settings.stops.trailing_mixed)
+    # P9: per-setup Kelly priors, killswitch arms and gate thresholds from YAML.
+    kelly_priors = {k: (v.win_rate, v.payoff) for k, v in settings.risk.kelly_priors.items()}
+    ks_cfg = settings.risk.killswitch
+    gates_cfg = settings.risk.gates
 
     for cur_ts in trading_days:
         # `day_label` (00:00 UTC) stamps the trade log / equity curve.
@@ -436,6 +436,7 @@ async def run_backtest(
                     fraction=kelly_fraction,
                     cap=position_cap,
                     prior_n=bayes_prior_n,
+                    priors=kelly_priors,
                 )
 
                 # R7.C3: only FULL exits (partial=False) count as "trades" for
@@ -500,6 +501,8 @@ async def run_backtest(
                     position_cap=position_cap,
                     max_gross_exposure=max_gross,
                     min_days_listed=settings.universe.min_days_listed,
+                    min_adv20_multiple=gates_cfg.min_adv20_multiple,
+                    max_correlation=gates_cfg.max_correlation,
                 )
                 if not gate.accepted:
                     continue
@@ -554,7 +557,14 @@ async def run_backtest(
         # the YAML override is actually wired. The other thresholds are not
         # in YAML today but keeping them as kwargs leaves room to plumb them
         # if added later.
-        ks = evaluate_killswitch(kill_inputs, monthly_drawdown_max=monthly_dd_kill)
+        ks = evaluate_killswitch(
+            kill_inputs,
+            monthly_drawdown_max=monthly_dd_kill,
+            three_day_loss_max=ks_cfg.three_day_loss_max,
+            gap_through_stop_max=ks_cfg.gap_through_stop_max,
+            broker_outage_max_seconds=ks_cfg.broker_outage_max_seconds,
+            data_stale_max_seconds=ks_cfg.data_stale_max_seconds,
+        )
         if ks.tripped and not kill_active:
             kill_active = True
             kill_first_tripped_at = cur

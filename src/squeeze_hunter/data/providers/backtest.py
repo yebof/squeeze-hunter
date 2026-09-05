@@ -187,9 +187,9 @@ class BacktestProvider:
             # Round-12: count US federal holidays like the rest of the codebase
             # (time stop, f3 window). Plain BusinessDay revealed the record one
             # business day early whenever a holiday fell inside the lag window.
-            from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+            from squeeze_hunter.trading_calendar import nyse_holidays
 
-            bday = pd.offsets.CustomBusinessDay(n=lag, holidays=_us_business_holidays())
+            bday = pd.offsets.CustomBusinessDay(n=lag, holidays=nyse_holidays())
             # Round-13: CustomBusinessDay is applied row-by-row (pandas cannot
             # vectorize it), and this runs for every ticker on every backtest
             # day. Map the ~24 distinct settlement dates per year once instead

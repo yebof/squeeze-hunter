@@ -40,6 +40,37 @@ class ScoreCfg(_StrictSection):
     )
 
 
+class KellyPriorCfg(_StrictSection):
+    """Per-setup Kelly prior. Must give a positive raw Kelly: p*b - (1-p) > 0."""
+
+    win_rate: float
+    payoff: float
+
+
+class KillswitchCfg(_StrictSection):
+    # P9: the four arms that were code constants, plus the sticky cooldown.
+    # `risk.monthly_drawdown_kill` (positive magnitude) stays where it was.
+    three_day_loss_max: float = -0.05
+    gap_through_stop_max: float = -0.25
+    broker_outage_max_seconds: int = 300
+    data_stale_max_seconds: int = 7200
+    cooldown_days: int = 7
+
+
+class GatesCfg(_StrictSection):
+    # P9: pre-trade gate thresholds that were function defaults only.
+    min_adv20_multiple: float = 100.0
+    max_correlation: float = 0.70
+
+
+def _default_kelly_priors() -> dict[str, KellyPriorCfg]:
+    return {
+        "CAR": KellyPriorCfg(win_rate=0.25, payoff=3.5),
+        "GME": KellyPriorCfg(win_rate=0.15, payoff=8.0),
+        "Mixed": KellyPriorCfg(win_rate=0.20, payoff=5.5),
+    }
+
+
 class RiskCfg(_StrictSection):
     kelly_fraction: float = 0.20
     position_cap: float = 0.08
@@ -48,6 +79,9 @@ class RiskCfg(_StrictSection):
     max_gross_exposure: float = 0.90
     monthly_drawdown_kill: float = 0.10
     bayes_prior_n: int = 30
+    kelly_priors: dict[str, KellyPriorCfg] = Field(default_factory=_default_kelly_priors)
+    killswitch: KillswitchCfg = Field(default_factory=KillswitchCfg)
+    gates: GatesCfg = Field(default_factory=GatesCfg)
 
 
 class StopsCfg(_StrictSection):

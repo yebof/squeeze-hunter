@@ -58,8 +58,12 @@ def kelly_priors_for_setup(
     fraction: float = 0.20,
     cap: float = 0.08,
     prior_n: int = 30,
+    priors: dict[str, tuple[float, float]] | None = None,
 ) -> KellyParams:
     """Return KellyParams with per-setup-type priors.
+
+    P9: `priors` (setup -> (win_rate, payoff)) comes from
+    settings.risk.kelly_priors; the module table below is only the default.
 
     R7.M2: "Weak" returns fraction=0 (and a noticeably-low cap) so any Weak
     candidate that slips past the gate sizes to zero.
@@ -76,7 +80,8 @@ def kelly_priors_for_setup(
             fraction=0.0,  # zero sizing for explicitly weak setups
             cap=0.0,
         )
-    pwr, ppay = _PRIORS_BY_SETUP.get(setup_type, _PRIORS_BY_SETUP["Mixed"])
+    table = priors if priors else _PRIORS_BY_SETUP
+    pwr, ppay = table.get(setup_type, table.get("Mixed", _PRIORS_BY_SETUP["Mixed"]))
     return KellyParams(
         prior_win_rate=pwr,
         prior_payoff=ppay,

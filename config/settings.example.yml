@@ -31,6 +31,24 @@ risk:
   monthly_drawdown_kill: 0.10
   # Kelly shrinkage: observed stats get weight n / (n + bayes_prior_n).
   bayes_prior_n: 30
+  # Per-setup Kelly priors (win rate, payoff). Each must give a positive raw
+  # Kelly, p*b - (1-p) > 0. Weak is always sized to zero.
+  kelly_priors:
+    CAR: { win_rate: 0.25, payoff: 3.5 }
+    GME: { win_rate: 0.15, payoff: 8.0 }
+    Mixed: { win_rate: 0.20, payoff: 5.5 }
+  # The other four killswitch arms and the sticky cooldown (calendar days).
+  killswitch:
+    three_day_loss_max: -0.05
+    gap_through_stop_max: -0.25
+    broker_outage_max_seconds: 300
+    data_stale_max_seconds: 7200
+    cooldown_days: 7
+  # Pre-trade gate thresholds: ADV20 dollar volume must be >= this multiple of
+  # the position; pairwise correlation above max_correlation is rejected.
+  gates:
+    min_adv20_multiple: 100
+    max_correlation: 0.70
 stops:
   hard_stop: -0.12
   # R9.1: trailing magnitudes are stored as negative thresholds (-0.20 = exit

@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, cast
-from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -23,6 +22,12 @@ from squeeze_hunter.monitor.alerts import AlertSender, Severity
 from squeeze_hunter.monitor.http import MonitorServer, start_monitor_server
 from squeeze_hunter.monitor.metrics import MetricsRegistry
 from squeeze_hunter.risk.killswitch import evaluate_killswitch
+from squeeze_hunter.trading_calendar import (
+    NY,
+    is_regular_session,
+    is_trading_day,
+    session_open_utc,
+)
 
 if TYPE_CHECKING:
     from squeeze_hunter.risk.killswitch import KillSwitchInputs
@@ -44,28 +49,10 @@ def _alert_sender_from_env() -> AlertSender | None:
     return AlertSender(telegram_bot_token=token, telegram_chat_id=chat, slack_webhook_url=slack)
 
 
-# R3.2: US regular session for the intraday loop. 09:30-16:00 ET, Mon-Fri.
-# We do NOT filter US federal holidays here — the cost of trading on a
-# holiday (rare false positive) is a logged debug skip, and we'd rather
-# err on the side of being available than silently skip a half-day session
-# (which is unusual but legal). Holiday-exact filtering can be added if needed.
-_NY = ZoneInfo("America/New_York")
-_SESSION_OPEN = time(9, 30)
-_SESSION_CLOSE = time(16, 0)
-
-
-def _is_us_regular_session(now: datetime) -> bool:
-    """True if `now` falls within Mon-Fri 09:30-16:00 ET (regular trading)."""
-    et = now.astimezone(_NY)
-    if et.weekday() >= 5:  # Saturday=5, Sunday=6
-        return False
-    return _SESSION_OPEN <= et.time() < _SESSION_CLOSE
-
-
-def _session_open_utc(now: datetime) -> datetime:
-    """Today's 09:30 ET (for `now`'s ET calendar day) expressed in UTC."""
-    et = now.astimezone(_NY)
-    return datetime.combine(et.date(), _SESSION_OPEN, tzinfo=_NY).astimezone(UTC)
+# R3.2 / P5: the session window lives in trading_calendar (single source of
+# truth for live and backtest); the old private names stay as aliases.
+_is_us_regular_session = is_regular_session
+_session_open_utc = session_open_utc
 
 
 @dataclass
@@ -287,6 +274,8 @@ class RuntimeContext:
         self.lifecycle_state.trailing_car = abs(self.settings.stops.trailing_car)
         self.lifecycle_state.trailing_gme = abs(self.settings.stops.trailing_gme)
         self.lifecycle_state.trailing_mixed = abs(self.settings.stops.trailing_mixed)
+        # P9: the sticky cooldown is a YAML knob, mirrored by the backtest runner.
+        self._kill_cooldown_days = self.settings.risk.killswitch.cooldown_days
         if self.broker is None:
             if self.mode == "sim":
                 self.broker = cast(
@@ -513,9 +502,14 @@ class RuntimeContext:
         # R8.S-I2: pass YAML monthly_drawdown_kill so the YAML knob is wired.
         # The YAML value is positive magnitude; killswitch expects negative.
         monthly_dd_kill = -abs(self.settings.risk.monthly_drawdown_kill)
+        ks_cfg = self.settings.risk.killswitch
         ks = evaluate_killswitch(
             self.telemetry.to_killswitch_inputs(as_of=now),
             monthly_drawdown_max=monthly_dd_kill,
+            three_day_loss_max=ks_cfg.three_day_loss_max,
+            gap_through_stop_max=ks_cfg.gap_through_stop_max,
+            broker_outage_max_seconds=ks_cfg.broker_outage_max_seconds,
+            data_stale_max_seconds=ks_cfg.data_stale_max_seconds,
         )
 
         # R7.C1 + R8.C1: sticky-cooldown window. From the first trip, stay
@@ -710,12 +704,8 @@ class RuntimeContext:
         Counting those as trading days would force the time-stop ~2 calendar
         weeks earlier than intended.
         """
-        # Avoid a circular import: pull the holiday cache from the earnings
-        # signal module which already maintains it.
-        from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
-
-        et = now.astimezone(_NY)
-        if et.date() in set(_us_business_holidays()):
+        et = now.astimezone(NY)
+        if not is_trading_day(et.date()):
             log.info("eod_close_skipped_holiday", date=et.date().isoformat())
             return
 
