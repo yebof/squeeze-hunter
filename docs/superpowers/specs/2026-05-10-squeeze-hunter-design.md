@@ -595,3 +595,35 @@ The validation case set was confirmed against public reporting:
 - CAR April 2026 short squeeze chatter — 247wallst.com
 
 Original anchors (GME 2021, CAR 2022, BBBY 2022, AMC 2021) are well-documented in mainstream financial press.
+
+## 10. Architecture Review (Sep 2026) and Hardening Roadmap
+
+### Verdict on the style question
+
+The system is, and should remain, **Approach A: a single-process modular monolith** driven by a scheduler. It is not a multi-agent design in either sense of the term: there are no LLM agents in the trading loop, and there is no actor/process decomposition — every job is a coroutine inside one `RuntimeContext`. That is the right call for v1: the design principles (conservative, deterministic, one code path, testable) are incompatible with agents that reason non-deterministically, and a 20-name universe does not need distributed compute. Multi-agent LLM work is reserved for **auditing the code** (review rounds 12–13 used parallel reviewer agents with adversarial verification), never for making trading decisions. The one decomposition worth keeping open is process-level (Approach B): a data-ingest daemon separate from the trading loop, under a supervisor — see P6/P10 below.
+
+### Weaknesses found by the round-12/13 reviews
+
+1. **"Same code path" holds for the risk primitives, not for the loop.** `backtest/runner.py` re-implements position management (peak tracking, halve legs, exit fills, killswitch inputs) separately from `execution/lifecycle.py`, and the live side has no entry path at all. Every divergence found in rounds 12–13 (halve cadence, peak semantics, time-stop off-by-one, stale-bar handling) lives in that duplication.
+2. **State is in-memory only.** §6 promises an order state machine, 60 s and EOD reconciliation and idempotent client order ids; the code keeps `pending_exits` ids in a dict, persists nothing, and `store/` is schema-only. A restart orphans positions.
+3. **`RuntimeContext` is a god object** (~800 lines: telemetry, killswitch state machine, job entry points, broker wiring, monitoring, alerts, scan). Several round-13 bugs (gauges nested under NAV, freshness refreshed by socket state) were consequences of tangled responsibilities.
+4. **Broker tests never touched ib_async semantics.** Every test mocked `_ib`, so the blocking `reqAccountUpdates()`, `PendingCancel` being fillable, cached `Ticker` objects and sub-penny limits were invisible until round 13.
+5. **No live data pipeline.** Paper/live scans read the same parquet cache as the backtest with nothing updating it; datasets carry no freshness contract; FINRA's CDN is currently unreachable with no fallback source.
+6. **Clock and calendar are ad hoc.** Session logic lived in `runtime.py`, the holiday calendar in `signals/earnings_reaction.py`, the backtest label/clock split inside the runner.
+7. **Tunables still in code:** Kelly priors, four killswitch arms and the cooldown, two gate thresholds.
+8. **No golden-number regression.** Three Gate 1 metric formulas were wrong for twelve review rounds because nothing pinned expected numbers on a fixed dataset; no invariant tests (never net short, exposure ≤ cap) run across the simulator.
+9. **No decision log.** The runner returns a trade log only; there is no per-day, per-ticker record of which gate rejected what, so Gate 1 outcomes cannot be explained after the fact.
+10. **Deployment gaps.** The app is not in `docker/compose.yml`, there is no restart policy, and the backup automation described in the runbook does not exist.
+
+### Roadmap (ordered; each item has a plan in `docs/superpowers/plans/2026-09-06-squeeze-hunter-architecture-hardening.md`)
+
+- **P1 Unified position core.** Extract pure `decide_exits()` / `propose_entries()` over a `PositionBook`; the backtest runner and the live daemon both call them; the runner's private loop is deleted. This also yields the Phase-4 live entry path behind a config flag.
+- **P2 Persistent state + reconciliation.** A `StateStore` protocol (atomic JSON snapshot first, Postgres later) for the book, pending orders and killswitch state; startup reconciliation against broker positions; 60 s and EOD reconciliation with alerts; client-side order ids.
+- **P3 Explicit order state machine** shared by lifecycle and OMS, plus a fake-IB contract test suite that reproduces ib_async semantics.
+- **P4 Split `RuntimeContext`** into telemetry, killswitch controller, trading session and wiring.
+- **P5 Infrastructure modules** `trading_calendar` (done in this revision) and a `Clock` protocol shared by live and backtest.
+- **P6 Live data pipeline** (`ingest_eod`, per-dataset freshness checked by `premarket_verify`, FINRA API fallback).
+- **P7 Golden-number and invariant tests.**
+- **P8 Decision log** persisted by both paths, with a CLI to explain a ticker-day.
+- **P9 Remaining tunables to YAML** (done in this revision: Kelly priors, killswitch arms and cooldown, gate thresholds).
+- **P10 Deployment:** app service in compose with a restart policy; backup job.
