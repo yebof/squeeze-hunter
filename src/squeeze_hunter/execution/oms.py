@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from squeeze_hunter.broker.base import BrokerOrder, IBroker
+from squeeze_hunter.execution.pricing import round_to_tick
 from squeeze_hunter.execution.slicing import (
     TwapPlan,
     default_aggression_schedule,
@@ -84,10 +85,12 @@ class OrderManager:
             )
 
             # Buy: limit above mid (positive bps); sell: limit below mid (negative bps)
+            # Round-13: snap to the minimum price variation (IBKR rejects
+            # sub-penny limits with error 110).
             if plan.side == "buy":
-                limit_price = mid * (1 + agg_bps / 10_000)
+                limit_price = round_to_tick(mid * (1 + agg_bps / 10_000), side="buy")
             else:
-                limit_price = mid * (1 - agg_bps / 10_000)
+                limit_price = round_to_tick(mid * (1 - agg_bps / 10_000), side="sell")
 
             submit = self.broker.submit_buy if plan.side == "buy" else self.broker.submit_sell
             order = await submit(
