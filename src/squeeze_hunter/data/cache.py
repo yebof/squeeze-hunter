@@ -68,6 +68,19 @@ class ParquetCache:
         dedup_keys: list[str] | None = None,
     ) -> None:
         existing = self.read_partition(domain, partition_key)
+        if not existing.empty:
+            # Round-13: a tz-aware column concatenated with a tz-naive one
+            # becomes object dtype, drop_duplicates then sees two different
+            # values for the same instant, and pyarrow coerces both to UTC on
+            # write — an invisible duplicate bar. Normalise datetimes first.
+            df = df.copy()
+            for col in df.columns:
+                if col in existing.columns and (
+                    pd.api.types.is_datetime64_any_dtype(existing[col])
+                    or pd.api.types.is_datetime64_any_dtype(df[col])
+                ):
+                    existing[col] = pd.to_datetime(existing[col], utc=True)
+                    df[col] = pd.to_datetime(df[col], utc=True)
         merged = pd.concat([existing, df], ignore_index=True) if not existing.empty else df
         keys = dedup_keys if dedup_keys is not None else self.dedup_keys
         if keys:

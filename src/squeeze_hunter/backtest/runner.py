@@ -210,13 +210,19 @@ async def run_backtest(
                 bars = await provider.fetch_bars(ticker, cur - timedelta(days=2), cur)
             except LookupError:
                 continue
+            st = open_states[ticker]
             if not bars or bars[-1].ts.date() != cur.date():
                 # Round-12: no bar TODAY (halt / delist) — don't re-run stops or
-                # advance bars_held on a stale prior bar; keep the last mark.
+                # advance bars_held on a stale prior bar. Round-13: carry the
+                # LAST mark forward explicitly — leaving the ticker out of
+                # `marks` made the simulator fall back to the entry price and
+                # erased the accrued P&L from equity and the drawdown input.
+                if st.get("last_close"):
+                    marks[ticker] = st["last_close"]
                 continue
             last = bars[-1]
             marks[ticker] = last.close  # surviving positions are marked at close
-            st = open_states[ticker]
+            st["last_close"] = last.close
             st["bars_held"] += 1
             # Peak tracks the running max of CLOSES (multi-day high-water mark).
             # We deliberately do NOT fold today's intraday HIGH into the peak:
@@ -228,12 +234,16 @@ async def run_backtest(
             # close preceded the low and manufactured trailing-stop exits at
             # the low of wide-range UP days. Today's close is folded in below,
             # after evaluate_stops.
+            # Round-13: the OPEN provably precedes the low, so the evaluation
+            # peak is max(running close-peak, today's open). A gap-up that
+            # craters intraday still trails out — as it would live — without
+            # fabricating a high-before-low round trip.
             entry_px = st["entry_price"]
             if entry_px > 0:
                 intraday_gap_by_ticker[ticker] = (last.low - entry_px) / entry_px
             stop_state = StopState(
                 entry_price=entry_px,
-                peak_price=st["peak"],
+                peak_price=max(st["peak"], last.open),
                 current_score=st.get("current_score", st["entry_score"]),
                 entry_score=st["entry_score"],
                 bars_held=st["bars_held"],
@@ -385,7 +395,10 @@ async def run_backtest(
                     continue
                 if not tb or tb[-1].ts.date() != cur.date():
                     continue  # no session today → not tradeable at tomorrow's open
-                prior = tb[:-1][-20:] or tb[-1:]
+                prior = tb[:-1][-20:]
+                if not prior:
+                    # Round-13: a lone bar must not certify its own liquidity.
+                    continue
                 adv20_by_ticker[t] = sum(b.close * b.volume for b in prior) / len(prior)
                 if tb[-1].close >= settings.universe.min_price:
                     universe_today.add(t)

@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from squeeze_hunter.backtest.runner import BacktestConfig, run_backtest
+from squeeze_hunter.backtest.runner import BacktestConfig, BacktestResult, run_backtest
 from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 
@@ -33,7 +33,10 @@ def _bar(ts: datetime, o: float, h: float, lo: float, c: float, v: int = 5_000_0
 
 
 def _write(cache: ParquetCache, bars: list[dict]) -> None:
-    cache.write_partition("bars", "GME", pd.DataFrame(bars))
+    # Round-13: one warm-up session (the Friday before) so the ADV20 gate has a
+    # prior bar on the first scan day — a lone bar no longer self-certifies.
+    warmup = dict(bars[0], ts=bars[0]["ts"] - timedelta(days=3))
+    cache.write_partition("bars", "GME", pd.DataFrame([warmup, *bars]))
     cache.write_partition(
         "short_interest",
         "all",
@@ -68,7 +71,7 @@ def _scan_first_day_only():
     return _scan
 
 
-async def _run(cache: ParquetCache, start: str, end: str) -> pd.DataFrame:
+async def _run_full(cache: ParquetCache, start: str, end: str) -> BacktestResult:
     settings = Settings()
     settings.score.weights = {"f1_si_pct": 1.0}
     cfg = BacktestConfig(
@@ -78,8 +81,11 @@ async def _run(cache: ParquetCache, start: str, end: str) -> pd.DataFrame:
         score_threshold=3.0,
     )
     with patch("squeeze_hunter.backtest.runner.run_scan", side_effect=_scan_first_day_only()):
-        result = await run_backtest(cfg, cache=cache, settings=settings)
-    return result.trade_log
+        return await run_backtest(cfg, cache=cache, settings=settings)
+
+
+async def _run(cache: ParquetCache, start: str, end: str) -> pd.DataFrame:
+    return (await _run_full(cache, start, end)).trade_log
 
 
 @pytest.mark.asyncio

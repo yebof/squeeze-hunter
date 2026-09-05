@@ -145,7 +145,19 @@ async def test_runner_enters_next_trading_day_after_scan(tmp_path: Path) -> None
     # the fill price pins the exact bar/day.
     base = datetime(2024, 5, 14, tzinfo=UTC)
     days = pd.bdate_range(base, periods=6, tz="UTC")
-    rows = []
+    # Round-13: one warm-up session before the run so the ADV20 liquidity gate
+    # has a prior bar on the first scan day.
+    rows = [
+        {
+            "ticker": "GME",
+            "ts": base - timedelta(days=1),
+            "open": 9.0,
+            "high": 19.0,
+            "low": 8.0,
+            "close": 17.0,
+            "volume": 5_000_000,
+        }
+    ]
     for i, ts in enumerate(days):
         rows.append(
             {
@@ -234,6 +246,15 @@ async def test_runner_gap_through_stop_uses_daily_low(tmp_path: Path) -> None:
     # (-35% from entry, well past the -12% hard stop) but CLOSE recovers to 99
     # (only -1%, would NOT trip a close-based stop). Day3: filler.
     bars = [
+        {  # Round-13: warm-up session so the ADV20 gate has a prior bar on day 0
+            "ticker": "GME",
+            "ts": (days[0] - pd.Timedelta(days=1)).to_pydatetime(),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 5_000_000,
+        },
         {
             "ticker": "GME",
             "ts": days[0].to_pydatetime(),

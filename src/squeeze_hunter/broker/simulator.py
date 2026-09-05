@@ -175,7 +175,13 @@ class SimulatorBroker:
     def gross_exposure_pct(self: SimulatorBroker, marks: dict[str, float]) -> float:
         if self.equity <= 0:
             return 0.0
-        notional = sum(marks.get(t, lot.avg_price) * lot.qty for t, lot in self.positions.items())
+        # Round-13: a ticker with no fresh mark keeps its LAST mark, not its
+        # entry price — falling back to cost erased accrued P&L from equity,
+        # gross exposure and the drawdown killswitch input on any no-bar day.
+        notional = sum(
+            marks.get(t, self.last_marks.get(t, lot.avg_price)) * lot.qty
+            for t, lot in self.positions.items()
+        )
         return notional / self.equity
 
     def mark_to_market(self: SimulatorBroker, marks: dict[str, float], ts: datetime) -> None:
@@ -184,7 +190,13 @@ class SimulatorBroker:
         for t, px in marks.items():
             if px > 0:
                 self.last_marks[t] = px
-        notional = sum(marks.get(t, lot.avg_price) * lot.qty for t, lot in self.positions.items())
+        # Round-13: a ticker with no fresh mark keeps its LAST mark, not its
+        # entry price — falling back to cost erased accrued P&L from equity,
+        # gross exposure and the drawdown killswitch input on any no-bar day.
+        notional = sum(
+            marks.get(t, self.last_marks.get(t, lot.avg_price)) * lot.qty
+            for t, lot in self.positions.items()
+        )
         self.equity = self.cash + notional
 
 
