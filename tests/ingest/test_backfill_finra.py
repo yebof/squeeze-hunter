@@ -182,3 +182,14 @@ async def test_backfill_finra_downloads_each_monthly_file_once(tmp_path: Path) -
     out = cache.read_partition("short_interest", "all")
     assert set(out["ticker"]) <= set(tickers)
     assert (out["ticker"] == "GME").any()
+
+
+@pytest.fixture(autouse=True)
+def _no_splits():
+    """Round-13: backfill_finra now also asks Yahoo for split history; keep these
+    tests hermetic (no network) by defaulting it to 'no splits'."""
+    with patch(
+        "squeeze_hunter.ingest.backfill_finra.YahooProvider.get_split_ratios",
+        new=AsyncMock(return_value=[]),
+    ):
+        yield

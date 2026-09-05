@@ -146,6 +146,29 @@ class YahooProvider:
 
         return await asyncio.to_thread(_go)
 
+    async def get_split_ratios(self: YahooProvider, ticker: str) -> list[tuple[date, float]]:
+        """Historical stock splits as (effective date, ratio); 4.0 = 4-for-1,
+        0.1 = 1-for-10 reverse. Empty when Yahoo reports none.
+
+        Round-13: FINRA short-share counts are as-reported and never restated,
+        so a pre-split count must be scaled by every later split before it is
+        divided by today's float.
+        """
+
+        def _go() -> list[tuple[date, float]]:
+            splits = yf.Ticker(ticker).splits
+            out: list[tuple[date, float]] = []
+            if splits is None or len(splits) == 0:
+                return out
+            ratios = splits.to_numpy(dtype=float)
+            for ts, ratio in zip(pd.DatetimeIndex(splits.index), ratios, strict=True):
+                d = ts.date()
+                if isinstance(d, date) and ratio > 0:  # narrows date | NaTType
+                    out.append((d, float(ratio)))
+            return out
+
+        return await asyncio.to_thread(_go)
+
     async def fetch_sentiment(
         self: YahooProvider, ticker: str, as_of: datetime
     ) -> RedditMention | None:

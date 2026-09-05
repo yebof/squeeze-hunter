@@ -19,6 +19,7 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
     yahoo = YahooProvider()
     rows: list[dict] = []
     float_cache: dict[str, int | None] = {}
+    splits_cache: dict[str, list[tuple[date, float]]] = {}
 
     # CDX2-P2: ONE pass over the FINRA files for the whole universe, not one
     # full re-download per ticker. fetch_short_interest_bulk GETs each monthly
@@ -40,9 +41,28 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
                 log.warning("yahoo_float_failed", ticker=t, err=str(e), err_type=type(e).__name__)
                 float_cache[t] = None
         float_shares = float_cache[t]
+        # Round-13: FINRA reports share counts as of the settlement date and
+        # never restates them, while Yahoo's float is TODAY's. A 10M short
+        # before a 4:1 split is 40M of today's shares; dividing the raw count
+        # by today's float understated pre-split f1 by 4x (GME) and overstated
+        # it 10x across AMC's 1:10 reverse split. Scale each record by every
+        # split that happened AFTER its settlement date. si_shares itself is
+        # stored as reported (days_to_cover divides it by an unadjusted ADV).
+        if t not in splits_cache:
+            try:
+                splits_cache[t] = await yahoo.get_split_ratios(t)
+            except (ConnectionError, TimeoutError, OSError, KeyError, ValueError) as e:
+                log.warning("yahoo_splits_failed", ticker=t, err=str(e), err_type=type(e).__name__)
+                splits_cache[t] = []
+        splits = splits_cache[t]
 
         for si in si_list:
-            si_pct_float = (si.si_shares / float_shares) if float_shares else 0.0
+            adjust = 1.0
+            for split_date, ratio in splits:
+                if split_date > si.settlement_date:
+                    adjust *= ratio
+            adjusted_shares = si.si_shares * adjust
+            si_pct_float = (adjusted_shares / float_shares) if float_shares else 0.0
             rows.append(
                 {
                     "ticker": si.ticker,
