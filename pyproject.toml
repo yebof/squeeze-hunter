@@ -32,6 +32,7 @@ dependencies = [
     "httpx>=0.27",
     "scipy>=1.17.1",
     "python-dotenv>=1.2.2",
+    "pandas-market-calendars>=5.4.0",
 ]
 
 [project.optional-dependencies]

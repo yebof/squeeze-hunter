@@ -49,12 +49,17 @@ def sharpe(equity: pd.Series, periods_per_year: int = 252) -> float:
 
 def sortino(equity: pd.Series, periods_per_year: int = 252) -> float:
     r = daily_returns(equity)
-    downside = r[r < 0]
-    # R4.6: same NaN-vs-zero gap as sharpe — fix with len + finite guard.
-    sd = downside.std(ddof=1) if len(downside) >= 2 else 0.0
-    if len(downside) <= 1 or sd == 0.0 or not np.isfinite(sd):
+    if len(r) <= 1:
         return 0.0
-    return float(r.mean() / sd * np.sqrt(periods_per_year))
+    # Round-13: textbook downside deviation — the RMS of min(r, 0) over ALL
+    # periods. The previous std of the negative returns (about their own mean)
+    # collapsed toward zero whenever losses were similar-sized — the normal
+    # case with one fixed hard stop — and inflated the ratio to ~1e13, voiding
+    # Gate 1's sortino_min check. R4.6's finite guard is kept.
+    downside_dev = float(np.sqrt(np.mean(np.minimum(r.to_numpy(dtype=float), 0.0) ** 2)))
+    if downside_dev < 1e-12 or not np.isfinite(downside_dev):
+        return 0.0
+    return float(r.mean() / downside_dev * np.sqrt(periods_per_year))
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -89,7 +94,12 @@ def hit_rate_and_payoff(trade_log: pd.DataFrame) -> tuple[float, float]:
             while qty > 0 and lots:
                 lot_qty, lot_price = lots[0]
                 use = min(qty, lot_qty)
-                pnls.append((price - lot_price) * use)
+                # Round-13: payoff is a RETURN ratio, not dollar P&L. Dollar
+                # P&L let a small loss on a large lot outweigh a big gain on a
+                # small one and drifted with account size; Kelly and the spec
+                # both work in percent.
+                if lot_price > 0:
+                    pnls.append((price - lot_price) / lot_price)
                 qty -= use
                 if use == lot_qty:
                     lots.pop(0)
@@ -121,20 +131,34 @@ def captured_events(
 ) -> int:
     """Count distinct events whose ticker had any buy within the capture window.
 
-    The window is asymmetric: lookback is ``window_days`` before the event
-    (to credit predictive entries), but the forward allowance is only **1
-    calendar day** after the event start.  Entries more than 1 day after the
-    event are considered late chasing and do NOT count as captured.
+    The window is asymmetric: lookback is ``window_days`` calendar days before
+    the event (to credit predictive entries), but the forward allowance is
+    only **one NYSE trading day** after the event start. Entries later than
+    that are considered late chasing and do NOT count as captured.
+
+    Round-13: the allowance used to be one *calendar* day, but the scan that
+    sees the event fills at the NEXT session's open — for a Friday event that
+    is Monday (+3 calendar days), so the entry that actually caught the event
+    was never credited.
     """
     if trade_log.empty:
         return 0
+    from squeeze_hunter.signals.earnings_reaction import _us_business_holidays
+
+    holidays_dt64 = np.array(_us_business_holidays(), dtype="datetime64[D]")
     hits = 0
     buys = trade_log[trade_log["side"] == "buy"]
     for ticker, event_ts in events:
+        next_session = np.busday_offset(
+            np.datetime64(event_ts.date()), 1, roll="forward", holidays=holidays_dt64
+        )
+        forward_end = datetime.combine(
+            next_session.astype("datetime64[D]").astype(object), datetime.max.time()
+        ).replace(tzinfo=event_ts.tzinfo)
         match = buys[
             (buys["ticker"] == ticker)
             & (buys["ts"] >= event_ts - timedelta(days=window_days))
-            & (buys["ts"] <= event_ts + timedelta(days=1))
+            & (buys["ts"] <= forward_end)
         ]
         if not match.empty:
             hits += 1

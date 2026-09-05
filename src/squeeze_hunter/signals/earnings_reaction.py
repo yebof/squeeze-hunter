@@ -17,38 +17,34 @@ from math import log
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
+import pandas_market_calendars as mcal
 
 from squeeze_hunter.data.protocol import DataProvider
 from squeeze_hunter.signals.base import Factor
 
-# R8: cache US federal holidays once. np.busday_count without a holidays
-# argument counts Mon-Fri only and treats Christmas / Thanksgiving / etc.
-# as trading days. The federal-holiday calendar is a close approximation of
-# the NYSE trading calendar — it overlaps on ~9 of 10 closures per year.
-# Known small inaccuracies (acceptable for the 5-day decay window):
-#   - misses Good Friday (NYSE closure but not federal holiday)
-#   - includes Columbus Day and Veterans Day (federal but NYSE-open)
-# A future refinement could use pandas_market_calendars for exact NYSE
-# closures.
+# R8: cache the trading holidays once. np.busday_count without a holidays
+# argument counts Mon-Fri only and treats Christmas / Thanksgiving / etc. as
+# trading days.
+# Round-13: the calendar is the real NYSE one (pandas_market_calendars), not
+# the US federal calendar. The federal approximation iterated Good Friday
+# (NYSE closed → an equity point with no marks every year) and skipped
+# Columbus Day and Veterans Day (NYSE open → never scanned, never
+# stop-checked, missing from the equity curve). Every consumer — the
+# backtest day loop, the live time-stop counter, the f3 / f5 windows, the
+# FINRA publication lag and captured-events — shares this list.
 _US_HOLIDAYS_CACHE: list[date] | None = None
 
 
 def _us_business_holidays() -> list[date]:
+    """Weekday NYSE closures 2018-2030 (name kept for the existing callers)."""
     global _US_HOLIDAYS_CACHE
     if _US_HOLIDAYS_CACHE is None:
-        cal = USFederalHolidayCalendar()
-        # Cover the realistic backtest + live range.
-        holidays = cal.holidays(start="2018-01-01", end="2030-12-31")
-        # Drop NaT entries that USFederalHolidayCalendar can theoretically emit.
-        out: list[date] = []
-        for h in holidays:
-            ts = pd.Timestamp(h)
-            if pd.notna(ts):
-                d = ts.date()
-                if isinstance(d, date):  # narrows date | NaTType -> date
-                    out.append(d)
-        _US_HOLIDAYS_CACHE = out
+        nyse = mcal.get_calendar("NYSE")
+        # Weekdays that are NOT sessions on the exchange schedule: regular
+        # holidays plus special closures (days of mourning, etc.).
+        sessions = {ts.date() for ts in nyse.schedule("2018-01-01", "2030-12-31").index}
+        weekdays = pd.bdate_range("2018-01-01", "2030-12-31")
+        _US_HOLIDAYS_CACHE = [ts.date() for ts in weekdays if ts.date() not in sessions]
     return _US_HOLIDAYS_CACHE
 
 

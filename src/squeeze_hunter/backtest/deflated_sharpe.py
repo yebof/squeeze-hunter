@@ -45,7 +45,10 @@ def deflated_sharpe(
     p1 = max(1e-12, min(1 - 1e-12, 1 - 1 / n_trials))
     p2 = max(1e-12, min(1 - 1e-12, 1 - 1 / (n_trials * 2.71828)))
     # Expected maximum of n_trials iid N(0,1) draws, in standardized units.
-    e_max = (1 - 0.5772) * norm.ppf(p1) + 0.5772 * norm.ppf(p2)
+    # Round-13: for a single trial the expected max of one draw is 0. The
+    # clamped ppf(1e-12) = -7.03 made e_max = -2.78, so with the CLI default
+    # --n-trials 1 a zero or negative Sharpe scored ~0.99 and passed.
+    e_max = 0.0 if n_trials <= 1 else (1 - 0.5772) * norm.ppf(p1) + 0.5772 * norm.ppf(p2)
     # Standard error of the per-period SR estimate over n_obs returns.
     sr_std = sqrt((1 - skew * sr + (kurtosis - 1) / 4 * sr**2) / (n_obs - 1))
     # SR0 = e_max * sr_std lives in per-period SR units. z-score: how many

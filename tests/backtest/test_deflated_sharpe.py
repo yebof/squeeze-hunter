@@ -1,3 +1,5 @@
+import pytest
+
 from squeeze_hunter.backtest.deflated_sharpe import deflated_sharpe
 
 
@@ -44,11 +46,15 @@ def test_deflated_sharpe_units_realistic_annualized_sharpe() -> None:
 
 
 def test_deflated_sharpe_no_penalty_at_single_trial() -> None:
-    """With n_trials=1 there is no multiple-testing penalty, so a positive
-    annualized Sharpe should deflate to ~1.0 (the CLI default n_trials=1 keeps
-    the gate effectively inert, as designed)."""
+    """With n_trials=1 there is no multiple-testing penalty: the benchmark is
+    0 and the value is the probability the true Sharpe is positive given the
+    estimation error. Round-13: the old expectation (> 0.95 for Sharpe 1.0)
+    encoded an inverted benchmark (-2.78) that also scored a NEGATIVE Sharpe
+    at 0.96; an annualized 1.0 over 250 observations is ~1 standard error
+    above zero, i.e. ~0.84."""
     val = deflated_sharpe(observed_sr=1.0, n_trials=1, n_obs=250)
-    assert val > 0.95
+    assert 0.75 < val < 0.95
+    assert deflated_sharpe(observed_sr=0.0, n_trials=1, n_obs=250) == pytest.approx(0.5, abs=0.02)
 
 
 def test_deflated_sharpe_monotonic_in_observed_sharpe() -> None:

@@ -213,6 +213,9 @@ def test_sortino_returns_zero_for_two_point_curve_one_downside() -> None:
         index=pd.date_range("2024-01-01", periods=3, freq="B"),
     )
     s = sortino(eq)
-    # Only 1 downside return → std(ddof=1) is NaN → guard returns 0
-    assert s == 0.0
+    # Round-13: the textbook downside deviation (RMS of min(r, 0) over all
+    # periods) is finite with a single losing day — no NaN, and a net-negative
+    # curve must score BELOW zero so it fails the gate, never slips through.
     assert not np.isnan(s)
+    assert np.isfinite(s)
+    assert s < 0.0
