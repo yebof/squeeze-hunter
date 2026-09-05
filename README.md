@@ -219,6 +219,28 @@ cp .env.example .env   # then edit IBKR / Finnhub / Reddit / Telegram / Slack cr
 uv run squeeze-hunter hello AAPL
 ```
 
+## Credentials and external services
+
+Copy `.env.example` to `.env` in the repository root and fill in what you
+need. The CLI loads the nearest `.env` automatically and never overrides
+variables already set in your shell. `.env` is gitignored; never commit it.
+
+| Variable | Needed for | Where to get it |
+| --- | --- | --- |
+| `FINNHUB_KEY` | `ingest earnings` — the earnings calendar behind f3 | Sign up at [finnhub.io](https://finnhub.io), copy the API key from the dashboard. The free tier is enough for a 20-name universe. |
+| `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT` | `hello`, `paper`, `live`, `emergency-flatten` | An [Interactive Brokers](https://www.interactivebrokers.com) account with a paper-trading sub-account (IDs start with `DU`). Run TWS or IB Gateway on the same machine and enable the API (Configure → API → Settings → *Enable ActiveX and Socket Clients*; add `127.0.0.1` to trusted IPs). Paper mode requires port **7497** — `PaperBroker` refuses any other port, so if you use IB Gateway set its API port to 7497. Live TWS uses 7496. `IBKR_CLIENT_ID` is any small integer not used by another API client. |
+| `IBKR_USERID`, `IBKR_PASSWORD` | Only the `ib-gateway` container in `docker/compose.yml` | Your IBKR paper-account login. Not read by the Python code. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Killswitch alerts (high severity) | Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) to get the token; send the bot a message, then read your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`. Optional. |
+| `SLACK_WEBHOOK_URL` | Low-severity alerts | Slack → *Apps* → *Incoming Webhooks* → add to a channel, copy the webhook URL. Optional. |
+| `SH_DB_URL` | `alembic upgrade head` only | Leave the default for the local docker Postgres. The runtime does not read the database yet. |
+| `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | Reserved for the Reddit mention ingest behind f4, which is not implemented yet | [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) → create a *script* app. Nothing reads these today. |
+
+Services that need no key: Yahoo Finance bars and float (via `yfinance`) and
+the FINRA short-interest files (public monthly downloads from
+`cdn.finra.org`; if that host answers 403 from your network, try another
+network or the [FINRA API](https://developer.finra.org)). Every `SH_*`
+variable of the form `SH_<SECTION>__<KEY>` overrides the matching YAML setting.
+
 ## CLI
 
 ```
