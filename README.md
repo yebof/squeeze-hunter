@@ -143,8 +143,8 @@ it pushes a Telegram / Slack alert and can be reset manually.
 
 ## Backtest and the three gates
 
-The backtest iterates over trading days (weekends and US federal holidays
-excluded). The scan uses information available after the close; entries fill
+The backtest iterates over NYSE sessions (weekends, exchange holidays and
+special closures excluded, via `pandas_market_calendars`). The scan uses information available after the close; entries fill
 at the next session's open with open-window slippage; stops are evaluated
 against the day's low and filled at the low (conservative). FINRA short
 interest becomes visible only after its publication lag (settlement date + 8
@@ -228,7 +228,7 @@ variables already set in your shell. `.env` is gitignored; never commit it.
 | Variable | Needed for | Where to get it |
 | --- | --- | --- |
 | `FINNHUB_KEY` | `ingest earnings` — the earnings calendar behind f3 | Sign up at [finnhub.io](https://finnhub.io), copy the API key from the dashboard. The free tier is enough for a 20-name universe. |
-| `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT` | `hello`, `paper`, `live`, `emergency-flatten` | An [Interactive Brokers](https://www.interactivebrokers.com) account with a paper-trading sub-account (IDs start with `DU`). Run TWS or IB Gateway on the same machine and enable the API (Configure → API → Settings → *Enable ActiveX and Socket Clients*; add `127.0.0.1` to trusted IPs). Paper mode requires port **7497** — `PaperBroker` refuses any other port, so if you use IB Gateway set its API port to 7497. Live TWS uses 7496. `IBKR_CLIENT_ID` is any small integer not used by another API client. |
+| `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ACCOUNT` | `hello`, `paper`, `live`, `emergency-flatten` | An [Interactive Brokers](https://www.interactivebrokers.com) account with a paper-trading sub-account (IDs start with `DU`). Run TWS or IB Gateway on the same machine and enable the API (Configure → API → Settings → *Enable ActiveX and Socket Clients*; add `127.0.0.1` to trusted IPs). Paper mode requires port **7497** — `PaperBroker` refuses any other port, so if you use IB Gateway set its API port to 7497. Live mode requires `IBKR_PORT` to be set explicitly (7496 for TWS live, 4001 for IB Gateway live) and refuses 7497. Leave `IBKR_ACCOUNT` empty unless you have several sub-accounts; a value this login does not manage is refused at connect. `IBKR_CLIENT_ID` is any small integer not used by another API client. |
 | `IBKR_USERID`, `IBKR_PASSWORD` | Only the `ib-gateway` container in `docker/compose.yml` | Your IBKR paper-account login. Not read by the Python code. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Killswitch alerts (high severity) | Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) to get the token; send the bot a message, then read your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`. Optional. |
 | `SLACK_WEBHOOK_URL` | Low-severity alerts | Slack → *Apps* → *Incoming Webhooks* → add to a channel, copy the webhook URL. Optional. |
@@ -324,8 +324,9 @@ fails loudly instead of being ignored.
 - Not yet implemented from the spec: the 70/30 stock + call split and option-leg
   stops, the catalyst-fizzle stop, VWAP take-profit slices, and position
   persistence across restarts (state is in memory; Phase 4).
-- The US federal-holiday calendar approximates the NYSE calendar (it misses
-  Good Friday, for example).
+- Yahoo's float is today's float applied to every historical short-interest
+  record (share counts are split-adjusted at ingest, the float itself is not
+  reconstructed historically).
 - Known external blockers: `cdn.finra.org` currently answers 403 from the
   development machine (try another network or the FINRA API), and the earnings
   backfill needs a Finnhub key.
