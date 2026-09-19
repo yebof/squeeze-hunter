@@ -3,4 +3,7 @@ global:
 scrape_configs:
   - job_name: squeeze-hunter
     static_configs:
-      - targets: ["host.docker.internal:8080"]
+      # The app service on the compose network (P10). For a runtime started
+      # on the host instead, use host.docker.internal:8080 and bind
+      # monitor.http_host to 0.0.0.0.
+      - targets: ["squeeze-hunter:8080"]

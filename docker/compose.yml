@@ -35,6 +35,34 @@ services:
     ports: ["3000:3000"]
     depends_on: [prometheus]
 
+  # P10: the application itself. Build context is the repo root (one level
+  # up from this file). Runtime state and the parquet cache live on ./data;
+  # credentials come from ./.env; the unauthenticated /metrics + /health
+  # endpoint is reachable only on the compose network (not published).
+  squeeze-hunter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["squeeze-hunter", "paper"]
+    env_file:
+      - ../.env
+    environment:
+      SH_MONITOR__HTTP_HOST: 0.0.0.0
+      SH_MONITOR__HTTP_PORT: "8080"
+      IBKR_HOST: ib-gateway
+    volumes:
+      - ../data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 60s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    depends_on:
+      - ib-gateway
+      - prometheus
+    restart: unless-stopped
+
   ib-gateway:
     build:
       context: .
