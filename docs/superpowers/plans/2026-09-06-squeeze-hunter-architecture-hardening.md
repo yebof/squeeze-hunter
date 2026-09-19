@@ -18,19 +18,18 @@ Status legend: `[x]` done, `[ ]` open.
 - [x] `risk.kelly_priors` (per setup win rate / payoff), `risk.killswitch.*` (three-day loss, gap-through-stop, broker outage, data stale, cooldown days), `risk.gates.*` (ADV20 multiple, max correlation). Code defaults equal the YAML values; runner and runtime read settings, never the function defaults.
   - Acceptance: `grep` for the old literals in `runner.py` / `runtime.py` finds none; a test overrides each via `Settings` and observes the behaviour change.
 
-## P1 — Unified position core  `[ ]`  (largest; do first among the open items)
+## P1 — Unified position core  `[x]`  (2026-09-20)
 
 Goal: one implementation of "given the book, the quotes/bars and the clock, what do we sell, halve or buy", called by both the backtest and the live daemon.
 
-1. `execution/book.py`: `Position` dataclass (ticker, qty, entry_price, peak, entry_score, current_score, bars_held, setup_type, halved, pending order ids, last_mark) and `PositionBook` (dict + invariants: qty > 0, one position per ticker).
-2. `execution/decisions.py` (pure):
-   - `decide_exits(book, marks: dict[ticker, MarkSnapshot], params) -> list[ExitDecision]` where `MarkSnapshot` carries `price`, `low`, `open` (backtest) or `last` (live). Trailing evaluation uses `max(peak, open)` when an open is supplied, else `price`.
-   - `propose_entries(candidates, book, ctx, settings, stats) -> list[TradeProposal]` wrapping Kelly + gates (moved from the runner).
-3. `execution/lifecycle.py` becomes: fetch quotes → build marks → `decide_exits` → submit via broker with the existing reconcile / cancel-confirm logic. `backtest/runner.py` becomes: bars → marks → `decide_exits` → simulator fills; entries via `propose_entries` → next-open fills.
-4. Live entry path behind `execution.auto_enter: false` (YAML): when true, `premarket_verify` turns `last_candidates` into proposals and the OMS/TWAP path submits them at 09:35 ET.
-5. Delete the runner's private stop/halve/peak code. Tests: the existing runner and lifecycle suites must pass unchanged where they assert behaviour; a new parity test drives the same synthetic bar series through both paths and asserts identical exits.
-   - Acceptance: `evaluate_stops` has exactly one caller (`decide_exits`); `kelly_priors_for_setup` and `evaluate_gates` have exactly one caller (`propose_entries`).
-   - Estimate: 1–2 sessions. Changes backtest numbers only where the two paths currently disagree.
+- [x] `execution/book.py`: positions stay plain dicts (the daemon, its tests and the runtime address them by key) but `new_position_meta` is the only constructor and `realized_pnl` the only P&L rule, so the two paths cannot drift on shape.
+- [x] `execution/decisions.py` (pure): `decide_exit(meta, MarkSnapshot, StopParams) -> ExitDecision` — `MarkSnapshot.from_quote` (live tick) or `.from_bar` (daily bar: evaluate at the low, peak-before = open, peak-after = close, price-stops fill at the low, other stops at the close). `propose_entries(ranked, state, ctx, settings, ...) -> list[EntryDecision]` — Kelly + gates with slot reservation; every candidate yields an accepted/rejected decision with the gate reason (the seed for the P8 decision log). `setup_stats_from_trades` gives the runner its observed win/payoff stats.
+- [x] `execution/context.py`: `build_gate_context` assembles ADV20 / price floor / earnings proximity from the cache — identical inputs for backtest and premarket.
+- [x] `risk/killswitch.py`: `advance_killswitch(state, verdict, now, cooldown_days)` is the sticky-cooldown step; runtime and runner both call it. `telemetry.PortfolioTelemetry` moved out of `runtime.py` and the backtest feeds the same class (its private `_build_killswitch_inputs` is gone).
+- [x] `backtest/runner.py` and `execution/lifecycle.py` call the core; the runner's private stop / halve / peak / sizing code is deleted.
+- [x] Live entry path behind `execution.auto_enter` (default false): `premarket_verify` sizes `last_candidates` with `propose_entries`; `_execute_planned_entries` buys them once after `execution.entry_after_minutes` past the open, as a marketable limit `entry_limit_bps` above the ask, and registers the position through `new_position_meta` + telemetry. TWAP slicing via the OMS is deferred to P3 (the OMS assumes synchronous fills, which IBKR never gives).
+- [x] Acceptance met: `evaluate_stops`, `kelly_priors_for_setup` and `evaluate_gates` each have exactly one caller in `src/`; `tests/backtest/test_runner_parity.py` replays the runner's bars through `decide_exit` by hand and gets the same exit.
+- Not yet: pending BUY orders are not tracked (a non-filled entry is logged and dropped, never re-sent) — P3.
 
 ## P2 — Persistent state and reconciliation  `[ ]`
 

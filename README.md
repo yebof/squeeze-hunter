@@ -87,10 +87,10 @@ live share the same signal, risk and stop code.
 | `score/` | Weighted combiner and rule-based setup classifier |
 | `universe.py` | Universe filter (not yet wired into the pipeline; see limitations) |
 | `risk/` | Kelly sizing, pre-trade gates, stop stack, killswitch |
-| `execution/` | Lifecycle daemon (stops, pending-exit reconciliation); OMS + TWAP slicer (wired in Phase 4) |
+| `execution/` | `decisions.py` — the pure position core (`decide_exit`, `propose_entries`) shared by backtest and live; `book.py` position records; `context.py` gate inputs from the cache; lifecycle daemon (quotes in, orders out, pending-exit reconciliation); OMS + TWAP slicer (Phase 4) |
 | `broker/` | `IBroker` Protocol with IBKR live, IBKR paper and a deterministic simulator |
 | `backtest/` | Trading-day runner, cost model, walk-forward split, metrics, Gate 1 verdict |
-| `runtime.py` | `RuntimeContext` (sim / paper / live), portfolio telemetry, killswitch state machine |
+| `runtime.py`, `telemetry.py`, `trading_calendar.py` | `RuntimeContext` (sim / paper / live) and the premarket entry path; portfolio telemetry (killswitch inputs, shared with the backtest); the NYSE calendar and session window |
 | `scheduler.py` | The seven APScheduler jobs |
 | `monitor/` | Prometheus registry, health snapshot, `/metrics` + `/health` server, Telegram / Slack alerts |
 | `store/`, `alembic/` | Postgres ORM and migrations (schema only; unused at runtime) |
@@ -180,9 +180,11 @@ jobs, all in US Eastern time:
 | `moc_decision` | 15:55 | Phase 4 |
 | `eod_close` | 16:30 | wired: advances bars held |
 
-**Phase 3 does not auto-enter positions.** The nightly scan publishes
-candidates to `last_candidates` for manual review; the automatic entry path is
-Phase 4 work. The lifecycle daemon manages exits for positions that exist.
+**Automatic entries are off by default.** The nightly scan publishes
+candidates to `last_candidates` for manual review. With `execution.auto_enter:
+true`, `premarket_verify` sizes them with the same Kelly + gates the backtest
+uses and the intraday loop buys them once 09:35 ET has passed. The lifecycle
+daemon manages exits for every position either way.
 
 Once `paper` or `live` is running, `monitor.http_port` (default 8080) serves
 `/metrics` (Prometheus text) and `/health` (JSON; 503 while unhealthy or while
