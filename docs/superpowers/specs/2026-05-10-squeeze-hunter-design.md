@@ -623,7 +623,7 @@ The system is, and should remain, **Approach A: a single-process modular monolit
 - **P4 Split `RuntimeContext`** into telemetry, killswitch controller, trading session and wiring.
 - **P5 Infrastructure modules** `trading_calendar` *(done)* and a `Clock` protocol shared by live and backtest *(open)*.
 - **P6 Live data pipeline** *(done 2026-09-20)*: `ingest/eod.py` runs at 17:00 ET (incremental bars, periodic FINRA and earnings refreshes), every dataset carries a freshness stamp, `premarket_verify` refuses automatic entries on stale critical data, and `backfill_finra` falls back to the FINRA Query API when the CDN is blocked.
-- **P7 Golden-number and invariant tests.**
-- **P8 Decision log** persisted by both paths, with a CLI to explain a ticker-day.
+- **P7 Golden-number and invariant tests** *(done 2026-09-20)*: a seeded synthetic universe with checked-in expected Gate 1 numbers, plus never-net-short / cap / time-stop invariants; the backtest provider memoises prepared partitions to make it feasible.
+- **P8 Decision log** *(done 2026-09-20)*: every candidate's gate outcome is recorded by both paths (`decisions.parquet` per backtest, `decisions/live` partition in paper/live) and read back with `squeeze-hunter explain`.
 - **P9 Remaining tunables to YAML** *(done)*: Kelly priors, killswitch arms and cooldown, gate thresholds.
 - **P10 Deployment:** app service in compose with a restart policy; backup job.

@@ -262,6 +262,7 @@ squeeze-hunter --help
   paper              Run the paper-trading loop indefinitely.
   live               Run the live-trading loop. Requires --confirm-real-money.
   emergency-flatten  Market-flatten every open position. Requires --confirm.
+  explain            Why a candidate was (not) entered on a day (decision log).
 ```
 
 ## End-to-end validation
@@ -292,6 +293,8 @@ uv run squeeze-hunter backtest \
 # windows + holdout, so leave no gaps between windows.
 
 # 4) read data/backtests/gate1_report.txt
+# 5) ask why a name was skipped on a given day
+uv run squeeze-hunter explain --ticker HTZ --date 2025-04-21
 ```
 
 If Gate 1 passes, start paper trading: `uv run squeeze-hunter paper`.

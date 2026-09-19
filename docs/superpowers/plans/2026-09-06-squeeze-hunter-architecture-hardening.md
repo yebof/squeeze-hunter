@@ -60,13 +60,15 @@ Goal: one implementation of "given the book, the quotes/bars and the clock, what
 - [x] `data/providers/finra_api.py`: FINRA Query API client (client-credentials token, paged `consolidatedShortInterest` queries). `backfill_finra` falls back to it when the CDN download fails and `FINRA_API_CLIENT_ID` / `FINRA_API_CLIENT_SECRET` are set; without credentials the CDN failure stays loud. Field names follow the published dataset definition and have not yet been exercised against the live API.
 - Not done: Reddit / options ingest (f4 / f5 stay dead by design until those sources are plugged in).
 
-## P7 — Golden-number and invariant tests  `[ ]`
+## P7 — Golden-number and invariant tests  `[x]`  (2026-09-20)
 
-- A checked-in synthetic universe (10 tickers, 2 years, deterministic) with expected Gate 1 metrics; any change in `metrics.py`, the runner or the cost model must update the numbers explicitly. Property tests on the simulator: never net short, gross exposure ≤ cap, cash never negative.
+- [x] `tests/backtest/synthetic_universe.py`: 10 tickers, 2 years of NYSE sessions, seeded random walks with six scripted squeeze episodes (elevated SI, an earnings report the evening before, a +22% gap on 8x volume). `tests/backtest/test_golden.py` runs the full pipeline over it and compares Sharpe, Sortino, drawdown, hit rate, payoff, trade counts, exit reasons and realized P&L with `golden/expected.json` (rel 1e-6). Regenerate with `UPDATE_GOLDEN=1` only together with the change that explains the new numbers. Marked `slow` (≈50 s): pre-push skips it, CI runs it.
+- [x] Invariants over the same run: cash never negative, never net short, every entry within the position cap and the daily new-position cap, no position outlives the time stop.
+- [x] Made feasible by memoising prepared partitions in `BacktestProvider` (parsed, sorted, FINRA availability precomputed, Bar objects built once and sliced by bisect); the golden numbers were generated before the memoisation and matched after it.
 
-## P8 — Decision log  `[ ]`
+## P8 — Decision log  `[x]`  (2026-09-20)
 
-- Both paths append `(date, ticker, score, setup, gate_reason, size)` rows to `data/decisions/<run>.parquet`; `squeeze-hunter explain --date --ticker` prints them.
+- [x] `execution/decision_log.py`: one row per candidate per day (date, ticker, score, setup, accepted, reason, size, source). The runner returns it as `BacktestResult.decisions`; walk-forward concatenates every window (`raw["decisions"]`, labelled) and the CLI writes `data/backtests/decisions.parquet`; the live premarket path appends to the parquet partition `decisions/live`. `squeeze-hunter explain --ticker --date [--source]` prints the matching rows.
 
 ## P10 — Deployment  `[ ]`
 
