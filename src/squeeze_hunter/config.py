@@ -142,6 +142,9 @@ class ExecutionCfg(_StrictSection):
     entry_after_minutes: int = 5
     # Marketable-limit aggression for entries, in bps above the ask.
     entry_limit_bps: float = 50.0
+    # P3: an entry still working this many minutes after it was allowed to
+    # start is cancelled; whatever filled becomes the position.
+    entry_window_minutes: int = 20
 
 
 class MonitorCfg(_StrictSection):

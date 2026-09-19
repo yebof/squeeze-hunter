@@ -47,7 +47,9 @@ class BrokerOrder:
     side: str  # "buy" | "sell"
     qty: int
     limit_price: float | None
-    status: str  # "pending" | "filled" | "partial" | "cancelled" | "rejected"
+    # "pending" (accepted, not at the exchange) | "routed" (live) | "partial" |
+    # "filled" | "cancelled" | "rejected" | "expired" — see execution/orders.py
+    status: str
     filled_qty: int = 0
     avg_fill_price: float | None = None
     # R9.10: commission paid for THIS leg, in USD. Simulator populates this from
@@ -96,6 +98,12 @@ class IBroker(Protocol):
     async def cancel_order(self: IBroker, broker_order_id: str) -> bool: ...
 
     async def get_open_orders(self: IBroker) -> list[BrokerOrder]: ...
+
+    async def get_order(self: IBroker, broker_order_id: str) -> BrokerOrder | None:
+        """P3: the current state of one order, terminal ones included (None if
+        the broker no longer knows it). Lets the OMS and the pending-buy
+        tracker settle fills that arrive after the submitting call."""
+        ...
 
     async def get_position_qty(self: IBroker, ticker: str) -> int:
         """Return the broker-side held quantity for `ticker` (0 if flat).

@@ -21,6 +21,7 @@ from squeeze_hunter.execution.book import new_position_meta
 from squeeze_hunter.execution.context import build_gate_context
 from squeeze_hunter.execution.decisions import EntryDecision, SetupStats, propose_entries
 from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
+from squeeze_hunter.execution.orders import OrderRecord, OrderState, OrderTracker
 from squeeze_hunter.execution.pricing import round_to_tick
 from squeeze_hunter.logging_setup import get_logger
 from squeeze_hunter.monitor.alerts import AlertSender, Severity
@@ -116,8 +117,13 @@ class RuntimeContext:
     # P2: snapshot store (None = no persistence). Built from data.state_path in
     # setup() unless injected.
     state_store: StateStore | None = None
+    # P3: entry orders that did not fill on the submitting tick; settled on
+    # later ticks (or after a restart) through broker.get_order.
+    pending_buys: OrderTracker = field(default_factory=OrderTracker)
 
-    async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
+    async def setup(
+        self: RuntimeContext, connect_timeout_s: float = 30.0, *, now: datetime | None = None
+    ) -> None:
         # R9.1: propagate YAML stops settings into the lifecycle state so the
         # paper/live stop evaluation uses the same thresholds the operator
         # configures in YAML. Trailing values are stored negative in YAML;
@@ -212,7 +218,11 @@ class RuntimeContext:
             snapshot = self.state_store.load()
             if snapshot:
                 self._restore(snapshot)
-        await self._reconcile_with_broker(datetime.now(UTC), full=True, source="startup")
+        # P3: a buy that filled while we were down becomes a position with its
+        # real meta BEFORE reconciliation could adopt it as an unknown lot.
+        startup_now = now or datetime.now(UTC)
+        await self._settle_pending_buys(startup_now)
+        await self._reconcile_with_broker(startup_now, full=True, source="startup")
         self._persist()
 
     async def _notify(self: RuntimeContext, text: str) -> None:
@@ -277,6 +287,7 @@ class RuntimeContext:
         # mark of exited positions forever, permanently arming the killswitch
         # gap-through-stop trigger.
         positions_before = set(self.lifecycle_state.positions.keys())
+        await self._settle_pending_buys(now)
         await self._execute_planned_entries(now)
         await manage_positions(self.lifecycle_state, self.broker, now)
         positions_after = set(self.lifecycle_state.positions.keys())
@@ -474,20 +485,114 @@ class RuntimeContext:
                 status=order.status,
                 broker_order_id=order.broker_order_id,
             )
-            if order.status != "filled":
-                log.warning("entry_not_filled", ticker=d.ticker, status=order.status)
-                continue
-            filled = order.filled_qty or qty
-            entry_px = order.avg_fill_price or limit
-            self.lifecycle_state.positions[d.ticker] = new_position_meta(
-                ticker=d.ticker,
+            rec = OrderRecord.from_broker_order(
+                order,
+                "entry",
+                now,
+                meta={"score": d.score, "setup_type": d.setup_type, "size_usd": d.size_usd},
+            )
+            if rec.is_terminal:
+                self._finish_entry(rec)
+            else:
+                # P3: track it; _settle_pending_buys picks it up next tick.
+                self.pending_buys.add(rec)
+                log.info("entry_pending", ticker=d.ticker, broker_order_id=rec.order_id)
+
+    def _finish_entry(self: RuntimeContext, rec: OrderRecord) -> None:
+        """Turn a terminal entry order into a position (or drop it)."""
+        self.pending_buys.forget(rec.order_id)
+        filled = int(rec.filled_qty or (rec.qty if rec.state is OrderState.FILLED else 0))
+        if filled <= 0:
+            log.warning(
+                "entry_not_filled",
+                ticker=rec.ticker,
+                status=rec.state.value,
+                broker_order_id=rec.order_id,
+            )
+            return
+        entry_px = float(rec.avg_fill_price or rec.limit_price or 0.0)
+        if entry_px <= 0:
+            log.error("entry_filled_without_price", ticker=rec.ticker, broker_order_id=rec.order_id)
+            return
+        meta = rec.meta
+        existing = self.lifecycle_state.positions.get(rec.ticker)
+        if existing is not None:
+            # Two fills for one ticker (should not happen: propose_entries
+            # rejects already-held names) — merge rather than lose either.
+            total = int(existing["qty"]) + filled
+            existing["entry_price"] = (
+                float(existing["entry_price"]) * int(existing["qty"]) + entry_px * filled
+            ) / total
+            existing["qty"] = total
+            existing["peak_price"] = max(float(existing["peak_price"]), entry_px)
+            log.warning("entry_merged_into_existing_position", ticker=rec.ticker, qty=total)
+        else:
+            self.lifecycle_state.positions[rec.ticker] = new_position_meta(
+                ticker=rec.ticker,
                 qty=filled,
                 entry_price=entry_px,
-                score=d.score,
-                setup_type=d.setup_type,
-                entry_commission_per_share=(order.commission_usd / filled) if filled else 0.0,
+                score=float(meta.get("score", 0.0)),
+                setup_type=str(meta.get("setup_type", "Mixed")),
+                entry_commission_per_share=(rec.commission_usd / filled) if filled else 0.0,
             )
-            self.telemetry.record_position(d.ticker, entry_px, entry_px)
+        self.telemetry.record_position(rec.ticker, entry_px, entry_px)
+        log.info(
+            "entry_filled",
+            ticker=rec.ticker,
+            qty=filled,
+            price=entry_px,
+            status=rec.state.value,
+            broker_order_id=rec.order_id,
+        )
+
+    async def _settle_pending_buys(self: RuntimeContext, now: datetime) -> None:
+        """P3: advance every open entry order through broker.get_order; fills
+        become positions, anything still working past the entry window is
+        cancelled and its filled part kept."""
+        if self.broker is None:
+            return
+        open_records = self.pending_buys.open()
+        if not open_records:
+            return
+        et = now.astimezone(NY)
+        window_end = datetime.combine(et.date(), SESSION_OPEN, tzinfo=NY) + timedelta(
+            minutes=self.settings.execution.entry_after_minutes
+            + self.settings.execution.entry_window_minutes
+        )
+        for rec in open_records:
+            try:
+                bo = await self.broker.get_order(rec.order_id)
+            except _TRANSIENT_IO_ERRORS as e:
+                log.warning("pending_buy_poll_failed", broker_order_id=rec.order_id, err=str(e))
+                continue
+            if bo is None:
+                if now - rec.submitted_at > timedelta(days=1):
+                    log.warning("pending_buy_unknown_to_broker", broker_order_id=rec.order_id)
+                    self.pending_buys.forget(rec.order_id)
+                continue
+            updated = self.pending_buys.update(bo, now=now) or rec
+            if updated.is_terminal:
+                self._finish_entry(updated)
+                continue
+            past_window = et >= window_end or et.date() != rec.submitted_at.astimezone(NY).date()
+            if not past_window:
+                continue
+            try:
+                await self.broker.cancel_order(rec.order_id)
+                bo = await self.broker.get_order(rec.order_id)
+            except _TRANSIENT_IO_ERRORS as e:
+                log.warning("pending_buy_cancel_failed", broker_order_id=rec.order_id, err=str(e))
+                continue
+            if bo is not None:
+                updated = self.pending_buys.update(bo, now=now) or updated
+            if updated.is_terminal:
+                self._finish_entry(updated)
+            else:
+                log.warning(
+                    "pending_buy_cancel_not_acknowledged",
+                    broker_order_id=rec.order_id,
+                    status=updated.state.value,
+                )
 
     async def _latest_cached_close(self: RuntimeContext, ticker: str, now: datetime) -> float:
         from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
@@ -506,6 +611,7 @@ class RuntimeContext:
             "mode": self.mode,
             "positions": self.lifecycle_state.positions,
             "planned_entries": [asdict(d) for d in self.planned_entries],
+            "pending_buys": self.pending_buys.to_snapshot(),
             "killswitch": {
                 "active": self.kill_switch_active,
                 "reason": self._kill_reason,
@@ -547,6 +653,7 @@ class RuntimeContext:
         self.planned_entries = [
             EntryDecision(**d) for d in (snap.get("planned_entries") or []) if isinstance(d, dict)
         ]
+        self.pending_buys = OrderTracker.from_snapshot(snap.get("pending_buys"))
         ks = snap.get("killswitch") or {}
         self.kill_switch_active = bool(ks.get("active", False))
         self._kill_reason = ks.get("reason")
@@ -596,6 +703,8 @@ class RuntimeContext:
             log.warning("reconcile_positions_unavailable", source=source, err=str(e))
             return
         at_broker = {p.ticker: p for p in snapshots if p.qty > 0}
+        # P3: a holding that a pending buy is about to explain is not "unknown".
+        pending_tickers = {r.ticker for r in self.pending_buys.open()}
         drift: list[str] = []
         for ticker in list(self.lifecycle_state.positions):
             meta = self.lifecycle_state.positions[ticker]
@@ -611,7 +720,7 @@ class RuntimeContext:
                 drift.append(f"{ticker}: local {meta['qty']} vs broker {held.qty} -> adopted")
                 meta["qty"] = int(held.qty)
         for ticker, held in at_broker.items():
-            if ticker in self.lifecycle_state.positions:
+            if ticker in self.lifecycle_state.positions or ticker in pending_tickers:
                 continue
             entry = float(held.avg_cost) if held.avg_cost > 0 else 0.0
             if entry <= 0:

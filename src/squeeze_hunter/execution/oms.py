@@ -20,6 +20,8 @@ from squeeze_hunter.logging_setup import get_logger
 
 log = get_logger("execution.oms")
 
+_TERMINAL = frozenset({"filled", "cancelled", "rejected", "expired"})
+
 
 @dataclass
 class ExecutionResult:
@@ -40,6 +42,8 @@ class OrderManager:
         *,
         max_wall_seconds: int = 600,
         marketable_bps: float = 50.0,
+        poll_interval_s: float = 0.5,
+        slice_fill_wait_s: float | None = None,
     ) -> ExecutionResult:
         result = ExecutionResult()
         cumulative_qty = 0
@@ -99,6 +103,20 @@ class OrderManager:
                 limit_price=limit_price,
                 ts=self.clock(),
             )
+            # P3: a live broker returns "pending" on the submitting call and
+            # fills later. Poll the order until it is terminal or the slice's
+            # time budget is spent, then cancel the remainder so two slices
+            # are never working at once. The previous code read the fill off
+            # the submit response, which only the simulator ever populated.
+            next_submit = plan.slices[i + 1].submit_at if i + 1 < n_slices else None
+            budget = slice_fill_wait_s
+            if budget is None:
+                budget = (
+                    max(0.0, (next_submit - self.clock()).total_seconds())
+                    if next_submit is not None
+                    else 60.0
+                )
+            order = await self._await_terminal(order, budget_s=budget, poll_s=poll_interval_s)
             result.orders.append(order)
             filled = (
                 order.filled_qty
@@ -139,3 +157,51 @@ class OrderManager:
         result.unfilled_qty = sum(s.qty for s in plan.slices) - cumulative_qty
         result.avg_fill_price = cumulative_value / cumulative_qty if cumulative_qty > 0 else 0.0
         return result
+
+    async def _await_terminal(
+        self: OrderManager, order: BrokerOrder, *, budget_s: float, poll_s: float
+    ) -> BrokerOrder:
+        """Poll `get_order` until the order is terminal or `budget_s` elapses;
+        then cancel and report whatever filled. Transient broker errors end
+        the wait early (the order stays live at the broker and is cancelled)."""
+        if order.status in _TERMINAL:
+            return order
+        max_polls = int(budget_s / poll_s) if poll_s > 0 else min(int(budget_s * 1000), 10_000)
+        latest = order
+        for _ in range(max_polls):
+            if poll_s > 0:
+                await asyncio.sleep(poll_s)
+            try:
+                fetched = await self.broker.get_order(order.broker_order_id)
+            except (ConnectionError, TimeoutError, OSError) as e:
+                log.warning("oms_poll_failed", broker_order_id=order.broker_order_id, err=str(e))
+                break
+            if fetched is None:
+                break  # the broker no longer knows it; nothing more to learn
+            latest = fetched
+            if latest.status in _TERMINAL:
+                return latest
+        try:
+            await self.broker.cancel_order(order.broker_order_id)
+        except (ConnectionError, TimeoutError, OSError) as e:
+            log.warning("oms_cancel_failed", broker_order_id=order.broker_order_id, err=str(e))
+            return latest
+        for _ in range(20):
+            try:
+                fetched = await self.broker.get_order(order.broker_order_id)
+            except (ConnectionError, TimeoutError, OSError):
+                break
+            if fetched is None:
+                break
+            latest = fetched
+            if latest.status in _TERMINAL:
+                break
+            if poll_s > 0:
+                await asyncio.sleep(poll_s)
+        log.warning(
+            "oms_slice_cancelled",
+            broker_order_id=order.broker_order_id,
+            status=latest.status,
+            filled=latest.filled_qty,
+        )
+        return latest

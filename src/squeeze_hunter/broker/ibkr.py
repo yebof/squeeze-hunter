@@ -8,6 +8,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock
 
@@ -16,12 +17,15 @@ from squeeze_hunter.logging_setup import get_logger
 
 log = get_logger("broker.ibkr")
 
+# P3: the vocabulary of execution/orders.py. "routed" = live at the exchange
+# (Submitted / PreSubmitted, and PendingCancel — still fillable until TWS
+# acknowledges the cancel).
 _STATUS_MAP = {
     "PendingSubmit": "pending",
-    "PendingCancel": "pending",
-    "PreSubmitted": "pending",
-    "Submitted": "pending",
     "ApiPending": "pending",
+    "PreSubmitted": "routed",
+    "Submitted": "routed",
+    "PendingCancel": "routed",
     "Filled": "filled",
     "Cancelled": "cancelled",
     "ApiCancelled": "cancelled",
@@ -35,6 +39,40 @@ _STATUS_MAP = {
 # Round-13: a quote whose Ticker has not been updated for longer than this is
 # reported as zeros (halt, market-data farm outage, lost subscription).
 _QUOTE_MAX_AGE_S = 120.0
+
+
+# ib_async leaves an unset limit price at this sentinel (MarketOrder.lmtPrice).
+_UNSET_DOUBLE = 1.7976931348623157e308
+
+
+def _limit_or_none(raw: Any) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value >= _UNSET_DOUBLE / 2 or value <= 0:
+        return None
+    return value
+
+
+def _broker_order_from_trade(trade: Any) -> BrokerOrder:
+    contract = trade.contract
+    order = trade.order
+    st = trade.orderStatus
+    filled = int(getattr(st, "filled", 0) or 0)
+    status = _translate_status(st.status)
+    if status == "routed" and filled > 0:
+        status = "partial"
+    return BrokerOrder(
+        broker_order_id=str(order.orderId),
+        ticker=getattr(contract, "symbol", ""),
+        side="buy" if order.action == "BUY" else "sell",
+        qty=int(order.totalQuantity),
+        limit_price=_limit_or_none(getattr(order, "lmtPrice", None)),
+        status=status,
+        filled_qty=filled,
+        avg_fill_price=float(st.avgFillPrice) if getattr(st, "avgFillPrice", 0) else None,
+    )
 
 
 def _age_seconds(ts: datetime) -> float:
@@ -294,19 +332,7 @@ class IBKRBroker:
         if existing is not None or ref in self._submitted_refs:
             log.warning("order_deduped_by_client_ref", ticker=ticker, side=side, ref=ref)
             if existing is not None:
-                st = existing.orderStatus
-                return BrokerOrder(
-                    broker_order_id=str(existing.order.orderId),
-                    ticker=ticker,
-                    side=side,
-                    qty=qty,
-                    limit_price=limit_price,
-                    status=_translate_status(st.status),
-                    filled_qty=int(getattr(st, "filled", 0) or 0),
-                    avg_fill_price=float(st.avgFillPrice)
-                    if getattr(st, "avgFillPrice", 0)
-                    else None,
-                )
+                return _broker_order_from_trade(existing)
             # Placed earlier this session and no longer open: terminal. Report
             # it as pending so the caller reconciles against the position
             # rather than assuming a fill or resubmitting.
@@ -410,24 +436,15 @@ class IBKRBroker:
         return [PositionSnapshot(ticker=t, qty=q, avg_cost=c) for t, (q, c) in agg.items() if q > 0]
 
     async def get_open_orders(self: IBKRBroker) -> list[BrokerOrder]:
-        out = []
-        for trade in self._ib.openTrades():
-            contract = trade.contract
-            order = trade.order
-            st = trade.orderStatus
-            out.append(
-                BrokerOrder(
-                    broker_order_id=str(order.orderId),
-                    ticker=getattr(contract, "symbol", ""),
-                    side="buy" if order.action == "BUY" else "sell",
-                    qty=int(order.totalQuantity),
-                    limit_price=getattr(order, "lmtPrice", None) or None,
-                    status=_translate_status(st.status),
-                    filled_qty=int(st.filled or 0),
-                    avg_fill_price=float(st.avgFillPrice) if st.avgFillPrice else None,
-                )
-            )
-        return out
+        return [_broker_order_from_trade(t) for t in self._ib.openTrades()]
+
+    async def get_order(self: IBKRBroker, broker_order_id: str) -> BrokerOrder | None:
+        """P3: `IB.trades()` keeps done trades for the session, so a fill that
+        arrived after placeOrder returned is visible here."""
+        for trade in self._ib.trades():
+            if str(trade.order.orderId) == broker_order_id:
+                return _broker_order_from_trade(trade)
+        return None
 
     async def get_equity_usd(self: IBKRBroker) -> float | None:
         """R4.1: pull NetLiquidation (NAV) from IB account values.

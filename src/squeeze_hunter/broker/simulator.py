@@ -36,6 +36,8 @@ class SimulatorBroker:
     # not the stale `lot.avg_price` (entry). Without this, sim-mode stops
     # never fire because pnl_pct = (entry - entry) / entry = 0 forever.
     last_marks: dict[str, float] = field(default_factory=dict)
+    # P3: every order ever returned, by id, so get_order() can settle it.
+    order_history: dict[str, BrokerOrder] = field(default_factory=dict)
 
     def __post_init__(self: SimulatorBroker) -> None:
         self.cash = self.initial_cash
@@ -95,7 +97,7 @@ class SimulatorBroker:
         else:
             self.positions[ticker] = Lot(qty, fill.fill_price, ts)
         order_id = f"sim-{ticker}-{ts.isoformat()}-buy-{uuid.uuid4().hex[:8]}"
-        return BrokerOrder(
+        order = BrokerOrder(
             broker_order_id=order_id,
             ticker=ticker,
             side="buy",
@@ -108,6 +110,8 @@ class SimulatorBroker:
             # compute net realized P&L for Kelly avg_payoff accuracy.
             commission_usd=fill.commission_usd,
         )
+        self.order_history[order_id] = order
+        return order
 
     async def submit_sell(
         self: SimulatorBroker,
@@ -136,7 +140,7 @@ class SimulatorBroker:
         else:
             self.positions[ticker] = Lot(new_qty, existing.avg_price, existing.opened_at)
         order_id = f"sim-{ticker}-{ts.isoformat()}-sell-{uuid.uuid4().hex[:8]}"
-        return BrokerOrder(
+        order = BrokerOrder(
             broker_order_id=order_id,
             ticker=ticker,
             side="sell",
@@ -148,6 +152,8 @@ class SimulatorBroker:
             # R9.10: see submit_buy.
             commission_usd=fill.commission_usd,
         )
+        self.order_history[order_id] = order
+        return order
 
     async def cancel_order(self: SimulatorBroker, broker_order_id: str) -> bool:
         # Simulator fills immediately; no orders are ever open to cancel.
@@ -155,6 +161,9 @@ class SimulatorBroker:
 
     async def get_open_orders(self: SimulatorBroker) -> list[BrokerOrder]:
         return []
+
+    async def get_order(self: SimulatorBroker, broker_order_id: str) -> BrokerOrder | None:
+        return self.order_history.get(broker_order_id)
 
     async def get_equity_usd(self: SimulatorBroker) -> float | None:
         """R4.1: return the simulator's tracked equity (cash + last mark-to-market)."""

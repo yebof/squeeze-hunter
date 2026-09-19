@@ -57,6 +57,9 @@ async def test_oms_submits_each_slice_in_order() -> None:
 @pytest.mark.asyncio
 async def test_oms_handles_partial_fill() -> None:
     broker = MagicMock()
+    # P3: the OMS polls get_order for late fills and cancels the remainder.
+    broker.get_order = AsyncMock(return_value=None)
+    broker.cancel_order = AsyncMock(return_value=True)
 
     async def fake_quote(ticker):
         return _make_quote(ticker)
@@ -88,7 +91,7 @@ async def test_oms_handles_partial_fill() -> None:
         slice_offset_minutes=0,
     )
     oms = OrderManager(broker=broker, clock=lambda: datetime(2026, 5, 14, 13, 35, tzinfo=UTC))
-    result = await oms.execute(plan, max_wall_seconds=0)
+    result = await oms.execute(plan, max_wall_seconds=0, poll_interval_s=0)
     assert result.filled_qty == 50
     assert result.unfilled_qty == 50
 
@@ -235,6 +238,9 @@ async def test_oms_partial_fills_still_escalate() -> None:
         )
 
     broker = MagicMock()
+    # P3: the OMS polls get_order for late fills and cancels the remainder.
+    broker.get_order = AsyncMock(return_value=None)
+    broker.cancel_order = AsyncMock(return_value=True)
     broker.fetch_quote = fake_quote
     broker.submit_buy = fake_submit_buy
 
@@ -250,7 +256,7 @@ async def test_oms_partial_fills_still_escalate() -> None:
         slice_offset_minutes=0,
     )
     oms = OrderManager(broker=broker, clock=lambda: open_at + timedelta(minutes=15))
-    await oms.execute(plan, max_wall_seconds=0)
+    await oms.execute(plan, max_wall_seconds=0, poll_interval_s=0)
 
     # The natural aggression ramp goes from ~5 bps to ~30 bps. Escalation to
     # MARKETABLE bumps to 50 bps. If partials are mis-counted as fully filled,

@@ -59,8 +59,9 @@ def _fake_ib_with_orders() -> tuple[MagicMock, list]:
 
     def place(contract, order):
         placed.append(order)
+        order.orderId = len(placed)
         trade = SimpleNamespace(
-            order=SimpleNamespace(orderId=len(placed), orderRef=order.orderRef),
+            order=order,
             orderStatus=SimpleNamespace(status="PendingSubmit", filled=0, avgFillPrice=0.0),
             contract=contract,
         )

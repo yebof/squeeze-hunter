@@ -26,7 +26,9 @@ async def test_submit_buy_returns_pending_order() -> None:
     )
     assert isinstance(order, BrokerOrder)
     assert order.broker_order_id == "1234"
-    assert order.status == "pending"
+    # P3: PreSubmitted / Submitted are "routed" (live at the exchange);
+    # only PendingSubmit / ApiPending remain "pending".
+    assert order.status == "routed"
     assert order.side == "buy"
     assert order.qty == 100
 

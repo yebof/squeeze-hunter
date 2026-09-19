@@ -103,6 +103,9 @@ execution:
   auto_enter: false
   entry_after_minutes: 5
   entry_limit_bps: 50
+  # An entry order still unfilled this many minutes after the entry window
+  # opened is cancelled; the filled part (if any) becomes the position.
+  entry_window_minutes: 20
 monitor:
   # /metrics (Prometheus text) and /health (JSON, 503 while unhealthy or the
   # killswitch is active). 0 disables. The endpoint has NO authentication and
