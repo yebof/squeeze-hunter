@@ -31,13 +31,14 @@ Goal: one implementation of "given the book, the quotes/bars and the clock, what
 - [x] Acceptance met: `evaluate_stops`, `kelly_priors_for_setup` and `evaluate_gates` each have exactly one caller in `src/`; `tests/backtest/test_runner_parity.py` replays the runner's bars through `decide_exit` by hand and gets the same exit.
 - Not yet: pending BUY orders are not tracked (a non-filled entry is logged and dropped, never re-sent) — P3.
 
-## P2 — Persistent state and reconciliation  `[ ]`
+## P2 — Persistent state and reconciliation  `[x]`  (2026-09-20)
 
-1. `store/state.py`: `StateStore` protocol with `save(snapshot)` / `load()`; `JsonStateStore` writes `data/state/runtime.json` atomically (temp file + rename) after every tick and job; snapshot = book, pending orders, killswitch state, last scan date.
-2. `RuntimeContext.setup()` loads the snapshot, then reconciles against `broker.positions()`: unknown broker positions are adopted with conservative meta (entry = avg cost, setup = Mixed, score 0 → decay disabled, bars_held 0) and an alert; local positions absent at the broker are dropped with an alert.
-3. 60 s reconcile inside the tick (qty mismatch → adopt broker qty + warn) and EOD full reconcile with an alert on any drift.
-4. Client order ids (`sh-<ticker>-<utc ts>`) passed to IBKR `orderRef` and deduped on submit.
-   - Acceptance: kill -9 during a session, restart, positions and pending orders are intact and reconciled; a test simulates it with the simulator.
+- [x] `store/state.py`: `StateStore` protocol; `JsonStateStore` writes `data.state_path` (example YAML: `data/state/runtime.json`; empty = off) atomically via temp file + fsync + rename after every tick, nightly scan, premarket, EOD close and at shutdown. Snapshot = positions (with pending exit ids / action / qty), planned entries, killswitch state and active reasons, telemetry equity history and per-day peaks. A corrupt file is moved aside and the runtime starts clean.
+- [x] `IBroker.get_positions() -> list[PositionSnapshot]` (ticker, qty, avg cost) on the simulator and IBKR (fresh `reqPositionsAsync`, account-filtered, rows aggregated).
+- [x] `RuntimeContext.setup()` restores the snapshot, then `_reconcile_with_broker(full=True)`: phantoms (local, broker flat) are dropped, quantity mismatches adopt the broker's quantity, unknown broker holdings are adopted as `Mixed` with score 0 (signal-decay off; hard / trailing / time stops still apply) at the broker's average cost — every drift is alerted.
+- [x] 60 s reconcile in the tick (adopt quantities, log only; positions with an exit in flight are left to the daemon's own reconcile) and a full EOD reconcile with an alert on any drift. A pure in-memory sim without a state store skips reconciliation (test harness); paper / live always reconcile.
+- [x] IBKR client order refs: `sh-<side>-<ticker>-<qty>-<utc second>` in `orderRef`; a repeat of the same logical order returns the existing trade instead of placing a second one.
+- [x] Acceptance met: `tests/runtime/test_persistence_and_reconcile.py` restarts a context over the same simulator and store and finds positions, pending exits, the killswitch lockout and equity history intact; adoption / phantom / quantity / EOD-drift cases each have a test.
 
 ## P3 — Order state machine and fake-IB contract tests  `[ ]`
 

@@ -198,8 +198,11 @@ Grafana and an IB Gateway.
   `earnings/all.parquet`.
 - Backtest, paper and live scans all read the same parquet cache; keeping it
   current in paper / live mode needs a separate ingest job (Phase 4).
-- Postgres and Alembic define a schema, but no runtime module reads or writes
-  it yet.
+- The runtime snapshot (positions, pending exits, killswitch lockout, equity
+  history) lives in `data/state/runtime.json` (`data.state_path`), written
+  atomically after every job; a restart restores it and reconciles against the
+  broker. Postgres and Alembic define a schema, but no runtime module reads or
+  writes it yet.
 
 ## Quick start
 
@@ -324,8 +327,8 @@ fails loudly instead of being ignored.
   setups are barely detectable today; a passing Gate 1 may rest on CAR-type
   trades alone (the report prints a coverage warning).
 - Not yet implemented from the spec: the 70/30 stock + call split and option-leg
-  stops, the catalyst-fizzle stop, VWAP take-profit slices, and position
-  persistence across restarts (state is in memory; Phase 4).
+  stops, the catalyst-fizzle stop and VWAP take-profit slices. Pending BUY
+  orders are not tracked across ticks until the order state machine lands.
 - Yahoo's float is today's float applied to every historical short-interest
   record (share counts are split-adjusted at ingest, the float itself is not
   reconstructed historically).

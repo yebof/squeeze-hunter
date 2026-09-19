@@ -618,7 +618,7 @@ The system is, and should remain, **Approach A: a single-process modular monolit
 ### Roadmap (ordered; each item has a plan in `docs/superpowers/plans/2026-09-06-squeeze-hunter-architecture-hardening.md`)
 
 - **P1 Unified position core** *(done 2026-09-20)*. `execution/decisions.py` holds the pure `decide_exit()` / `propose_entries()`; the backtest runner and the live daemon both call them and the runner's private loop is deleted. The Phase-4 live entry path exists behind `execution.auto_enter` (single marketable-limit entry after 09:35 ET; TWAP slicing waits for P3). The killswitch cooldown step and `PortfolioTelemetry` are likewise shared.
-- **P2 Persistent state + reconciliation.** A `StateStore` protocol (atomic JSON snapshot first, Postgres later) for the book, pending orders and killswitch state; startup reconciliation against broker positions; 60 s and EOD reconciliation with alerts; client-side order ids.
+- **P2 Persistent state + reconciliation** *(done 2026-09-20)*. `store/state.py` writes an atomic JSON snapshot (`data.state_path`) after every job; startup restores it and reconciles against `IBroker.get_positions()`; the tick reconciles quantities every 60 s and EOD runs a full reconcile with an alert on drift; IBKR orders carry a client `orderRef` that is deduped on submit. Postgres can replace the JSON store behind the same protocol.
 - **P3 Explicit order state machine** shared by lifecycle and OMS, plus a fake-IB contract test suite that reproduces ib_async semantics.
 - **P4 Split `RuntimeContext`** into telemetry, killswitch controller, trading session and wiring.
 - **P5 Infrastructure modules** `trading_calendar` *(done)* and a `Clock` protocol shared by live and backtest *(open)*.
