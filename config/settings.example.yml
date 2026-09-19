@@ -91,6 +91,14 @@ backtest:
     - { ticker: OKLO, date: 2025-01-03 }  # Mixed
     - { ticker: HTZ, date: 2025-04-16 }   # CAR-type
     - { ticker: CAR, date: 2026-04-13 }   # CAR-type, freshest
+execution:
+  # Live/paper entry path (P1). false = nightly scan only publishes candidates
+  # for manual review (Phase 3). true = premarket_verify sizes them with the
+  # same Kelly + gates as the backtest and the intraday loop buys them once
+  # 09:35 ET has passed, as a marketable limit entry_limit_bps above the ask.
+  auto_enter: false
+  entry_after_minutes: 5
+  entry_limit_bps: 50
 monitor:
   # /metrics (Prometheus text) and /health (JSON, 503 while unhealthy or the
   # killswitch is active). 0 disables. The endpoint has NO authentication and

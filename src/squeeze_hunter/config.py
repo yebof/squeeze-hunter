@@ -128,6 +128,18 @@ class BacktestCfg(_StrictSection):
     validation_events: list[ValidationEvent] = Field(default_factory=list)
 
 
+class ExecutionCfg(_StrictSection):
+    # P1 step 4: when true, premarket_verify turns last_candidates into sized
+    # proposals (same propose_entries the backtest uses) and the intraday loop
+    # submits them once the 09:30-09:35 opening window has passed. Default
+    # OFF: Phase 3 publishes candidates for manual review.
+    auto_enter: bool = False
+    # Do not trade the opening print (spec: 09:30-09:35 no orders).
+    entry_after_minutes: int = 5
+    # Marketable-limit aggression for entries, in bps above the ask.
+    entry_limit_bps: float = 50.0
+
+
 class MonitorCfg(_StrictSection):
     # Round-12: /metrics + /health endpoint. Code default is OFF (0) so tests
     # and ad-hoc RuntimeContexts never bind a port; the example YAML turns it
@@ -149,6 +161,7 @@ class Settings(BaseSettings):
     data: DataCfg = Field(default_factory=DataCfg)
     backtest: BacktestCfg = Field(default_factory=BacktestCfg)
     monitor: MonitorCfg = Field(default_factory=MonitorCfg)
+    execution: ExecutionCfg = Field(default_factory=ExecutionCfg)
 
     @classmethod
     def settings_customise_sources(

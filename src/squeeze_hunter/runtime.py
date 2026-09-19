@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import httpx
 import pandas as pd
@@ -16,21 +16,29 @@ from squeeze_hunter.broker.base import IBroker
 from squeeze_hunter.broker.simulator import SimulatorBroker
 from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
+from squeeze_hunter.execution.book import new_position_meta
+from squeeze_hunter.execution.context import build_gate_context
+from squeeze_hunter.execution.decisions import EntryDecision, SetupStats, propose_entries
 from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
+from squeeze_hunter.execution.pricing import round_to_tick
 from squeeze_hunter.logging_setup import get_logger
 from squeeze_hunter.monitor.alerts import AlertSender, Severity
 from squeeze_hunter.monitor.http import MonitorServer, start_monitor_server
 from squeeze_hunter.monitor.metrics import MetricsRegistry
-from squeeze_hunter.risk.killswitch import evaluate_killswitch
+from squeeze_hunter.risk.gates import PortfolioState
+from squeeze_hunter.risk.killswitch import (
+    KillswitchState,
+    advance_killswitch,
+    evaluate_killswitch,
+)
+from squeeze_hunter.telemetry import PortfolioTelemetry
 from squeeze_hunter.trading_calendar import (
     NY,
+    SESSION_OPEN,
     is_regular_session,
     is_trading_day,
     session_open_utc,
 )
-
-if TYPE_CHECKING:
-    from squeeze_hunter.risk.killswitch import KillSwitchInputs
 
 log = get_logger("runtime")
 
@@ -55,167 +63,6 @@ _is_us_regular_session = is_regular_session
 _session_open_utc = session_open_utc
 
 
-@dataclass
-class PortfolioTelemetry:
-    """Tracks the inputs that feed evaluate_killswitch.
-
-    All metrics are computed lazily on demand from recorded history.
-    """
-
-    equity_history: list[tuple[datetime, float]] = field(default_factory=list)
-    # R7.I1: parallel tracker for the per-day MAX equity. equity_history
-    # collapses to last-of-day for the 3-day PnL metric (which wants
-    # close-vs-close), but the drawdown calc needs intraday peaks. Two
-    # accumulators keep both metrics correct without conflating them.
-    equity_peak_per_day: dict[date, float] = field(default_factory=dict)
-    position_marks: dict[str, tuple[float, float]] = field(default_factory=dict)
-    # ticker -> (entry_price, mark_price); negative gap = adverse move
-    last_broker_heartbeat: datetime | None = None
-    data_freshness: dict[str, datetime] = field(default_factory=dict)
-    critical_sources: set[str] = field(default_factory=lambda: {"ibkr_quotes"})
-
-    def record_equity(self: PortfolioTelemetry, ts: datetime, equity_usd: float) -> None:
-        # R6.C1: dedupe by date — keep only the LATEST equity reading per
-        # calendar day (in UTC). At 60s intraday ticks this collapses ~390
-        # entries/day into 1, so over 30 days we hold ≤31 entries — the trim
-        # is then trivial. The previous R4.9 implementation tried to trim by
-        # 31-day cutoff after len>100, but in a single trading session ALL
-        # entries were within the cutoff → no actual trim → unbounded growth.
-        ts_date = ts.date()
-        if self.equity_history and self.equity_history[-1][0].date() == ts_date:
-            # Same day as the last entry — replace it with the newer mark
-            self.equity_history[-1] = (ts, equity_usd)
-        else:
-            self.equity_history.append((ts, equity_usd))
-        # R7.I1: separately track the per-day max so the drawdown metric does
-        # not lose intraday peaks when a later same-day overwrite is lower.
-        prior_peak = self.equity_peak_per_day.get(ts_date, equity_usd)
-        self.equity_peak_per_day[ts_date] = max(prior_peak, equity_usd)
-        # Cap to last 60 entries (~60 trading days). All metrics use at most
-        # a 30-day window, so 60 entries is a generous ceiling.
-        if len(self.equity_history) > 60:
-            self.equity_history = self.equity_history[-60:]
-        # R8.Q-I9: evict equity_peak_per_day entries strictly older than 90
-        # CALENDAR DAYS from this `ts`, not just by count. After a long
-        # outage the count-only cap would retain entries from months ago
-        # because the dict was below the threshold.
-        stale_cutoff = ts_date - timedelta(days=90)
-        self.equity_peak_per_day = {
-            d: p for d, p in self.equity_peak_per_day.items() if d >= stale_cutoff
-        }
-
-    def record_position(
-        self: PortfolioTelemetry, ticker: str, entry_price: float, mark_price: float
-    ) -> None:
-        self.position_marks[ticker] = (entry_price, mark_price)
-
-    def clear_position(self: PortfolioTelemetry, ticker: str) -> None:
-        self.position_marks.pop(ticker, None)
-
-    def record_broker_heartbeat(self: PortfolioTelemetry, ts: datetime) -> None:
-        self.last_broker_heartbeat = ts
-
-    def record_data_freshness(self: PortfolioTelemetry, source: str, ts: datetime) -> None:
-        self.data_freshness[source] = ts
-
-    def rolling_30d_max_drawdown(self: PortfolioTelemetry, as_of: datetime) -> float:
-        cutoff = as_of - timedelta(days=30)
-        cutoff_date = cutoff.date()
-        # R8.S-I5: read the per-day peak tracker FIRST so a same-day drawdown
-        # (Day 1 of operation: peak intraday + adverse close) is detected.
-        # Prior order required len(equity_history) >= 2 first, returning 0
-        # for single-day drawdowns even though equity_peak_per_day had today's
-        # high recorded.
-        peaks_in_window = [e for d, e in self.equity_peak_per_day.items() if d >= cutoff_date]
-        if self.equity_history:
-            current = self.equity_history[-1][1]
-        else:
-            return 0.0
-        if peaks_in_window:
-            peak = max(peaks_in_window)
-        else:
-            # Parallel tracker empty (legacy state): fall back to equity_history.
-            recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
-            if len(recent) < 2:
-                return 0.0
-            peak = max(e for _, e in recent)
-        if peak <= 0:
-            return 0.0
-        return (current - peak) / peak
-
-    def last_3_days_cumulative_pnl_pct(self: PortfolioTelemetry, as_of: datetime) -> float:
-        # R7.I2: 3 *trading* days, not calendar days. On a Monday the calendar
-        # cutoff would only include Sat+Sun+today → at most 1 equity entry,
-        # and the metric silently returns 0 (killswitch dead on Mondays).
-        # Use a 4-business-day window ending at as_of so we capture the prior
-        # 3 trading days plus today.
-        bdays = pd.bdate_range(end=as_of, periods=4)
-        cutoff = bdays[0].to_pydatetime().replace(tzinfo=UTC)
-        recent = [(t, e) for t, e in self.equity_history if t >= cutoff]
-        if len(recent) < 2:
-            return 0.0
-        start_equity = recent[0][1]
-        end_equity = recent[-1][1]
-        if start_equity <= 0:
-            return 0.0
-        return (end_equity - start_equity) / start_equity
-
-    def worst_position_gap_pct(self: PortfolioTelemetry) -> float:
-        if not self.position_marks:
-            return 0.0
-        worst = 0.0
-        for entry, mark in self.position_marks.values():
-            if entry <= 0:
-                continue
-            gap = (mark - entry) / entry
-            if gap < worst:
-                worst = gap
-        return worst
-
-    def clamp_freshness_to(self: PortfolioTelemetry, floor: datetime) -> None:
-        """Raise heartbeat / data-freshness stamps older than `floor` up to it.
-
-        Round-12: the outage arms must measure IN-SESSION time. Ticks outside
-        09:30-16:00 ET return before touching telemetry, so both stamps froze
-        at ~15:59 ET; a single transient health() failure at the next open
-        then read as a 17 h (65 h over a weekend) outage → 7-day lockout.
-        """
-        if self.last_broker_heartbeat is not None and self.last_broker_heartbeat < floor:
-            self.last_broker_heartbeat = floor
-        for src, ts in list(self.data_freshness.items()):
-            if ts < floor:
-                self.data_freshness[src] = floor
-
-    def broker_disconnected_for_seconds(self: PortfolioTelemetry, as_of: datetime) -> int:
-        if self.last_broker_heartbeat is None:
-            return 0
-        delta = as_of - self.last_broker_heartbeat
-        return max(0, int(delta.total_seconds()))
-
-    def critical_data_stale_for_seconds(self: PortfolioTelemetry, as_of: datetime) -> int:
-        relevant = [ts for src, ts in self.data_freshness.items() if src in self.critical_sources]
-        if not relevant:
-            return 0
-        oldest = min(relevant)
-        delta = as_of - oldest
-        return max(0, int(delta.total_seconds()))
-
-    def to_killswitch_inputs(self: PortfolioTelemetry, as_of: datetime) -> KillSwitchInputs:
-        from squeeze_hunter.risk.killswitch import KillSwitchInputs
-
-        return KillSwitchInputs(
-            as_of=as_of,
-            rolling_30d_max_drawdown=self.rolling_30d_max_drawdown(as_of),
-            last_3_days_cumulative_pnl_pct=self.last_3_days_cumulative_pnl_pct(as_of),
-            worst_position_gap_pct=self.worst_position_gap_pct(),
-            broker_disconnected_for_seconds=self.broker_disconnected_for_seconds(as_of),
-            critical_data_stale_for_seconds=self.critical_data_stale_for_seconds(as_of),
-        )
-
-
-# R7.I3: transient broker/data errors caught around per-tick I/O. Programming
-# errors (AttributeError, NotImplementedError, TypeError, ValueError) must
-# propagate up to tick_safe so they surface in structured logs.
 _TRANSIENT_IO_ERRORS = (ConnectionError, TimeoutError, OSError)
 
 
@@ -261,6 +108,9 @@ class RuntimeContext:
     last_broker_healthy: bool = False
     alerts: AlertSender | None = None
     monitor_server: MonitorServer | None = None
+    # P1: sized entry proposals produced by premarket_verify (execution.auto_enter)
+    # and consumed once by the intraday loop after the opening window.
+    planned_entries: list[EntryDecision] = field(default_factory=list)
 
     async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
         # R9.1: propagate YAML stops settings into the lifecycle state so the
@@ -412,6 +262,7 @@ class RuntimeContext:
         # mark of exited positions forever, permanently arming the killswitch
         # gap-through-stop trigger.
         positions_before = set(self.lifecycle_state.positions.keys())
+        await self._execute_planned_entries(now)
         await manage_positions(self.lifecycle_state, self.broker, now)
         positions_after = set(self.lifecycle_state.positions.keys())
         for exited in positions_before - positions_after:
@@ -512,62 +363,121 @@ class RuntimeContext:
             data_stale_max_seconds=ks_cfg.data_stale_max_seconds,
         )
 
-        # R7.C1 + R8.C1: sticky-cooldown window. From the first trip, stay
-        # tripped for `_kill_cooldown_days` calendar days regardless of fresh
-        # telemetry, per the design doc's "Auto-resume after 7 calendar days
-        # OR explicit manual reset."
-        #
-        # R8.C1 fix: after the sticky window elapses, the killswitch state
-        # follows the real-time verdict but does NOT auto-rearm a new 7-day
-        # window when conditions are still bad. Prior behavior cleared the
-        # sticky timestamp at expiry, then set it again the same tick on a
-        # persistently-bad metric — extending the window forever and hiding
-        # the actual real-time state from the operator.
-        in_sticky_window = (
-            self._kill_first_tripped_at is not None
-            and now < self._kill_first_tripped_at + timedelta(days=self._kill_cooldown_days)
+        # R7.C1 + R8.C1 / P1: the sticky-cooldown state machine is the shared
+        # pure function advance_killswitch (the backtest runner calls the same
+        # one); this method only applies the side effects — log, alert, gauges.
+        prior = KillswitchState(
+            active=self.kill_switch_active,
+            reason=self._kill_reason,
+            first_tripped_at=self._kill_first_tripped_at,
         )
-        if in_sticky_window:
-            self.kill_switch_active = True
+        nxt, transition = advance_killswitch(prior, ks, now, self._kill_cooldown_days)
+        self.kill_switch_active = nxt.active
+        self._kill_reason = nxt.reason
+        self._kill_first_tripped_at = nxt.first_tripped_at
+        if transition == "tripped":
+            log.warning("killswitch_tripped", reason=nxt.reason)
+            await self._notify(
+                f"squeeze-hunter killswitch tripped: {nxt.reason} "
+                f"(mode={self.mode}, at={now.isoformat()})"
+            )
+        if nxt.active:
             if self.metrics_registry:
-                reason = self._kill_reason or "cooldown"
+                reason = nxt.reason or "unknown"
                 self.metrics_registry.set_kill_switch_active(reason)
-                # R10.2: track every reason label set during the cycle.
+                # R10.2: remember every reason label set during the cycle so
+                # the eventual clear resets ALL of them (the trip reason can
+                # transition mid-cycle and Prometheus tracks each label).
                 self._active_kill_reasons.add(reason)
-            return
-
-        was_active = self.kill_switch_active
-        self.kill_switch_active = ks.tripped
-        self._kill_reason = ks.reason
-        if ks.tripped:
-            # Open a new sticky window ONLY on a transition from clear → tripped.
-            if not was_active:
-                self._kill_first_tripped_at = now
-                log.warning("killswitch_tripped", reason=ks.reason)
-                await self._notify(
-                    f"squeeze-hunter killswitch tripped: {ks.reason} "
-                    f"(mode={self.mode}, at={now.isoformat()})"
-                )
-            if self.metrics_registry:
-                reason = ks.reason or "unknown"
-                self.metrics_registry.set_kill_switch_active(reason)
-                # R10.2: remember every reason that was active in this cycle so
-                # the eventual clear resets ALL of them. The trip reason can
-                # transition mid-cycle (drawdown → data_stale) and Prometheus
-                # tracks each labeled time series separately.
-                self._active_kill_reasons.add(reason)
-        elif self._kill_first_tripped_at is not None:
-            # Conditions cleared — close the trip cycle so the next fresh trip
-            # opens a new cooldown window.
-            log.info("killswitch_cleared", prior_reason=self._kill_reason)
-            # R9.4 + R10.2: reset every reason label that was active during the
-            # cycle so Grafana shows all gauges back at 0.0. Resetting only the
-            # most-recent reason left earlier reasons stuck at 1.0 forever.
+        elif transition == "cleared":
+            log.info("killswitch_cleared", prior_reason=prior.reason)
+            # R9.4 + R10.2: reset every reason label that was active during
+            # the cycle so Grafana shows all gauges back at 0.0.
             if self.metrics_registry is not None:
                 for reason in self._active_kill_reasons:
                     self.metrics_registry.set_kill_switch_inactive(reason)
             self._active_kill_reasons.clear()
-            self._kill_first_tripped_at = None
+
+    async def _execute_planned_entries(self: RuntimeContext, now: datetime) -> None:
+        """P1 step 4: buy the premarket proposals once, after the opening window.
+
+        A marketable limit `entry_limit_bps` above the ask, snapped to the
+        tick. A fill creates the position through the same `new_position_meta`
+        the backtest uses and registers it with telemetry so the gap arm sees
+        it (R9.9 checklist). Pending buys are not tracked yet — the order
+        state machine (P3) adds that; until then a non-filled entry is logged
+        and dropped, never re-sent.
+        """
+        if not self.planned_entries or self.broker is None:
+            return
+        et = now.astimezone(NY)
+        window_open = datetime.combine(et.date(), SESSION_OPEN, tzinfo=NY) + timedelta(
+            minutes=self.settings.execution.entry_after_minutes
+        )
+        if et < window_open:
+            return
+        planned, self.planned_entries = self.planned_entries, []
+        if self.kill_switch_active:
+            log.warning("planned_entries_dropped_killswitch", n=len(planned))
+            return
+        for d in planned:
+            if d.ticker in self.lifecycle_state.positions:
+                continue
+            try:
+                q = await self.broker.fetch_quote(d.ticker)
+            except _TRANSIENT_IO_ERRORS as e:
+                log.warning("entry_quote_failed", ticker=d.ticker, err=str(e))
+                continue
+            ref = q.ask or q.last or q.bid
+            if (not ref or ref <= 0) and isinstance(self.broker, SimulatorBroker):
+                # sim mode: the simulator only knows prices it has been marked
+                # with; take the latest cached close, as the backtest would.
+                ref = await self._latest_cached_close(d.ticker, now)
+            if not ref or ref <= 0:
+                log.warning("entry_skipped_no_quote", ticker=d.ticker)
+                continue
+            qty = int(d.size_usd // ref)
+            if qty <= 0:
+                log.info("entry_skipped_size_below_one_share", ticker=d.ticker, ref=ref)
+                continue
+            limit = round_to_tick(
+                ref * (1 + self.settings.execution.entry_limit_bps / 10_000), "buy"
+            )
+            order = await self.broker.submit_buy(
+                ticker=d.ticker, qty=qty, limit_price=limit, ts=now
+            )
+            log.info(
+                "entry_submitted",
+                ticker=d.ticker,
+                qty=qty,
+                limit=limit,
+                status=order.status,
+                broker_order_id=order.broker_order_id,
+            )
+            if order.status != "filled":
+                log.warning("entry_not_filled", ticker=d.ticker, status=order.status)
+                continue
+            filled = order.filled_qty or qty
+            entry_px = order.avg_fill_price or limit
+            self.lifecycle_state.positions[d.ticker] = new_position_meta(
+                ticker=d.ticker,
+                qty=filled,
+                entry_price=entry_px,
+                score=d.score,
+                setup_type=d.setup_type,
+                entry_commission_per_share=(order.commission_usd / filled) if filled else 0.0,
+            )
+            self.telemetry.record_position(d.ticker, entry_px, entry_px)
+
+    async def _latest_cached_close(self: RuntimeContext, ticker: str, now: datetime) -> float:
+        from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
+
+        provider = BacktestProvider(cache=self.cache, clock=Clock(now=now))
+        try:
+            bars = await provider.fetch_bars(ticker, now - timedelta(days=7), now)
+        except LookupError:
+            return 0.0
+        return float(bars[-1].close) if bars else 0.0
 
     def reset_killswitch(self: RuntimeContext) -> None:
         """R7.C1: explicit manual reset. Clears sticky cooldown state and
@@ -736,12 +646,71 @@ class RuntimeContext:
         structured logs. Phase 4 will add halt-list scraping, news scoring, and
         candidate-list filtering using last_candidates populated by nightly_scan.
         """
-        log.info(
-            "premarket_verify_stub",
-            candidates_from_overnight=len(self.last_candidates)
-            if self.last_candidates is not None
-            else 0,
+        n_candidates = len(self.last_candidates) if self.last_candidates is not None else 0
+        log.info("premarket_verify", candidates_from_overnight=n_candidates)
+        self.planned_entries = []
+        if not self.settings.execution.auto_enter:
+            return
+        if self.kill_switch_active:
+            log.warning("premarket_entries_suppressed_killswitch", reason=self._kill_reason)
+            return
+        if self.broker is None or self.last_candidates is None or self.last_candidates.empty:
+            return
+        # Same inputs as the backtest: gate context from the cache, portfolio
+        # state from the broker, proposals from the shared core.
+        from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
+
+        provider = BacktestProvider(
+            cache=self.cache,
+            clock=Clock(now=now),
+            finra_publication_lag_bdays=self.settings.data.finra_publication_lag_bdays,
         )
+        # The gate context is built for the LAST session (the bars the scan
+        # saw), which is what "today's" ADV20 / price floor mean premarket.
+        last_session = now.astimezone(NY).date() - timedelta(days=1)
+        as_of = datetime.combine(last_session, datetime.max.time(), tzinfo=UTC)
+        ctx = await build_gate_context(
+            provider, self.cache, self.tickers, as_of, self.settings, kill_switch_active=False
+        )
+        try:
+            equity = await self.broker.get_equity_usd()
+        except _TRANSIENT_IO_ERRORS as e:
+            log.warning("premarket_equity_unavailable", err=str(e))
+            return
+        if equity is None or equity <= 0:
+            log.warning("premarket_entries_skipped_no_equity")
+            return
+        positions = {t: int(m["qty"]) for t, m in self.lifecycle_state.positions.items()}
+        gross = 0.0
+        for t, m in self.lifecycle_state.positions.items():
+            mark = self.telemetry.position_marks.get(t, (m["entry_price"], m["entry_price"]))[1]
+            gross += mark * m["qty"]
+        state = PortfolioState(
+            equity_usd=equity,
+            cash_usd=equity - gross,
+            gross_exposure_pct=gross / equity,
+            positions=positions,
+            opened_today=0,
+        )
+        decisions = propose_entries(
+            self.last_candidates,
+            state,
+            ctx,
+            self.settings,
+            score_threshold=self.settings.score.threshold,
+            # No realized-trade history is kept live yet (P2 persistence):
+            # size from the per-setup priors alone.
+            stats_for_setup=lambda s: SetupStats(wins=0, trades=0, avg_payoff=None),
+        )
+        for d in decisions:
+            log.info(
+                "premarket_entry_decision",
+                ticker=d.ticker,
+                accepted=d.accepted,
+                reason=d.reason,
+                size_usd=round(d.size_usd, 2),
+            )
+        self.planned_entries = [d for d in decisions if d.accepted]
 
     async def premarket_verify_safe(self: RuntimeContext, now: datetime) -> bool:
         """Run premarket_verify() and swallow any exception so the scheduler keeps firing.
