@@ -90,8 +90,8 @@ def _build_runtime_callbacks(
         return _run
 
     return {
-        # Phase 4: integrate live EOD data ingest (yfinance → parquet backfill)
-        "ingest_eod": None,
+        # P6: daily bars / FINRA / earnings refresh at 17:00 ET.
+        "ingest_eod": _job(lambda now: rc.ingest_eod_safe(now=now)),
         "nightly_scan": _job(lambda now: rc.nightly_scan_safe(now=now)),
         # Phase 4: overnight news + halt-list ingest
         "premarket_data": None,

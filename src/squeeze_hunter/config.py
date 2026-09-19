@@ -116,6 +116,21 @@ class DataCfg(_StrictSection):
     # telemetry) is written after every job and read back at startup. Empty
     # disables persistence (tests / ad-hoc contexts); the example YAML sets it.
     state_path: str = ""
+    # P6: daily EOD ingest and the freshness gate. `*_max_age_days` bound how
+    # old a dataset's newest point may be before premarket refuses to plan
+    # automatic entries; `*_refresh_days` say how often the slow datasets are
+    # re-pulled by the EOD job.
+    bars_backfill_days: int = 400  # first pull for a ticker with no bars on disk
+    finra_refresh_days: int = 7
+    earnings_refresh_days: int = 7
+    bars_max_age_days: float = 3.0
+    short_interest_max_age_days: float = 21.0
+    earnings_max_age_days: float = 14.0
+    require_fresh_for_entries: bool = True
+    # Datasets whose staleness blocks automatic entries; the others only warn.
+    # Short interest and earnings are absent until their ingests run, and the
+    # factors they feed degrade to zero rather than to wrong values.
+    critical_datasets: list[str] = Field(default_factory=lambda: ["bars"])
 
 
 class ValidationEvent(_StrictSection):

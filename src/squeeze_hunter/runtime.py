@@ -23,6 +23,8 @@ from squeeze_hunter.execution.decisions import EntryDecision, SetupStats, propos
 from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
 from squeeze_hunter.execution.orders import OrderRecord, OrderState, OrderTracker
 from squeeze_hunter.execution.pricing import round_to_tick
+from squeeze_hunter.ingest.eod import ingest_eod
+from squeeze_hunter.ingest.freshness import dataset_age_days
 from squeeze_hunter.logging_setup import get_logger
 from squeeze_hunter.monitor.alerts import AlertSender, Severity
 from squeeze_hunter.monitor.http import MonitorServer, start_monitor_server
@@ -225,13 +227,15 @@ class RuntimeContext:
         await self._reconcile_with_broker(startup_now, full=True, source="startup")
         self._persist()
 
-    async def _notify(self: RuntimeContext, text: str) -> None:
-        """Push a HIGH-severity alert; delivery failure must never break a tick."""
+    async def _notify(
+        self: RuntimeContext, text: str, *, severity: Severity = Severity.HIGH
+    ) -> None:
+        """Push an alert (HIGH by default); delivery failure must never break a tick."""
         if self.alerts is None:
             log.warning("alert_channel_not_configured", text=text)
             return
         try:
-            await self.alerts.send(text, severity=Severity.HIGH)
+            await self.alerts.send(text, severity=severity)
         except _ALERT_ERRORS as e:
             log.warning("alert_send_failed", err=str(e), err_type=type(e).__name__)
 
@@ -604,6 +608,49 @@ class RuntimeContext:
             return 0.0
         return float(bars[-1].close) if bars else 0.0
 
+    # ------------------------------------------------------------------ P6
+    def _data_freshness_problems(
+        self: RuntimeContext, now: datetime, *, critical_only: bool = False
+    ) -> list[str]:
+        """Datasets whose newest point is older than its budget (or unknown).
+        `critical_only` restricts to data.critical_datasets (the entry gate)."""
+        budgets = {
+            "bars": self.settings.data.bars_max_age_days,
+            "short_interest": self.settings.data.short_interest_max_age_days,
+            "earnings": self.settings.data.earnings_max_age_days,
+        }
+        critical = set(self.settings.data.critical_datasets)
+        problems: list[str] = []
+        for dataset, budget in budgets.items():
+            if critical_only and dataset not in critical:
+                continue
+            age = dataset_age_days(self.cache.root, dataset, now)
+            if age is None:
+                problems.append(f"{dataset}: never ingested (max {budget:g}d)")
+            elif age > budget:
+                problems.append(f"{dataset}: {age:.1f}d old (max {budget:g}d)")
+        return problems
+
+    async def ingest_eod(self: RuntimeContext, now: datetime) -> None:
+        """17:00 ET: bring bars / short interest / earnings up to date."""
+        report = await ingest_eod(self.tickers, self.cache, self.settings, now)
+        if not report.ok:
+            await self._notify(
+                "squeeze-hunter EOD ingest problems: "
+                f"bars_failed={report.bars_failed} finra={report.finra} "
+                f"earnings={report.earnings}",
+                severity=Severity.LOW,
+            )
+        self._persist()
+
+    async def ingest_eod_safe(self: RuntimeContext, now: datetime) -> bool:
+        try:
+            await self.ingest_eod(now=now)
+        except Exception:
+            log.exception("ingest_eod_failed", as_of=now.isoformat())
+            return False
+        return True
+
     # ------------------------------------------------------------------ P2
     def _snapshot(self: RuntimeContext) -> dict[str, Any]:
         return {
@@ -838,6 +885,9 @@ class RuntimeContext:
             clock=clock,
             finra_publication_lag_bdays=self.settings.data.finra_publication_lag_bdays,
         )
+        stale = self._data_freshness_problems(now)
+        if stale:
+            log.warning("nightly_scan_on_stale_data", problems=stale)
         ranked = await run_scan(self.tickers, provider, now, self.settings)
         if self.kill_switch_active:
             # Round-12: the scan still runs so HELD positions get their
@@ -926,6 +976,15 @@ class RuntimeContext:
         log.info("premarket_verify", candidates_from_overnight=n_candidates)
         self.planned_entries = []
         if not self.settings.execution.auto_enter:
+            return
+        # P6: never size entries off a stale cache.
+        problems = self._data_freshness_problems(now, critical_only=True)
+        if problems and self.settings.data.require_fresh_for_entries:
+            log.warning("premarket_entries_refused_stale_data", problems=problems)
+            await self._notify(
+                "squeeze-hunter: automatic entries refused, data stale — " + "; ".join(problems)
+            )
+            self._persist()
             return
         if self.kill_switch_active:
             log.warning("premarket_entries_suppressed_killswitch", reason=self._kill_reason)

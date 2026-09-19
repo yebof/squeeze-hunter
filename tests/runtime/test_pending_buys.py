@@ -104,6 +104,7 @@ async def _rc(
     settings = Settings()
     settings.score.weights = {"f6_bollinger_breakout": 1.0, "f7_volume_spike": 1.0}
     settings.execution.auto_enter = True
+    settings.data.require_fresh_for_entries = False  # P6 gate has its own tests
     rc = RuntimeContext(
         cache=cache,
         settings=settings,

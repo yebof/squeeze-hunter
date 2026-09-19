@@ -24,6 +24,7 @@ async def _rc(tmp_path: Path, auto_enter: bool) -> RuntimeContext:
     settings = Settings()
     settings.score.weights = {"f6_bollinger_breakout": 1.0, "f7_volume_spike": 1.0}
     settings.execution.auto_enter = auto_enter
+    settings.data.require_fresh_for_entries = False  # P6 gate has its own tests
     rc = RuntimeContext(cache=cache, settings=settings, tickers=["GME"], mode="sim")
     await rc.setup()
     rc.last_candidates = pd.DataFrame(

@@ -77,6 +77,18 @@ data:
   # history) — written atomically after every job so a restart resumes where
   # it left off and reconciles against the broker. Empty = no persistence.
   state_path: data/state/runtime.json
+  # Daily EOD ingest (17:00 ET) and the premarket freshness gate. When a
+  # dataset's newest point is older than its *_max_age_days, automatic entries
+  # are refused (and alerted) until the data catches up. Bars are critical;
+  # short interest and earnings age slowly by nature.
+  bars_backfill_days: 400
+  finra_refresh_days: 7
+  earnings_refresh_days: 7
+  bars_max_age_days: 3
+  short_interest_max_age_days: 21
+  earnings_max_age_days: 14
+  require_fresh_for_entries: true
+  critical_datasets: [bars]
 backtest:
   # Gate 1 "captured-the-event" case set (design spec §5, exactly 8 events).
   # A buy within [date - 5 calendar days, date + 1 day] captures the event;

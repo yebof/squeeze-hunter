@@ -8,6 +8,7 @@ import pandas as pd
 
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.data.providers.finra import FinraProvider
+from squeeze_hunter.data.providers.finra_api import FinraApiClient, api_credentials_from_env
 from squeeze_hunter.data.providers.yahoo import YahooProvider
 from squeeze_hunter.logging_setup import get_logger
 
@@ -24,7 +25,18 @@ async def backfill_finra(tickers: list[str], cache: ParquetCache) -> None:
     # CDX2-P2: ONE pass over the FINRA files for the whole universe, not one
     # full re-download per ticker. fetch_short_interest_bulk GETs each monthly
     # report exactly once and indexes the requested tickers.
-    si_by_ticker = await finra.fetch_short_interest_bulk(tickers, since=date(2018, 1, 1))
+    try:
+        si_by_ticker = await finra.fetch_short_interest_bulk(tickers, since=date(2018, 1, 1))
+    except RuntimeError as cdn_error:
+        # P6: the public CDN answers 403 from some networks. Fall back to the
+        # FINRA Query API when credentials are configured; otherwise stay
+        # loud (round-12) — a silent empty backfill leaves f1/f2 dead.
+        creds = api_credentials_from_env()
+        if creds is None:
+            raise
+        log.warning("finra_cdn_failed_using_api", err=str(cdn_error))
+        api = FinraApiClient(client_id=creds[0], client_secret=creds[1])
+        si_by_ticker = await api.fetch_short_interest(tickers, since=date(2018, 1, 1))
 
     for t in tickers:
         si_list = si_by_ticker.get(t, [])

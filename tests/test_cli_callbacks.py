@@ -80,7 +80,7 @@ def test_runtime_callbacks_wires_critical_jobs(tmp_path: Path) -> None:
     assert callable(cbs["premarket_verify"])
 
     # Phase 4 follow-ups: explicitly None with comments in source
-    assert cbs.get("ingest_eod") is None
+    assert cbs.get("ingest_eod") is not None  # P6: the EOD ingest is wired
     assert cbs.get("premarket_data") is None
     assert cbs.get("moc_decision") is None
 
