@@ -151,5 +151,17 @@ async def run_walk_forward(
             "test_equities": [r.equity_curve for r in test_results],
             "holdout_equity": holdout_res.equity_curve,
             "trades": holdout_res.trade_log,
+            # P8: every window's decisions, labelled, for `squeeze-hunter explain`.
+            "decisions": pd.concat(
+                [
+                    r.decisions.assign(window=label)
+                    for label, r in [
+                        ("train", train_res),
+                        *[(f"test{i}", r) for i, r in enumerate(test_results)],
+                        ("holdout", holdout_res),
+                    ]
+                ],
+                ignore_index=True,
+            ),
         },
     }

@@ -10,7 +10,7 @@ keeps the trade log / equity curve that Gate 1 reads.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -22,6 +22,8 @@ from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.data.providers.backtest import BacktestProvider, Clock
 from squeeze_hunter.execution.book import new_position_meta, realized_pnl
 from squeeze_hunter.execution.context import build_gate_context
+from squeeze_hunter.execution.decision_log import COLUMNS as DECISION_COLUMNS
+from squeeze_hunter.execution.decision_log import DecisionLog
 from squeeze_hunter.execution.decisions import (
     MarkSnapshot,
     StopParams,
@@ -57,6 +59,8 @@ class BacktestResult:
     equity_curve: pd.Series
     trade_log: pd.DataFrame
     daily_metrics: pd.DataFrame
+    # P8: one row per candidate per day with the gate outcome.
+    decisions: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=DECISION_COLUMNS))
 
 
 async def run_backtest(
@@ -85,6 +89,7 @@ async def run_backtest(
     # PortfolioTelemetry the runtime uses, so a strategy that would have
     # tripped live is locked out here as well and Gate 1 sees it.
     telemetry = PortfolioTelemetry()
+    decision_log = DecisionLog()
     kill = KillswitchState()
     kill_cooldown_days = settings.risk.killswitch.cooldown_days
     ks_cfg = settings.risk.killswitch
@@ -235,14 +240,16 @@ async def run_backtest(
                 positions={t: broker.position_qty(t) for t in broker.positions},
                 opened_today=0,
             )
-            for d in propose_entries(
+            decisions = propose_entries(
                 ranked,
                 state,
                 ctx,
                 settings,
                 score_threshold=cfg.score_threshold,
                 stats_for_setup=lambda s: setup_stats_from_trades(trade_log, s),
-            ):
+            )
+            decision_log.record(day_label, decisions, source="backtest")
+            for d in decisions:
                 if d.accepted:
                     pending_entries.append(
                         {
@@ -282,4 +289,5 @@ async def run_backtest(
         equity_curve=eq,
         trade_log=pd.DataFrame(trade_log),
         daily_metrics=pd.DataFrame(daily_rows),
+        decisions=decision_log.to_frame(),
     )

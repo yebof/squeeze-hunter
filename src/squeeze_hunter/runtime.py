@@ -19,6 +19,7 @@ from squeeze_hunter.config import Settings
 from squeeze_hunter.data.cache import ParquetCache
 from squeeze_hunter.execution.book import new_position_meta
 from squeeze_hunter.execution.context import build_gate_context
+from squeeze_hunter.execution.decision_log import DecisionLog
 from squeeze_hunter.execution.decisions import EntryDecision, SetupStats, propose_entries
 from squeeze_hunter.execution.lifecycle import LifecycleState, manage_positions
 from squeeze_hunter.execution.orders import OrderRecord, OrderState, OrderTracker
@@ -1044,6 +1045,13 @@ class RuntimeContext:
                 accepted=d.accepted,
                 reason=d.reason,
                 size_usd=round(d.size_usd, 2),
+            )
+        # P8: append to the live decision log (parquet partition decisions/live).
+        dlog = DecisionLog()
+        dlog.record(now, decisions, source=f"premarket:{self.mode}")
+        if dlog.rows:
+            self.cache.append_partition(
+                "decisions", "live", dlog.to_frame(), dedup_keys=["date", "ticker", "source"]
             )
         self.planned_entries = [d for d in decisions if d.accepted]
         self._persist()

@@ -309,6 +309,8 @@ def backtest(
     verdict = evaluate_gate1(report["holdout"], n_trials=n_trials, n_obs=n_obs)
     holdout_eq.to_csv(out / "holdout_equity.csv")
     report["raw"]["trades"].to_csv(out / "holdout_trades.csv", index=False)
+    # P8: the decision log for every window; read back with `explain`.
+    report["raw"]["decisions"].to_parquet(out / "decisions.parquet", index=False)
     # R9.2: surface setup-type coverage so a "PASSED" with only CAR trades is
     # explicitly flagged. f4/f5 are 0-by-design today → no GME/Mixed labels.
     from squeeze_hunter.backtest.gate1 import setup_type_coverage_warning
@@ -351,6 +353,32 @@ def _format_report(report: dict, verdict: Any, coverage_warning: str | None = No
         lines.append("=== Coverage warning ===")
         lines.append(coverage_warning)
     return "\n".join(lines)
+
+
+@app.command()
+def explain(
+    ticker: Annotated[str | None, typer.Option("--ticker")] = None,
+    date_str: Annotated[str | None, typer.Option("--date", help="YYYY-MM-DD")] = None,
+    source: Annotated[
+        Path,
+        typer.Option(
+            "--source",
+            help="decisions.parquet from a backtest, or a parquet cache root for the live log",
+        ),
+    ] = Path("data/backtests/decisions.parquet"),
+) -> None:
+    """P8: show why candidates were (not) entered on a day."""
+    import pandas as pd
+
+    from squeeze_hunter.execution.decision_log import explain as _explain
+
+    if source.is_file():
+        frame = pd.read_parquet(source)
+    elif source.is_dir():
+        frame = ParquetCache(root=source).read_partition("decisions", "live")
+    else:
+        frame = pd.DataFrame()
+    typer.echo(_explain(frame, ticker=ticker, date=date_str))
 
 
 @app.command()
