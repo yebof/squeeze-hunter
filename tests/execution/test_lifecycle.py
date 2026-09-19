@@ -89,11 +89,12 @@ async def test_lifecycle_skips_position_when_quote_is_nan() -> None:
             }
         }
     )
-    # Patch evaluate_stops so we can prove the NaN price short-circuits BEFORE any
-    # stop math runs. The old `if price <= 0.0` guard did NOT catch nan (nan<=0.0
-    # is False), so evaluate_stops ran on a nan price — every comparison was False
-    # and the stops silently failed to fire. The fix must skip the tick entirely.
-    with patch("squeeze_hunter.execution.lifecycle.evaluate_stops") as eval_mock:
+    # Patch the decision core so we can prove the NaN price short-circuits BEFORE
+    # any stop math runs. The old `if price <= 0.0` guard did NOT catch nan
+    # (nan<=0.0 is False), so the stops ran on a nan price — every comparison
+    # was False and they silently failed to fire. The fix must skip the tick.
+    # (P1: the daemon calls decide_exit, which is the only caller of evaluate_stops.)
+    with patch("squeeze_hunter.execution.lifecycle.decide_exit") as eval_mock:
         out = await manage_positions(
             state=state, broker=broker, now=datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
         )

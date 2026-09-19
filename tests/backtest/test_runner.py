@@ -622,17 +622,37 @@ async def test_runner_gross_exposure_invariant(tmp_path: Path) -> None:
             )
 
 
-def test_runner_gross_exposure_updates_state() -> None:
-    """R6 unit-level regression: PortfolioState.gross_exposure_pct must be
-    bumped by `size_usd / equity_usd` after each accepted buy in the daily
-    loop. Verifies the R6 fix by reading the runner source directly.
-    """
-    import inspect
+def test_same_scan_candidates_see_cumulative_exposure() -> None:
+    """R6 regression, P1 form: several candidates from ONE scan must not each
+    independently pass the gross-exposure cap. (Formerly asserted by grepping
+    the runner's source; the behaviour now lives in propose_entries.)"""
+    from datetime import UTC, datetime
 
-    from squeeze_hunter.backtest import runner as runner_mod
+    from squeeze_hunter.execution.decisions import SetupStats, propose_entries
+    from squeeze_hunter.risk.gates import GateContext, PortfolioState
 
-    src = inspect.getsource(runner_mod)
-    # The R6 fix line must be present in the daily loop
-    assert "state.gross_exposure_pct += size_usd / state.equity_usd" in src, (
-        "R6 fix (per-buy gross_exposure_pct update) missing from runner.py"
+    settings = Settings()
+    settings.risk.position_cap = 0.5
+    settings.risk.max_gross_exposure = 0.9
+    settings.risk.kelly_fraction = 1.0  # full Kelly so the cap binds
+    tickers = ["A", "B", "C"]
+    ctx = GateContext(
+        as_of=datetime(2024, 5, 13, tzinfo=UTC),
+        kill_switch_active=False,
+        adv20_dollar_volume_by_ticker={t: 1e12 for t in tickers},
+        days_listed_by_ticker={t: 365 for t in tickers},
+        halted_tickers=frozenset(),
+        universe_tickers=frozenset(tickers),
+        earnings_within_3_days={},
+        portfolio_correlations={},
     )
+    ranked = pd.DataFrame([{"ticker": t, "score": 9.0, "setup_type": "CAR"} for t in tickers])
+    state = PortfolioState(equity_usd=100_000, cash_usd=100_000, gross_exposure_pct=0.0)
+    # A strong observed record pushes Kelly up to the 50% cap for every name.
+    strong = SetupStats(wins=100, trades=100, avg_payoff=10.0)
+    out = propose_entries(
+        ranked, state, ctx, settings, score_threshold=8.0, stats_for_setup=lambda s: strong
+    )
+    assert [d.accepted for d in out] == [True, False, False]
+    assert out[0].size_usd == pytest.approx(50_000)
+    assert out[1].reason == "gross_exposure_exceeded"

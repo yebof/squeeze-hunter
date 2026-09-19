@@ -1,9 +1,11 @@
-"""Killswitch — pure function over telemetry inputs."""
+"""Killswitch — pure function over telemetry inputs, plus the sticky-cooldown
+state machine shared by the backtest runner and the runtime (P1/P4)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Literal
 
 
 @dataclass
@@ -44,3 +46,37 @@ def evaluate_killswitch(
     if inp.critical_data_stale_for_seconds >= data_stale_max_seconds:
         return KillSwitchVerdict(True, "data_stale")
     return KillSwitchVerdict(False)
+
+
+@dataclass(frozen=True, slots=True)
+class KillswitchState:
+    active: bool = False
+    reason: str | None = None
+    first_tripped_at: datetime | None = None
+
+
+def advance_killswitch(
+    state: KillswitchState,
+    verdict: KillSwitchVerdict,
+    now: datetime,
+    cooldown_days: int,
+) -> tuple[KillswitchState, Literal["tripped", "cleared"] | None]:
+    """R7.C1 + R8.C1 sticky cooldown, as one pure step.
+
+    From the first trip the switch stays active for `cooldown_days` calendar
+    days regardless of the live verdict. After the window it follows the
+    verdict but does NOT open a new window on persistent badness — only a
+    fresh clear → tripped transition does. Returns the new state and the
+    transition that happened this step (for logging / alerting / gauges).
+    """
+    if state.first_tripped_at is not None and now < state.first_tripped_at + timedelta(
+        days=cooldown_days
+    ):
+        return KillswitchState(True, state.reason or "cooldown", state.first_tripped_at), None
+    if verdict.tripped:
+        if not state.active:
+            return KillswitchState(True, verdict.reason, now), "tripped"
+        return KillswitchState(True, verdict.reason, state.first_tripped_at), None
+    if state.first_tripped_at is not None or state.active:
+        return KillswitchState(False, None, None), "cleared"
+    return KillswitchState(False, None, None), None

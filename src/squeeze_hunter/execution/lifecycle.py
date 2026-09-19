@@ -9,14 +9,18 @@ from datetime import datetime
 from typing import Any
 
 from squeeze_hunter.broker.base import IBroker
+from squeeze_hunter.execution.decisions import (
+    MarkSnapshot,
+    StopParams,
+    apply_exit_decision,
+    decide_exit,
+)
 from squeeze_hunter.execution.pricing import round_to_tick
 from squeeze_hunter.logging_setup import get_logger
 from squeeze_hunter.risk.stops import (
     _DEFAULT_TRAILING_CAR,
     _DEFAULT_TRAILING_GME,
     _DEFAULT_TRAILING_MIXED,
-    StopState,
-    evaluate_stops,
 )
 
 log = get_logger("execution.lifecycle")
@@ -227,42 +231,26 @@ async def _process_one_position(
         )
         return
 
-    meta["peak_price"] = max(meta["peak_price"], price)
-    stop_state = StopState(
-        entry_price=meta["entry_price"],
-        peak_price=meta["peak_price"],
-        current_score=meta["current_score"],
-        entry_score=meta["entry_score"],
-        bars_held=meta["bars_held"],
-        setup_type=meta["setup_type"],
-        halved=bool(meta.get("halved", False)),
+    # P1: the shared decision core (same call the backtest runner makes).
+    decision = decide_exit(
+        meta,
+        MarkSnapshot.from_quote(price),
+        StopParams(
+            hard_stop=state.hard_stop,
+            time_stop_bars=state.time_stop_bars,
+            signal_decay_halve=state.signal_decay_halve,
+            signal_decay_exit=state.signal_decay_exit,
+            trailing_car=state.trailing_car,
+            trailing_gme=state.trailing_gme,
+            trailing_mixed=state.trailing_mixed,
+        ),
     )
-    # R9.1: pass the YAML-driven stops parameters (carried on LifecycleState)
-    # so paper/live behave identically to the backtest. Previously this call
-    # used only defaults — every YAML knob in `stops:` was silently dead.
-    sig = evaluate_stops(
-        stop_state,
-        current_price=price,
-        hard_stop=state.hard_stop,
-        time_stop_bars=state.time_stop_bars,
-        signal_decay_halve=state.signal_decay_halve,
-        signal_decay_exit=state.signal_decay_exit,
-        trailing_car=state.trailing_car,
-        trailing_gme=state.trailing_gme,
-        trailing_mixed=state.trailing_mixed,
-    )
-    if sig.action == "hold":
+    apply_exit_decision(meta, decision)
+    if decision.action == "hold":
         return
-    if sig.action in {"halve", "exit"}:
-        qty = meta["qty"] // 2 if sig.action == "halve" else meta["qty"]
-        if qty <= 0:
-            if sig.action == "halve":
-                # Round-13: a 1-share position cannot be halved. Mark the
-                # one-shot done (and say so once) instead of re-entering this
-                # branch silently every 60 s forever.
-                meta["halved"] = True
-                log.info("lifecycle_halve_unrepresentable", ticker=ticker, qty=meta["qty"])
-            return
+    if decision.action in {"halve", "exit"}:
+        qty = decision.qty
+        sig_reason = decision.reason
         # R9.3: cancel any prior STILL-OPEN exit orders before resubmitting.
         # Without this, a stop that triggers two ticks in a row leaves TWO
         # live sell orders on the broker. If both fill the position flips
@@ -302,7 +290,7 @@ async def _process_one_position(
             "lifecycle_exit",
             ticker=ticker,
             qty=qty,
-            reason=sig.reason,
+            reason=sig_reason,
             broker_order_id=order.broker_order_id,
             status=order.status,
         )
@@ -317,11 +305,11 @@ async def _process_one_position(
         # re-evaluates the stop with a fresh quote.
         if order.status == "filled":
             state.record_exit(
-                {"ts": now, "ticker": ticker, "qty": qty, "reason": sig.reason or "exit"}
+                {"ts": now, "ticker": ticker, "qty": qty, "reason": sig_reason or "exit"}
             )
             meta.pop("pending_action", None)
             meta.pop("pending_qty", None)
-            if sig.action == "exit":
+            if decision.action == "exit":
                 state.positions.pop(ticker, None)
             else:
                 meta["qty"] -= qty
@@ -345,7 +333,7 @@ async def _process_one_position(
             meta.setdefault("pending_exits", []).append(order.broker_order_id)
             # Round-12: remember what the pending order was for so the
             # reconcile can tell a filled halve from a filled exit.
-            meta["pending_action"] = sig.action
+            meta["pending_action"] = decision.action
             meta["pending_qty"] = qty
             log.warning(
                 "lifecycle_exit_unfilled",
