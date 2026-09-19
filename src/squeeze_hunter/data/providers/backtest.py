@@ -3,6 +3,7 @@ prevents lookahead bias by construction."""
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -46,6 +47,94 @@ class BacktestProvider:
         default_factory=lambda: frozenset({"bars", "options", "si", "earnings", "sentiment"})
     )
 
+    # P7: read each parquet partition ONCE per provider and keep it prepared
+    # (parsed timestamps, chronological order, FINRA availability dates). The
+    # runner used to re-read and re-parse the same files for every ticker on
+    # every session — the dominant cost of a multi-year backtest. A provider
+    # lives for one backtest run / one nightly scan, so staleness is a
+    # non-issue; call `invalidate()` after writing to the cache mid-run.
+    _frames: dict[tuple[str, str], pd.DataFrame] = field(default_factory=dict, repr=False)
+
+    def invalidate(self: BacktestProvider) -> None:
+        self._frames.clear()
+        self._bars.clear()
+
+    _bars: dict[str, tuple[list[Bar], list[datetime]]] = field(default_factory=dict, repr=False)
+
+    def _bars_prepared(self: BacktestProvider, ticker: str) -> tuple[list[Bar], list[datetime]]:
+        """All bars for `ticker`, chronological, as Bar objects built once
+        (pydantic construction per call was the next cost after parquet I/O)."""
+        if ticker not in self._bars:
+            df = self.cache.read_partition("bars", ticker)
+            bars: list[Bar] = []
+            if not df.empty:
+                df = df.copy()
+                df["ts"] = pd.to_datetime(df["ts"], utc=True)
+                # Round-13: chronological regardless of parquet storage order.
+                df = df.sort_values("ts", kind="stable").reset_index(drop=True)
+                columns = (
+                    df["ticker"],
+                    df["ts"],
+                    df["open"],
+                    df["high"],
+                    df["low"],
+                    df["close"],
+                    df["volume"],
+                )
+                for ticker_v, ts_v, o_v, h_v, lo_v, c_v, vol_v in zip(*columns, strict=True):
+                    ts_py = pd.Timestamp(ts_v).to_pydatetime()
+                    if not isinstance(ts_py, datetime) or pd.isna(ts_v):
+                        continue  # NaT: unusable row
+                    o = float(o_v)
+                    h = float(h_v)
+                    lo = float(lo_v)
+                    c = float(c_v)
+                    # Clamp high/low so OHLC constraints hold even for noisy cached data.
+                    bars.append(
+                        Bar(
+                            ticker=str(ticker_v),
+                            ts=ts_py,
+                            open=o,
+                            high=max(h, o, c),
+                            low=min(lo, o, c),
+                            close=c,
+                            volume=int(vol_v),
+                        )
+                    )
+            self._bars[ticker] = (bars, [b.ts for b in bars])
+        return self._bars[ticker]
+
+    def _short_interest_frame(self: BacktestProvider) -> pd.DataFrame:
+        key = ("short_interest", "all")
+        if key not in self._frames:
+            df = self.cache.read_partition("short_interest", "all")
+            if not df.empty:
+                df = df.copy()
+                df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
+                lag = self.finra_publication_lag_bdays
+                if lag > 0:
+                    # R11 + Round-13: reveal on settlement + lag NYSE sessions.
+                    from squeeze_hunter.trading_calendar import nyse_holidays
+
+                    bday = pd.offsets.CustomBusinessDay(n=lag, holidays=nyse_holidays())
+                    distinct = pd.to_datetime(pd.Series(df["settlement_date"].unique()))
+                    avail = dict(zip(distinct.dt.date, (distinct + bday).dt.date, strict=True))
+                    df["available"] = df["settlement_date"].map(avail)
+                else:
+                    df["available"] = df["settlement_date"]
+            self._frames[key] = df
+        return self._frames[key]
+
+    def _earnings_frame(self: BacktestProvider) -> pd.DataFrame:
+        key = ("earnings", "all")
+        if key not in self._frames:
+            df = self.cache.read_partition("earnings", "all")
+            if not df.empty:
+                df = df.copy()
+                df["report_at"] = pd.to_datetime(df["report_at"], utc=True)
+            self._frames[key] = df
+        return self._frames[key]
+
     async def fetch_bars(
         self: BacktestProvider,
         ticker: str,
@@ -60,38 +149,14 @@ class BacktestProvider:
                 end=end.isoformat(),
                 clock=self.clock.now.isoformat(),
             )
-        df = self.cache.read_partition("bars", ticker)
-        if df.empty:
+        bars, stamps = self._bars_prepared(ticker)
+        if not bars:
             log.info("backtest_no_bars_partition", ticker=ticker)
             return []
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        # Round-13: return CHRONOLOGICAL bars. ParquetCache.append_partition
-        # preserves append order, so a gap-fill or earlier-range re-ingest puts
-        # older rows last; every `bars[-1]`-is-today guard in the runner and
-        # the f6/f7 windows assumed sorted input.
-        df = df.sort_values("ts", kind="stable")
-        mask = (df["ts"] >= start) & (df["ts"] <= end) & (df["ts"] <= self.clock.now)
-        bars = []
-        for _, row in df[mask].iterrows():
-            o = float(row["open"])
-            h = float(row["high"])
-            lo = float(row["low"])
-            c = float(row["close"])
-            # Clamp high/low so OHLC constraints hold even for noisy cached data.
-            h = max(h, o, c)
-            lo = min(lo, o, c)
-            bars.append(
-                Bar(
-                    ticker=row["ticker"],
-                    ts=row["ts"].to_pydatetime(),
-                    open=o,
-                    high=h,
-                    low=lo,
-                    close=c,
-                    volume=int(row["volume"]),
-                )
-            )
-        return bars
+        hi = min(end, self.clock.now)
+        lo_idx = bisect.bisect_left(stamps, start)
+        hi_idx = bisect.bisect_right(stamps, hi)
+        return bars[lo_idx:hi_idx]
 
     async def fetch_quote(self: BacktestProvider, ticker: str) -> Quote:
         bars = await self.fetch_bars(
@@ -172,35 +237,11 @@ class BacktestProvider:
     async def fetch_short_interest(
         self: BacktestProvider, ticker: str, since: date | None = None
     ) -> list[ShortInterest]:
-        df = self.cache.read_partition("short_interest", "all")
+        df = self._short_interest_frame()
         if df.empty:
             return []
-        df["settlement_date"] = pd.to_datetime(df["settlement_date"]).dt.date
         clock_d = self.clock.now.date()
-        # R11: gate visibility on the AVAILABILITY date (settlement + FINRA
-        # publication lag), not the settlement date. FINRA publishes a
-        # settlement-date report ~8 business days later, so revealing it on the
-        # settlement date lets the backtest act on short interest the live
-        # system could not yet have known — lookahead that inflates Gate 1.
-        lag = self.finra_publication_lag_bdays
-        if lag > 0:
-            # Round-12: count US federal holidays like the rest of the codebase
-            # (time stop, f3 window). Plain BusinessDay revealed the record one
-            # business day early whenever a holiday fell inside the lag window.
-            from squeeze_hunter.trading_calendar import nyse_holidays
-
-            bday = pd.offsets.CustomBusinessDay(n=lag, holidays=nyse_holidays())
-            # Round-13: CustomBusinessDay is applied row-by-row (pandas cannot
-            # vectorize it), and this runs for every ticker on every backtest
-            # day. Map the ~24 distinct settlement dates per year once instead
-            # of offsetting every row of the whole-universe table (45x faster).
-            distinct = pd.to_datetime(pd.Series(df["settlement_date"].unique()))
-            avail_by_settlement = dict(
-                zip(distinct.dt.date, (distinct + bday).dt.date, strict=True)
-            )
-            available = df["settlement_date"].map(avail_by_settlement)
-        else:
-            available = df["settlement_date"]
+        available = df["available"]
         mask = (df["ticker"] == ticker) & (available <= clock_d)
         # `since` filters by settlement date (it selects how far back to look,
         # which is a property of the report period, not its availability).
@@ -220,10 +261,9 @@ class BacktestProvider:
     async def fetch_earnings(
         self: BacktestProvider, ticker: str, since: date | None = None
     ) -> list[EarningsEvent]:
-        df = self.cache.read_partition("earnings", "all")
+        df = self._earnings_frame()
         if df.empty:
             return []
-        df["report_at"] = pd.to_datetime(df["report_at"], utc=True)
         mask = (df["ticker"] == ticker) & (df["report_at"] <= self.clock.now)
         if since is not None:
             mask = mask & (df["report_at"].dt.date >= since)
