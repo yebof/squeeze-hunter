@@ -164,6 +164,7 @@ async def test_tick_skipped_outside_us_regular_session(tmp_path: Path) -> None:
     mock_broker.name = "drawdown-mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
@@ -221,6 +222,7 @@ async def test_tick_clears_telemetry_position_marks_on_exit(tmp_path: Path) -> N
     mock_broker.name = "mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
@@ -294,6 +296,7 @@ async def test_tick_records_equity_in_all_modes(tmp_path: Path) -> None:
     mock_broker.name = "live-mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="live-mock"),
     )
@@ -330,6 +333,7 @@ async def test_tick_skips_equity_when_broker_returns_none(tmp_path: Path) -> Non
     mock_broker.name = "snapshot-pending"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="pending"),
     )
@@ -460,6 +464,7 @@ async def test_killswitch_sticky_cooldown_after_trip(tmp_path: Path) -> None:
     mock_broker.name = "cooldown-mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
@@ -508,6 +513,7 @@ async def test_killswitch_cooldown_does_not_rearm_when_conditions_persist(
     mock_broker.name = "persistent-bad"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
@@ -551,6 +557,7 @@ async def test_killswitch_manual_reset_clears_cooldown(tmp_path: Path) -> None:
     mock_broker.name = "reset-mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )
@@ -591,6 +598,7 @@ async def test_runtime_killswitch_uses_real_telemetry(tmp_path: Path) -> None:
     mock_broker.name = "drawdown-mock"
     mock_broker.connect = AsyncMock()
     mock_broker.disconnect = AsyncMock()
+    mock_broker.get_positions = AsyncMock(return_value=[])  # P2 reconcile
     mock_broker.health = AsyncMock(
         return_value=BrokerHealth(connected=True, last_ping_ms=0, account="mock"),
     )

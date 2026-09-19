@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from typing import cast
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import pandas as pd
@@ -31,6 +32,7 @@ from squeeze_hunter.risk.killswitch import (
     advance_killswitch,
     evaluate_killswitch,
 )
+from squeeze_hunter.store.state import JsonStateStore, StateStore
 from squeeze_hunter.telemetry import PortfolioTelemetry
 from squeeze_hunter.trading_calendar import (
     NY,
@@ -111,6 +113,9 @@ class RuntimeContext:
     # P1: sized entry proposals produced by premarket_verify (execution.auto_enter)
     # and consumed once by the intraday loop after the opening window.
     planned_entries: list[EntryDecision] = field(default_factory=list)
+    # P2: snapshot store (None = no persistence). Built from data.state_path in
+    # setup() unless injected.
+    state_store: StateStore | None = None
 
     async def setup(self: RuntimeContext, connect_timeout_s: float = 30.0) -> None:
         # R9.1: propagate YAML stops settings into the lifecycle state so the
@@ -192,13 +197,23 @@ class RuntimeContext:
         # Round-12: alert channel (AlertSender had no caller — killswitch trips
         # only logged) and the /metrics + /health endpoint (Prometheus scraped
         # an empty port). Both were promised by spec §7.
-        self.alerts = _alert_sender_from_env()
+        if self.alerts is None:  # an injected sender (tests, embedding) wins
+            self.alerts = _alert_sender_from_env()
         if self.settings.monitor.http_port > 0 and self.monitor_server is None:
             self.monitor_server = start_monitor_server(
                 self,
                 port=self.settings.monitor.http_port,
                 host=self.settings.monitor.http_host,
             )
+        # P2: resume from the last snapshot, then let the broker correct it.
+        if self.state_store is None and self.settings.data.state_path:
+            self.state_store = JsonStateStore(Path(self.settings.data.state_path))
+        if self.state_store is not None:
+            snapshot = self.state_store.load()
+            if snapshot:
+                self._restore(snapshot)
+        await self._reconcile_with_broker(datetime.now(UTC), full=True, source="startup")
+        self._persist()
 
     async def _notify(self: RuntimeContext, text: str) -> None:
         """Push a HIGH-severity alert; delivery failure must never break a tick."""
@@ -293,6 +308,10 @@ class RuntimeContext:
         if broker_healthy and not self.lifecycle_state.positions:
             self.telemetry.record_data_freshness("ibkr_quotes", now)
         self.last_broker_healthy = broker_healthy
+        # P2: 60 s reconcile — adopt the broker's quantities; positions with an
+        # exit in flight are left to the daemon's own reconcile.
+        if broker_healthy:
+            await self._reconcile_with_broker(now, full=False, source="tick")
 
         # Mark to market: fetch quotes, record position marks, collect prices.
         # R7.Q-I2: skip the loop entirely when the broker is unhealthy — every
@@ -397,6 +416,7 @@ class RuntimeContext:
                 for reason in self._active_kill_reasons:
                     self.metrics_registry.set_kill_switch_inactive(reason)
             self._active_kill_reasons.clear()
+        self._persist()
 
     async def _execute_planned_entries(self: RuntimeContext, now: datetime) -> None:
         """P1 step 4: buy the premarket proposals once, after the opening window.
@@ -478,6 +498,149 @@ class RuntimeContext:
         except LookupError:
             return 0.0
         return float(bars[-1].close) if bars else 0.0
+
+    # ------------------------------------------------------------------ P2
+    def _snapshot(self: RuntimeContext) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "mode": self.mode,
+            "positions": self.lifecycle_state.positions,
+            "planned_entries": [asdict(d) for d in self.planned_entries],
+            "killswitch": {
+                "active": self.kill_switch_active,
+                "reason": self._kill_reason,
+                "first_tripped_at": (
+                    self._kill_first_tripped_at.isoformat() if self._kill_first_tripped_at else None
+                ),
+                "active_reasons": sorted(self._active_kill_reasons),
+            },
+            "telemetry": {
+                "equity_history": [
+                    [ts.isoformat(), eq] for ts, eq in self.telemetry.equity_history
+                ],
+                "equity_peak_per_day": {
+                    d.isoformat(): peak for d, peak in self.telemetry.equity_peak_per_day.items()
+                },
+            },
+        }
+
+    def _persist(self: RuntimeContext) -> None:
+        if self.state_store is None:
+            return
+        try:
+            self.state_store.save(self._snapshot())
+        except OSError as e:
+            # Persistence must never take the trading loop down; the next job
+            # retries. Programming errors (TypeError from an unserialisable
+            # value) propagate so they surface in tick_safe's logs.
+            log.error("state_persist_failed", err=str(e), err_type=type(e).__name__)
+
+    def _restore(self: RuntimeContext, snap: dict[str, Any]) -> None:
+        positions = snap.get("positions") or {}
+        self.lifecycle_state.positions = {
+            str(t): dict(meta) for t, meta in positions.items() if isinstance(meta, dict)
+        }
+        for t, meta in self.lifecycle_state.positions.items():
+            self.telemetry.record_position(
+                t, float(meta["entry_price"]), float(meta["entry_price"])
+            )
+        self.planned_entries = [
+            EntryDecision(**d) for d in (snap.get("planned_entries") or []) if isinstance(d, dict)
+        ]
+        ks = snap.get("killswitch") or {}
+        self.kill_switch_active = bool(ks.get("active", False))
+        self._kill_reason = ks.get("reason")
+        raw_ts = ks.get("first_tripped_at")
+        self._kill_first_tripped_at = datetime.fromisoformat(raw_ts) if raw_ts else None
+        self._active_kill_reasons = set(ks.get("active_reasons") or [])
+        tele = snap.get("telemetry") or {}
+        self.telemetry.equity_history = [
+            (datetime.fromisoformat(ts), float(eq)) for ts, eq in tele.get("equity_history") or []
+        ]
+        self.telemetry.equity_peak_per_day = {
+            date.fromisoformat(d): float(peak)
+            for d, peak in (tele.get("equity_peak_per_day") or {}).items()
+        }
+        log.info(
+            "state_restored",
+            positions=len(self.lifecycle_state.positions),
+            planned_entries=len(self.planned_entries),
+            kill_switch_active=self.kill_switch_active,
+            saved_at=snap.get("saved_at"),
+        )
+
+    async def _reconcile_with_broker(
+        self: RuntimeContext, now: datetime, *, full: bool, source: str
+    ) -> None:
+        """P2: make the local book agree with the broker.
+
+        - A local position the broker does not hold is a phantom: dropped.
+        - A quantity mismatch adopts the broker's quantity.
+        - A broker holding we do not know is adopted with conservative meta
+          (entry = avg cost, setup Mixed, score 0 so signal-decay never fires,
+          bars_held 0) so the hard / trailing / time stops manage it.
+        Positions with an exit in flight are skipped on the 60 s pass: the
+        daemon's own pending-exit reconcile owns them. `full` (startup / EOD)
+        pushes an alert on any drift; the tick pass only logs.
+        """
+        if self.broker is None:
+            return
+        if isinstance(self.broker, SimulatorBroker) and self.state_store is None:
+            # Pure in-memory sim (tests, ad-hoc harnesses) seeds the book
+            # directly; there is no external truth to reconcile against.
+            # Paper / live always reconcile; sim does once persistence is on.
+            return
+        try:
+            snapshots = await self.broker.get_positions()
+        except _TRANSIENT_IO_ERRORS as e:
+            log.warning("reconcile_positions_unavailable", source=source, err=str(e))
+            return
+        at_broker = {p.ticker: p for p in snapshots if p.qty > 0}
+        drift: list[str] = []
+        for ticker in list(self.lifecycle_state.positions):
+            meta = self.lifecycle_state.positions[ticker]
+            if not full and meta.get("pending_exits"):
+                continue
+            held = at_broker.get(ticker)
+            if held is None:
+                drift.append(f"{ticker}: local {meta['qty']} but broker flat -> dropped")
+                self.lifecycle_state.positions.pop(ticker, None)
+                self.telemetry.clear_position(ticker)
+                continue
+            if int(held.qty) != int(meta["qty"]):
+                drift.append(f"{ticker}: local {meta['qty']} vs broker {held.qty} -> adopted")
+                meta["qty"] = int(held.qty)
+        for ticker, held in at_broker.items():
+            if ticker in self.lifecycle_state.positions:
+                continue
+            entry = float(held.avg_cost) if held.avg_cost > 0 else 0.0
+            if entry <= 0:
+                try:
+                    q = await self.broker.fetch_quote(ticker)
+                    entry = float(q.last or q.bid or q.ask or 0.0)
+                except _TRANSIENT_IO_ERRORS:
+                    entry = 0.0
+            if entry <= 0:
+                drift.append(
+                    f"{ticker}: broker holds {held.qty} but no price to adopt it -> ignored"
+                )
+                continue
+            self.lifecycle_state.positions[ticker] = new_position_meta(
+                ticker=ticker,
+                qty=int(held.qty),
+                entry_price=entry,
+                score=0.0,
+                setup_type="Mixed",
+            )
+            self.telemetry.record_position(ticker, entry, entry)
+            drift.append(f"{ticker}: broker holds {held.qty} unknown locally -> adopted as Mixed")
+        if not drift:
+            return
+        log.warning("reconcile_drift", source=source, items=drift)
+        if full:
+            await self._notify(
+                f"squeeze-hunter reconciliation ({source}, mode={self.mode}): " + "; ".join(drift)
+            )
 
     def reset_killswitch(self: RuntimeContext) -> None:
         """R7.C1: explicit manual reset. Clears sticky cooldown state and
@@ -589,6 +752,7 @@ class RuntimeContext:
                 # If ticker isn't in scan output (e.g. dropped from universe),
                 # keep prior current_score so the position isn't silently zeroed.
         log.info("nightly_scan_complete", n_candidates=len(ranked))
+        self._persist()
 
     async def nightly_scan_safe(self: RuntimeContext, now: datetime) -> bool:
         """Run nightly_scan() and swallow any exception so the scheduler keeps firing.
@@ -619,12 +783,15 @@ class RuntimeContext:
             log.info("eod_close_skipped_holiday", date=et.date().isoformat())
             return
 
+        # P2: full EOD reconciliation; any drift alerts the operator.
+        await self._reconcile_with_broker(now, full=True, source="eod")
         for meta in self.lifecycle_state.positions.values():
             meta["bars_held"] = int(meta.get("bars_held", 0)) + 1
         log.info(
             "eod_close_complete",
             positions=len(self.lifecycle_state.positions),
         )
+        self._persist()
 
     async def eod_close_safe(self: RuntimeContext, now: datetime) -> bool:
         """Run eod_close() and swallow any exception so the scheduler keeps firing.
@@ -711,6 +878,7 @@ class RuntimeContext:
                 size_usd=round(d.size_usd, 2),
             )
         self.planned_entries = [d for d in decisions if d.accepted]
+        self._persist()
 
     async def premarket_verify_safe(self: RuntimeContext, now: datetime) -> bool:
         """Run premarket_verify() and swallow any exception so the scheduler keeps firing.
@@ -748,6 +916,7 @@ class RuntimeContext:
             self.broker = None
 
     async def shutdown(self: RuntimeContext) -> None:
+        self._persist()
         if self.monitor_server is not None:
             await asyncio.to_thread(self.monitor_server.stop)
             self.monitor_server = None

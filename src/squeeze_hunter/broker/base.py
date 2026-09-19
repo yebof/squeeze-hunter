@@ -58,6 +58,16 @@ class BrokerOrder:
     commission_usd: float = 0.0
 
 
+@dataclass(slots=True, frozen=True)
+class PositionSnapshot:
+    """One broker-side holding (P2 reconciliation). avg_cost is 0.0 when the
+    broker does not report it."""
+
+    ticker: str
+    qty: int
+    avg_cost: float = 0.0
+
+
 @runtime_checkable
 class IBroker(Protocol):
     name: str
@@ -97,6 +107,11 @@ class IBroker(Protocol):
         already-flat broker would drive the account SHORT. The authoritative
         truth is the broker's actual position, not our local meta['qty'].
         """
+        ...
+
+    async def get_positions(self: IBroker) -> list[PositionSnapshot]:
+        """Every non-flat holding at the broker (P2). The runtime reconciles
+        its book against this at startup, every tick and at EOD."""
         ...
 
     async def get_equity_usd(self: IBroker) -> float | None:

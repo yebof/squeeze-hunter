@@ -73,6 +73,10 @@ data:
   # days after its settlement date so it can't act on short interest before it
   # was public (look-ahead bias). 0 = reveal on the settlement date (legacy).
   finra_publication_lag_bdays: 8
+  # Runtime snapshot (positions, pending exits, killswitch lockout, equity
+  # history) — written atomically after every job so a restart resumes where
+  # it left off and reconciles against the broker. Empty = no persistence.
+  state_path: data/state/runtime.json
 backtest:
   # Gate 1 "captured-the-event" case set (design spec §5, exactly 8 events).
   # A buy within [date - 5 calendar days, date + 1 day] captures the event;

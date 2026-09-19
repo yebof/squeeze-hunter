@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from squeeze_hunter.backtest.cost_model import Fill, StockCostModel
-from squeeze_hunter.broker.base import BrokerHealth, BrokerOrder, Quote
+from squeeze_hunter.broker.base import BrokerHealth, BrokerOrder, PositionSnapshot, Quote
 from squeeze_hunter.logging_setup import get_logger
 
 log = get_logger("broker.simulator")
@@ -168,6 +168,13 @@ class SimulatorBroker:
         """CDX-P1-3: IBroker Protocol position query. The simulator fills
         synchronously so its local lot IS the authoritative position."""
         return self.position_qty(ticker)
+
+    async def get_positions(self: SimulatorBroker) -> list[PositionSnapshot]:
+        return [
+            PositionSnapshot(ticker=t, qty=lot.qty, avg_cost=lot.avg_price)
+            for t, lot in self.positions.items()
+            if lot.qty > 0
+        ]
 
     def realized_pnl(self: SimulatorBroker, ticker: str) -> float:
         return self.realized.get(ticker, 0.0)

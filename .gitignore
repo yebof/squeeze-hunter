@@ -25,6 +25,7 @@ build/
 # Data volumes (parquet history, postgres data dir, logs, backups)
 data/parquet/
 data/postgres/
+data/state/
 logs/
 backups/
 

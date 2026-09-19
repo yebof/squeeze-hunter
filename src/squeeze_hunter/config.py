@@ -112,6 +112,10 @@ class DataCfg(_StrictSection):
     # interest before it was public (lookahead → inflated Gate 1). Set 0 to
     # reveal on the settlement date (legacy behavior).
     finra_publication_lag_bdays: int = 8
+    # P2: where the runtime snapshot (book, pending orders, killswitch state,
+    # telemetry) is written after every job and read back at startup. Empty
+    # disables persistence (tests / ad-hoc contexts); the example YAML sets it.
+    state_path: str = ""
 
 
 class ValidationEvent(_StrictSection):

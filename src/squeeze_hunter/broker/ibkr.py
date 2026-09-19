@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock
 
-from squeeze_hunter.broker.base import BrokerHealth, BrokerOrder, Quote
+from squeeze_hunter.broker.base import BrokerHealth, BrokerOrder, PositionSnapshot, Quote
 from squeeze_hunter.logging_setup import get_logger
 
 log = get_logger("broker.ibkr")
@@ -153,6 +153,8 @@ class IBKRBroker:
 
     def __post_init__(self: IBKRBroker) -> None:
         self._ib = IB()
+        # P2: client order refs placed this session (ref -> broker order id).
+        self._submitted_refs: dict[str, str] = {}
 
     def _make_stock(self: IBKRBroker, ticker: str) -> Stock:
         """R9.6 / R10.1: build a Stock contract, attaching primaryExchange ONLY
@@ -255,26 +257,7 @@ class IBKRBroker:
         limit_price: float | None,
         ts: datetime,
     ) -> BrokerOrder:
-        contract = self._make_stock(ticker)
-        await self._ib.qualifyContractsAsync(contract)
-        order = LimitOrder("BUY", qty, limit_price) if limit_price else MarketOrder("BUY", qty)
-        trade = self._ib.placeOrder(contract, order)
-        log.info(
-            "order_submitted",
-            ticker=ticker,
-            side="buy",
-            qty=qty,
-            limit=limit_price,
-            broker_order_id=trade.order.orderId,
-        )
-        return BrokerOrder(
-            broker_order_id=str(trade.order.orderId),
-            ticker=ticker,
-            side="buy",
-            qty=qty,
-            limit_price=limit_price,
-            status=_translate_status(trade.orderStatus.status),
-        )
+        return await self._place(ticker, "buy", qty, limit_price, ts)
 
     async def submit_sell(
         self: IBKRBroker,
@@ -283,22 +266,78 @@ class IBKRBroker:
         limit_price: float | None,
         ts: datetime,
     ) -> BrokerOrder:
+        return await self._place(ticker, "sell", qty, limit_price, ts)
+
+    @staticmethod
+    def _client_ref(ticker: str, side: str, qty: int, ts: datetime) -> str:
+        """P2: idempotency key for one logical order. A retry of the same
+        (ticker, side, qty, second) — e.g. after a timeout whose first attempt
+        actually reached TWS — must not place a second order."""
+        return f"sh-{side}-{ticker}-{qty}-{ts.astimezone(UTC).strftime('%Y%m%dT%H%M%S')}"
+
+    def _find_open_by_ref(self: IBKRBroker, ref: str):  # noqa: ANN202 (ib_async Trade)
+        for trade in self._ib.openTrades():
+            if getattr(trade.order, "orderRef", None) == ref:
+                return trade
+        return None
+
+    async def _place(
+        self: IBKRBroker,
+        ticker: str,
+        side: str,
+        qty: int,
+        limit_price: float | None,
+        ts: datetime,
+    ) -> BrokerOrder:
+        ref = self._client_ref(ticker, side, qty, ts)
+        existing = self._find_open_by_ref(ref)
+        if existing is not None or ref in self._submitted_refs:
+            log.warning("order_deduped_by_client_ref", ticker=ticker, side=side, ref=ref)
+            if existing is not None:
+                st = existing.orderStatus
+                return BrokerOrder(
+                    broker_order_id=str(existing.order.orderId),
+                    ticker=ticker,
+                    side=side,
+                    qty=qty,
+                    limit_price=limit_price,
+                    status=_translate_status(st.status),
+                    filled_qty=int(getattr(st, "filled", 0) or 0),
+                    avg_fill_price=float(st.avgFillPrice)
+                    if getattr(st, "avgFillPrice", 0)
+                    else None,
+                )
+            # Placed earlier this session and no longer open: terminal. Report
+            # it as pending so the caller reconciles against the position
+            # rather than assuming a fill or resubmitting.
+            return BrokerOrder(
+                broker_order_id=self._submitted_refs[ref],
+                ticker=ticker,
+                side=side,
+                qty=qty,
+                limit_price=limit_price,
+                status="pending",
+            )
         contract = self._make_stock(ticker)
         await self._ib.qualifyContractsAsync(contract)
-        order = LimitOrder("SELL", qty, limit_price) if limit_price else MarketOrder("SELL", qty)
+        action = side.upper()
+        order = LimitOrder(action, qty, limit_price) if limit_price else MarketOrder(action, qty)
+        order.orderRef = ref
         trade = self._ib.placeOrder(contract, order)
+        self._submitted_refs[ref] = str(trade.order.orderId)
         log.info(
             "order_submitted",
             ticker=ticker,
-            side="sell",
+            side=side,
             qty=qty,
             limit=limit_price,
             broker_order_id=trade.order.orderId,
+            client_ref=ref,
         )
         return BrokerOrder(
             broker_order_id=str(trade.order.orderId),
             ticker=ticker,
-            side="sell",
+            side=side,
             qty=qty,
             limit_price=limit_price,
             status=_translate_status(trade.orderStatus.status),
@@ -344,6 +383,31 @@ class IBKRBroker:
                 continue
             total += int(pos.position)
         return total
+
+    async def get_positions(
+        self: IBKRBroker, *, refresh_timeout_s: float = 5.0
+    ) -> list[PositionSnapshot]:
+        """P2: every non-flat holding for the configured account, freshly
+        synced (see get_position_qty for why the cached snapshot is not
+        trusted). Rows for the same symbol are aggregated."""
+        await asyncio.wait_for(self._ib.reqPositionsAsync(), timeout=refresh_timeout_s)
+        agg: dict[str, tuple[int, float]] = {}
+        for pos in self._ib.positions():
+            symbol = getattr(pos.contract, "symbol", None)
+            if not symbol:
+                continue
+            pos_account = getattr(pos, "account", None)
+            if self.account and pos_account and pos_account != self.account:
+                continue
+            qty = int(pos.position)
+            if qty == 0:
+                continue
+            cost = float(getattr(pos, "avgCost", 0.0) or 0.0)
+            prev_qty, prev_cost = agg.get(symbol, (0, 0.0))
+            total = prev_qty + qty
+            blended = (prev_qty * prev_cost + qty * cost) / total if total else 0.0
+            agg[symbol] = (total, blended)
+        return [PositionSnapshot(ticker=t, qty=q, avg_cost=c) for t, (q, c) in agg.items() if q > 0]
 
     async def get_open_orders(self: IBKRBroker) -> list[BrokerOrder]:
         out = []
