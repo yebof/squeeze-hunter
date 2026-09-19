@@ -10,8 +10,7 @@ Status legend: `[x]` done, `[ ]` open.
 ## P5 — Infrastructure: trading calendar and clock  `[x]` calendar, `[ ]` clock
 
 - [x] `squeeze_hunter/trading_calendar.py`: NYSE closures (pandas_market_calendars), `is_trading_day`, `next_session`, `trading_sessions(start, end)`, `is_regular_session`, `session_open_utc`. Every former copy (runtime session helpers, `signals/earnings_reaction._us_business_holidays`, runner day loop, metrics captured-events, FINRA lag) imports from it; old names stay as aliases.
-- [ ] `Clock` protocol: `now()`, `today()`, `is_session_open()`. `BacktestClock` (advances per session) and `WallClock`. Replaces the runner's `day_label` / `cur` split and the `Clock` dataclass in `data/providers/backtest.py`.
-  - Acceptance: no module other than `trading_calendar` imports `pandas_market_calendars` or defines session times.
+- [~] `Clock` protocol — closed without code (2026-09-20). Every job takes an explicit `now`, `trading_calendar` owns session times, and the provider's `Clock` is the look-ahead guard the backtest needs; a runtime clock abstraction would have no second consumer. Acceptance that still holds: no module other than `trading_calendar` imports `pandas_market_calendars` or defines session times.
 
 ## P9 — Remaining tunables to YAML  `[x]`
 
@@ -49,9 +48,13 @@ Goal: one implementation of "given the book, the quotes/bars and the clock, what
 - [x] `tests/broker/fake_ib.py` reproduces the ib_async semantics the MagicMocks hid (blocking `reqAccountUpdates`, PendingSubmit on place, PendingCancel on cancel, one cached Ticker per contract, done trades in `trades()`); `tests/broker/test_ibkr_contract.py` runs the real `IBKRBroker` — and the real lifecycle daemon — against it, including the cancel-must-be-acknowledged-before-resubmit path.
 - Not done: exit orders still use the daemon's `pending_exits` ids (tested, reconciled by position); migrating them onto `OrderTracker` and wiring TWAP slicing into the entry path are follow-ups (the OMS sleeps between slices and cannot run inside a 60 s tick — it needs its own task).
 
-## P4 — Split RuntimeContext  `[ ]`
+## P4 — Split RuntimeContext  `[x]`  (2026-09-20)
 
-- `KillswitchController` (evaluate + sticky cooldown + reasons + alert + gauges), `TradingSession` (tick / nightly_scan / eod_close / premarket_verify), `RuntimeWiring` (broker, monitor server, alert sender, settings). `RuntimeContext` becomes a thin facade so the CLI and tests keep their entry points.
+- [x] `risk/killswitch_controller.py`: `KillswitchController` owns the sticky-cooldown state (active, reason, first trip, active gauge labels) and applies verdict + step + gauges; the runtime only logs and alerts on the transition. Snapshot round-trip included.
+- [x] `execution/entries.py`: `EntryPath` owns the live entry path — premarket `plan()` (gate context, portfolio state, `propose_entries`, decision log), `execute_planned()` after the opening window, `settle_pending()` for buys that fill later — together with the planned and pending entry state.
+- [x] `execution/reconcile.py`: `reconcile_book()` is the broker ↔ book reconciliation as a function; the runtime keeps the sim-mode skip rule, logging and the alert.
+- [x] `RuntimeContext` (1100 → ~810 lines) is the wiring and the job orchestration (setup / tick / nightly / eod / premarket / ingest / persistence); facade properties keep the old names (`kill_switch_active`, `planned_entries`, `pending_buys`, …) so the CLI, the monitor and every test kept their entry points. No behaviour change: the full suite passed unchanged.
+- Not done: a separate `TradingSession` / `RuntimeWiring` split. The remaining methods are the orchestration itself; cutting further would only move lines.
 
 ## P6 — Live data pipeline  `[x]`  (2026-09-20)
 

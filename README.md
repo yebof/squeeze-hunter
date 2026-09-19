@@ -90,7 +90,7 @@ live share the same signal, risk and stop code.
 | `execution/` | `decisions.py` — the pure position core (`decide_exit`, `propose_entries`) shared by backtest and live; `book.py` position records; `orders.py` order state machine and tracker; `context.py` gate inputs from the cache; lifecycle daemon (quotes in, orders out, pending-exit reconciliation); OMS + TWAP slicer (polls for fills; not yet wired into entries) |
 | `broker/` | `IBroker` Protocol with IBKR live, IBKR paper and a deterministic simulator |
 | `backtest/` | Trading-day runner, cost model, walk-forward split, metrics, Gate 1 verdict |
-| `runtime.py`, `telemetry.py`, `trading_calendar.py` | `RuntimeContext` (sim / paper / live) and the premarket entry path; portfolio telemetry (killswitch inputs, shared with the backtest); the NYSE calendar and session window |
+| `runtime.py`, `telemetry.py`, `trading_calendar.py` | `RuntimeContext` (sim / paper / live): wiring and job orchestration over `execution/entries.py` (the live entry path), `execution/reconcile.py` (broker ↔ book) and `risk/killswitch_controller.py`; portfolio telemetry (killswitch inputs, shared with the backtest); the NYSE calendar and session window |
 | `scheduler.py` | The seven APScheduler jobs |
 | `monitor/` | Prometheus registry, health snapshot, `/metrics` + `/health` server, Telegram / Slack alerts |
 | `store/`, `alembic/` | Postgres ORM and migrations (schema only; unused at runtime) |
