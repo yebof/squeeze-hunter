@@ -40,11 +40,14 @@ Goal: one implementation of "given the book, the quotes/bars and the clock, what
 - [x] IBKR client order refs: `sh-<side>-<ticker>-<qty>-<utc second>` in `orderRef`; a repeat of the same logical order returns the existing trade instead of placing a second one.
 - [x] Acceptance met: `tests/runtime/test_persistence_and_reconcile.py` restarts a context over the same simulator and store and finds positions, pending exits, the killswitch lockout and equity history intact; adoption / phantom / quantity / EOD-drift cases each have a test.
 
-## P3 — Order state machine and fake-IB contract tests  `[ ]`
+## P3 — Order state machine and fake-IB contract tests  `[x]`  (2026-09-20)
 
-1. `execution/orders.py`: `OrderRecord` with the spec's states (PENDING → ROUTED → PARTIAL → FILLED | REJECTED | CANCELLED | EXPIRED), `is_terminal`, transition validation.
-2. `IBKRBroker` maps ib_async statuses onto it (ValidationError → REJECTED, PendingCancel → still ROUTED).
-3. `tests/broker/fake_ib.py`: a fake `IB` that reproduces the semantics the mocks hid: `placeOrder` returns PendingSubmit and later transitions, `cancelOrder` → PendingCancel then Cancelled after N loop iterations, `reqMktData` returns one cached `Ticker` per contract with a `time` stamp, `reqAccountUpdates` raises inside a running loop. Contract tests run the real `IBKRBroker` against it.
+- [x] `execution/orders.py`: `OrderState` (PENDING → ROUTED → PARTIAL → FILLED | REJECTED | CANCELLED | EXPIRED), `OrderRecord` (immutable, transition-validated `apply`, terminal states are final, a partial fill survives a cancel) and `OrderTracker` (open orders, snapshot round-trip).
+- [x] `IBroker.get_order(id)` on the simulator (order history) and IBKR (`IB.trades()`, so fills that arrived after `placeOrder` are visible). IBKR status vocabulary: PendingSubmit/ApiPending → pending, PreSubmitted/Submitted/PendingCancel → routed (partial when anything filled), ValidationError/Inactive → rejected; `MarketOrder.lmtPrice == UNSET_DOUBLE` reads as no limit.
+- [x] The OMS polls `get_order` until a slice is terminal or its time budget is spent, then cancels the remainder — it no longer reads fills off the submit response (only the simulator ever populated that).
+- [x] Pending buys: an entry that does not fill on the submitting tick is tracked in `RuntimeContext.pending_buys`, persisted, settled on later ticks (or after a restart, before reconciliation could adopt the fill as an unknown lot), and cancelled once `execution.entry_window_minutes` have passed with the filled part kept as the position.
+- [x] `tests/broker/fake_ib.py` reproduces the ib_async semantics the MagicMocks hid (blocking `reqAccountUpdates`, PendingSubmit on place, PendingCancel on cancel, one cached Ticker per contract, done trades in `trades()`); `tests/broker/test_ibkr_contract.py` runs the real `IBKRBroker` — and the real lifecycle daemon — against it, including the cancel-must-be-acknowledged-before-resubmit path.
+- Not done: exit orders still use the daemon's `pending_exits` ids (tested, reconciled by position); migrating them onto `OrderTracker` and wiring TWAP slicing into the entry path are follow-ups (the OMS sleeps between slices and cannot run inside a 60 s tick — it needs its own task).
 
 ## P4 — Split RuntimeContext  `[ ]`
 

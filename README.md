@@ -87,7 +87,7 @@ live share the same signal, risk and stop code.
 | `score/` | Weighted combiner and rule-based setup classifier |
 | `universe.py` | Universe filter (not yet wired into the pipeline; see limitations) |
 | `risk/` | Kelly sizing, pre-trade gates, stop stack, killswitch |
-| `execution/` | `decisions.py` — the pure position core (`decide_exit`, `propose_entries`) shared by backtest and live; `book.py` position records; `context.py` gate inputs from the cache; lifecycle daemon (quotes in, orders out, pending-exit reconciliation); OMS + TWAP slicer (Phase 4) |
+| `execution/` | `decisions.py` — the pure position core (`decide_exit`, `propose_entries`) shared by backtest and live; `book.py` position records; `orders.py` order state machine and tracker; `context.py` gate inputs from the cache; lifecycle daemon (quotes in, orders out, pending-exit reconciliation); OMS + TWAP slicer (polls for fills; not yet wired into entries) |
 | `broker/` | `IBroker` Protocol with IBKR live, IBKR paper and a deterministic simulator |
 | `backtest/` | Trading-day runner, cost model, walk-forward split, metrics, Gate 1 verdict |
 | `runtime.py`, `telemetry.py`, `trading_calendar.py` | `RuntimeContext` (sim / paper / live) and the premarket entry path; portfolio telemetry (killswitch inputs, shared with the backtest); the NYSE calendar and session window |
@@ -327,8 +327,9 @@ fails loudly instead of being ignored.
   setups are barely detectable today; a passing Gate 1 may rest on CAR-type
   trades alone (the report prints a coverage warning).
 - Not yet implemented from the spec: the 70/30 stock + call split and option-leg
-  stops, the catalyst-fizzle stop and VWAP take-profit slices. Pending BUY
-  orders are not tracked across ticks until the order state machine lands.
+  stops, the catalyst-fizzle stop and VWAP take-profit slices. Entries are a
+  single marketable-limit order; TWAP slicing exists in the OMS but is not
+  wired into the entry path yet.
 - Yahoo's float is today's float applied to every historical short-interest
   record (share counts are split-adjusted at ingest, the float itself is not
   reconstructed historically).
