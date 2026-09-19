@@ -81,8 +81,8 @@ live share the same signal, risk and stop code.
 
 | Path | Responsibility |
 | --- | --- |
-| `data/` | Domain schemas, the `DataProvider` Protocol, the parquet cache, five providers (parquet replay, Yahoo, FINRA, Reddit, Finnhub) |
-| `ingest/` | One-shot backfills: bars, FINRA short interest (merged with Yahoo float), Finnhub earnings calendar |
+| `data/` | Domain schemas, the `DataProvider` Protocol, the parquet cache, five providers (parquet replay, Yahoo, FINRA CDN, Reddit, Finnhub) plus the FINRA Query API fallback client |
+| `ingest/` | Backfills (bars, FINRA short interest merged with Yahoo float and split-adjusted, Finnhub earnings), the daily `eod.py` refresh job and `freshness.py` stamps |
 | `signals/` | The seven factor functions, cross-sectional z-scoring, concurrent orchestration |
 | `score/` | Weighted combiner and rule-based setup classifier |
 | `universe.py` | Universe filter (not yet wired into the pipeline; see limitations) |
@@ -172,7 +172,7 @@ jobs, all in US Eastern time:
 
 | Job | When | State |
 | --- | --- | --- |
-| `ingest_eod` | 17:00 | Phase 4 |
+| `ingest_eod` | 17:00 | wired: incremental bars, periodic FINRA / earnings refresh, freshness stamps |
 | `nightly_scan` | 22:00 | wired: runs the scan, publishes candidates, refreshes held positions' scores |
 | `premarket_data` | 04:00 | Phase 4 |
 | `premarket_verify` | 08:00 | wired |
@@ -196,8 +196,11 @@ Grafana and an IB Gateway.
 - The parquet cache under `data/parquet/` (gitignored) holds
   `bars/<TICKER>.parquet`, `short_interest/all.parquet` and
   `earnings/all.parquet`.
-- Backtest, paper and live scans all read the same parquet cache; keeping it
-  current in paper / live mode needs a separate ingest job (Phase 4).
+- Backtest, paper and live scans all read the same parquet cache. In paper /
+  live mode the 17:00 ET `ingest_eod` job keeps it current and writes
+  per-dataset freshness stamps to `data/parquet/_freshness.json`; automatic
+  entries are refused while a critical dataset (bars by default) is older than
+  its `data.*_max_age_days` budget.
 - The runtime snapshot (positions, pending exits, killswitch lockout, equity
   history) lives in `data/state/runtime.json` (`data.state_path`), written
   atomically after every job; a restart restores it and reconciles against the
@@ -237,6 +240,7 @@ variables already set in your shell. `.env` is gitignored; never commit it.
 | `IBKR_USERID`, `IBKR_PASSWORD` | Only the `ib-gateway` container in `docker/compose.yml` | Your IBKR paper-account login. Not read by the Python code. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Killswitch alerts (high severity) | Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) to get the token; send the bot a message, then read your chat id from `https://api.telegram.org/bot<TOKEN>/getUpdates`. Optional. |
 | `SLACK_WEBHOOK_URL` | Low-severity alerts | Slack → *Apps* → *Incoming Webhooks* → add to a channel, copy the webhook URL. Optional. |
+| `FINRA_API_CLIENT_ID`, `FINRA_API_CLIENT_SECRET` | Fallback for `ingest finra` when `cdn.finra.org` is unreachable | Register at [developer.finra.org](https://developer.finra.org) and create an API credential. Optional; without it a blocked CDN makes the FINRA ingest fail loudly. |
 | `SH_DB_URL` | `alembic upgrade head` only | Leave the default for the local docker Postgres. The runtime does not read the database yet. |
 | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | Reserved for the Reddit mention ingest behind f4, which is not implemented yet | [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps) → create a *script* app. Nothing reads these today. |
 

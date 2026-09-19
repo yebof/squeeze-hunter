@@ -53,9 +53,12 @@ Goal: one implementation of "given the book, the quotes/bars and the clock, what
 
 - `KillswitchController` (evaluate + sticky cooldown + reasons + alert + gauges), `TradingSession` (tick / nightly_scan / eod_close / premarket_verify), `RuntimeWiring` (broker, monitor server, alert sender, settings). `RuntimeContext` becomes a thin facade so the CLI and tests keep their entry points.
 
-## P6 — Live data pipeline  `[ ]`
+## P6 — Live data pipeline  `[x]`  (2026-09-20)
 
-- `ingest_eod` job: bars (Yahoo) for the universe, FINRA when a new report is due, earnings weekly. Each dataset writes a `freshness` stamp; `premarket_verify` refuses to publish candidates when a critical dataset is older than its budget. FINRA API client as a fallback to the CDN files.
+- [x] `ingest/eod.py` (`ingest_eod`, wired to the 17:00 ET `ingest_eod` job through `RuntimeContext.ingest_eod_safe`): bars pulled incrementally from the day after each ticker's last cached bar (one failing ticker never blocks the rest); FINRA re-pulled when the last ingest is older than `data.finra_refresh_days`; earnings when older than `data.earnings_refresh_days` (skipped and reported without `FINNHUB_KEY`). Problems go out as a LOW-severity alert.
+- [x] `ingest/freshness.py`: per-dataset `as_of` / `recorded_at` stamps in `data/parquet/_freshness.json`. `premarket_verify` refuses to plan automatic entries (and alerts) when a dataset in `data.critical_datasets` (default `[bars]`) is older than its `*_max_age_days` or never ingested; `nightly_scan` warns about every stale dataset; `data.require_fresh_for_entries: false` disables the gate.
+- [x] `data/providers/finra_api.py`: FINRA Query API client (client-credentials token, paged `consolidatedShortInterest` queries). `backfill_finra` falls back to it when the CDN download fails and `FINRA_API_CLIENT_ID` / `FINRA_API_CLIENT_SECRET` are set; without credentials the CDN failure stays loud. Field names follow the published dataset definition and have not yet been exercised against the live API.
+- Not done: Reddit / options ingest (f4 / f5 stay dead by design until those sources are plugged in).
 
 ## P7 — Golden-number and invariant tests  `[ ]`
 

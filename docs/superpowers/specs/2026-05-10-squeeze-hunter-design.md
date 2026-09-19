@@ -622,7 +622,7 @@ The system is, and should remain, **Approach A: a single-process modular monolit
 - **P3 Explicit order state machine** *(done 2026-09-20)*: `execution/orders.py` (states, transition validation, tracker), `IBroker.get_order`, an OMS that polls for fills instead of assuming them, pending-buy tracking in the runtime, and a fake IB that reproduces ib_async semantics with contract tests over the real `IBKRBroker` and lifecycle daemon. Exit orders still ride the daemon's pending-exit ids; TWAP entries need their own task before they can be wired.
 - **P4 Split `RuntimeContext`** into telemetry, killswitch controller, trading session and wiring.
 - **P5 Infrastructure modules** `trading_calendar` *(done)* and a `Clock` protocol shared by live and backtest *(open)*.
-- **P6 Live data pipeline** (`ingest_eod`, per-dataset freshness checked by `premarket_verify`, FINRA API fallback).
+- **P6 Live data pipeline** *(done 2026-09-20)*: `ingest/eod.py` runs at 17:00 ET (incremental bars, periodic FINRA and earnings refreshes), every dataset carries a freshness stamp, `premarket_verify` refuses automatic entries on stale critical data, and `backfill_finra` falls back to the FINRA Query API when the CDN is blocked.
 - **P7 Golden-number and invariant tests.**
 - **P8 Decision log** persisted by both paths, with a CLI to explain a ticker-day.
 - **P9 Remaining tunables to YAML** *(done)*: Kelly priors, killswitch arms and cooldown, gate thresholds.
